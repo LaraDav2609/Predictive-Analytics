@@ -13,6 +13,7 @@ from data.mlb_historical_client import MLBHistoricalClient
 from analytics.soccer_predictor import SoccerPredictor
 from analytics.f1_predictor import F1Predictor
 from analytics.baseball_predictor import BaseballPredictor
+from data.f1_sentiment import refresh_f1_sentiment
 from api import common_routes, soccer_routes, f1_routes, baseball_routes, baseball_history_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -57,7 +58,18 @@ async def lifespan(app: FastAPI):
 
     try:
         await _f1_client.refresh()
-        f1_pred.load_drivers(_f1_client.get_drivers())
+        f1_features = await _f1_client.get_prediction_features()
+        f1_sentiment = await refresh_f1_sentiment(
+            _f1_client.get_drivers(),
+            _f1_client.get_constructors(),
+            _f1_client.season,
+        )
+        f1_pred.load_drivers(
+            _f1_client.get_drivers(),
+            _f1_client.get_constructors(),
+            f1_features,
+            f1_sentiment,
+        )
         logger.info("F1 data loaded successfully")
     except Exception as e:
         logger.warning("F1 data load failed (will use fallback): %s", e)

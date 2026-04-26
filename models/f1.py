@@ -10,6 +10,8 @@ class Driver(BaseModel):
     last_name: str
     nationality: str
     team: str
+    profile_url: str | None = None
+    photo_url: str | None = None
     points: float = 0.0
     wins: int = 0
     podiums: int = 0
@@ -27,7 +29,10 @@ class Constructor(BaseModel):
 
 class RacePrediction(BaseModel):
     driver_predictions: dict[str, "DriverRacePrediction"] = {}
-    model_version: str = "f1-points-v1"
+    model_version: str = "f1-live-historical-sentiment-v2"
+    generated_at: datetime | None = None
+    data_sources: list[str] = []
+    confidence: float | None = None
 
 
 class DriverRacePrediction(BaseModel):
@@ -37,6 +42,13 @@ class DriverRacePrediction(BaseModel):
     podium_prob: float
     top5_prob: float
     predicted_position: int | None = None
+    form_score: float | None = None
+    team_score: float | None = None
+    sentiment_score: float | None = None
+    reliability_score: float | None = None
+    confidence: float | None = None
+    recent_summary: str | None = None
+    explanation: list[str] = []
 
 
 class Race(BaseModel):
