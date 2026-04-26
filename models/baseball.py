@@ -59,3 +59,76 @@ class MLBStanding(BaseModel):
     streak: str
     last_10: str = ""
     run_differential: int = 0
+
+
+class MLBHistoricalTeamSeason(BaseModel):
+    team_id: int
+    season: int | None = None
+    name: str
+    location_name: str = ""
+    franchise_name: str = ""
+    club_name: str = ""
+    abbreviation: str = ""
+    league: str = ""
+    division: str = ""
+    venue: str = ""
+    first_year_of_play: str = ""
+    active: bool = True
+
+
+class MLBHistoricalRosterPlayer(BaseModel):
+    player_id: int
+    full_name: str
+    jersey_number: str | None = None
+    position: str = ""
+    status: str = ""
+    status_description: str = ""
+    batting_side: str | None = None
+    pitching_hand: str | None = None
+    birth_date: str | None = None
+
+
+class MLBHistoricalTeamRoster(BaseModel):
+    team_id: int
+    season: int
+    roster_type: str
+    team_name: str = ""
+    players: list[MLBHistoricalRosterPlayer]
+
+
+class MLBStatSplit(BaseModel):
+    season: str | None = None
+    stat_type: str = ""
+    group: str = ""
+    team_id: int | None = None
+    team_name: str | None = None
+    league_name: str | None = None
+    player_id: int | None = None
+    player_name: str | None = None
+    stat: dict[str, str | int | float | None]
+
+
+class MLBHistoricalPlayerProfile(BaseModel):
+    player_id: int
+    full_name: str
+    primary_number: str | None = None
+    birth_date: str | None = None
+    current_age: int | None = None
+    birth_city: str | None = None
+    birth_state_province: str | None = None
+    birth_country: str | None = None
+    height: str | None = None
+    weight: int | None = None
+    active: bool | None = None
+    primary_position: str | None = None
+    batting_side: str | None = None
+    pitching_hand: str | None = None
+    current_team_id: int | None = None
+    current_team_name: str | None = None
+
+
+class MLBHistoricalPlayerStats(BaseModel):
+    player: MLBHistoricalPlayerProfile
+    groups: list[str]
+    stat_type: str
+    splits: list[MLBStatSplit]

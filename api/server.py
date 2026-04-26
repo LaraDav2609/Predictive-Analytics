@@ -9,10 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from data.football_data_client import FootballDataClient
 from data.f1_client import F1Client
 from data.mlb_client import MLBClient
+from data.mlb_historical_client import MLBHistoricalClient
 from analytics.soccer_predictor import SoccerPredictor
 from analytics.f1_predictor import F1Predictor
 from analytics.baseball_predictor import BaseballPredictor
-from api import common_routes, soccer_routes, f1_routes, baseball_routes
+from api import common_routes, soccer_routes, f1_routes, baseball_routes, baseball_history_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,11 +22,12 @@ logger = logging.getLogger(__name__)
 _football_client: FootballDataClient | None = None
 _f1_client: F1Client | None = None
 _mlb_client: MLBClient | None = None
+_mlb_historical_client: MLBHistoricalClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _football_client, _f1_client, _mlb_client
+    global _football_client, _f1_client, _mlb_client, _mlb_historical_client
 
     # Startup: initialize data clients and load data
     logger.info("Starting sports predictions service...")
@@ -33,6 +35,7 @@ async def lifespan(app: FastAPI):
     _football_client = FootballDataClient()
     _f1_client = F1Client()
     _mlb_client = MLBClient()
+    _mlb_historical_client = MLBHistoricalClient()
 
     soccer_pred = SoccerPredictor()
     f1_pred = F1Predictor()
@@ -42,6 +45,7 @@ async def lifespan(app: FastAPI):
     soccer_routes.init(_football_client, soccer_pred)
     f1_routes.init(_f1_client, f1_pred)
     baseball_routes.init(_mlb_client, baseball_pred)
+    baseball_history_routes.init(_mlb_historical_client)
 
     # Initial data load
     try:
@@ -74,6 +78,8 @@ async def lifespan(app: FastAPI):
         await _f1_client.close()
     if _mlb_client:
         await _mlb_client.close()
+    if _mlb_historical_client:
+        await _mlb_historical_client.close()
     logger.info("Sports predictions service stopped")
 
 
@@ -94,3 +100,4 @@ app.include_router(common_routes.router, prefix="/api")
 app.include_router(soccer_routes.router, prefix="/api")
 app.include_router(f1_routes.router, prefix="/api")
 app.include_router(baseball_routes.router, prefix="/api")
+app.include_router(baseball_history_routes.router, prefix="/api")
