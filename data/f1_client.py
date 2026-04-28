@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from data.base_client import SportsDataClient
+from data.weather_client import OpenMeteoClient
 from models.sport import Sport, Competition
 from models.f1 import Driver, Constructor, Race, RaceResult, RacePrediction
 
@@ -99,6 +100,9 @@ class F1Client(SportsDataClient):
         self._driver_seasons_cache: dict[str, list[dict]] = {}
         self._constructor_seasons_cache: dict[str, list[dict]] = {}
         self._constructor_driver_titles_cache: dict[tuple[str, int], dict | None] = {}
+        self._season_results_cache: dict[int, list[dict]] = {}
+        self._prediction_features_cache: dict[tuple[int, int], dict] = {}
+        self._weather_client = OpenMeteoClient()
 
     def get_sport(self) -> Sport:
         return Sport.FORMULA_ONE
@@ -120,6 +124,8 @@ class F1Client(SportsDataClient):
         return self._season
 
     async def refresh(self) -> None:
+        self._season_results_cache.pop(self._season, None)
+        self._prediction_features_cache.clear()
         await self._fetch_driver_standings()
         await self._fetch_constructor_standings()
         await self._fetch_race_calendar()
@@ -207,12 +213,21 @@ class F1Client(SportsDataClient):
                 date_str = r.get("date", f"{self._season}-03-01")
                 time_str = r.get("time", "14:00:00Z").rstrip("Z")
                 dt = datetime.fromisoformat(f"{date_str}T{time_str}").replace(tzinfo=timezone.utc)
+                sessions = _parse_calendar_sessions(r, dt)
+                has_sprint = bool(r.get("Sprint") or r.get("SprintQualifying") or r.get("SprintShootout"))
                 self._races.append(Race(
                     round=int(r.get("round", 0)),
                     name=r.get("raceName", ""),
                     circuit=circuit.get("circuitName", ""),
                     country=location.get("country", ""),
                     date=dt,
+                    circuit_id=circuit.get("circuitId"),
+                    locality=location.get("locality"),
+                    latitude=_safe_float(location.get("lat")),
+                    longitude=_safe_float(location.get("long")),
+                    has_sprint=has_sprint,
+                    sessions=sessions,
+                    status="COMPLETED" if dt < datetime.now(timezone.utc) else "SCHEDULED",
                 ))
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch F1 calendar: %s", e)
@@ -229,20 +244,27 @@ class F1Client(SportsDataClient):
         return self._races
 
     async def get_prediction_features(self, lookback_races: int = 8) -> dict:
-        """Build compact live/historical features for the F1 predictor."""
-        try:
-            resp = await self._client.get(f"/{self._season}/results.json?limit=1000")
-            resp.raise_for_status()
-            data = resp.json()
-            races_data = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
-        except (httpx.HTTPError, KeyError, ValueError) as e:
-            logger.warning("Failed to fetch F1 prediction features: %s", e)
-            races_data = []
+        """Build live, historical, circuit, and weather features for the F1 predictor."""
+        cache_key = (self._season, lookback_races)
+        cached = self._prediction_features_cache.get(cache_key)
+        if cached:
+            return cached
+
+        current_races = await self._fetch_season_results(self._season)
+        previous_races = []
+        for season in range(self._season - 1, max(2022, self._season - 3), -1):
+            previous_races.extend(await self._fetch_season_results(season))
+        races_data = current_races
+        all_races = current_races + previous_races
 
         driver_results: dict[str, list[dict]] = {}
         constructor_results: dict[str, list[dict]] = {}
-        for race in races_data:
+        track_results: dict[str, dict[str, list[dict]]] = {}
+        teammate_results: dict[tuple[int, int, str], list[dict]] = {}
+        for race in all_races:
             round_num = int(race.get("round", 0) or 0)
+            season = int(race.get("season", self._season) or self._season)
+            track_key = _track_key_from_raw_race(race)
             for item in race.get("Results") or []:
                 driver = item.get("Driver") or {}
                 constructor = item.get("Constructor") or {}
@@ -252,6 +274,8 @@ class F1Client(SportsDataClient):
                 grid_raw = item.get("grid")
                 result = {
                     "round": round_num,
+                    "season": season,
+                    "track_key": track_key,
                     "driver_id": driver_id,
                     "driver_name": f"{driver.get('givenName', '')} {driver.get('familyName', '')}".strip(),
                     "team": constructor.get("name", ""),
@@ -259,46 +283,95 @@ class F1Client(SportsDataClient):
                     "grid": int(grid_raw) if str(grid_raw).lstrip("-").isdigit() else None,
                     "points": float(item.get("points", 0) or 0),
                     "status": item.get("status") or "Unknown",
+                    "fastest_lap_rank": ((item.get("FastestLap") or {}).get("rank")),
                 }
                 if driver_id:
                     driver_results.setdefault(driver_id, []).append(result)
+                    track_results.setdefault(track_key, {}).setdefault(driver_id, []).append(result)
                 if constructor_name:
                     constructor_results.setdefault(constructor_name, []).append(result)
+                    teammate_results.setdefault((season, round_num, constructor_name), []).append(result)
+
+        teammate_deltas: dict[str, list[float]] = {}
+        for entries in teammate_results.values():
+            classified = [entry for entry in entries if isinstance(entry.get("position"), int)]
+            if len(classified) < 2:
+                continue
+            for entry in classified:
+                teammates = [other for other in classified if other.get("driver_id") != entry.get("driver_id")]
+                if not teammates:
+                    continue
+                best_mate = min(teammates, key=lambda item: item["position"])
+                teammate_deltas.setdefault(entry["driver_id"], []).append(float(best_mate["position"] - entry["position"]))
 
         max_driver_points = max((d.points for d in self._drivers), default=1.0) or 1.0
         max_constructor_points = max((c.points for c in self._constructors), default=1.0) or 1.0
 
         driver_features = {}
         for driver in self._drivers:
-            results = sorted(driver_results.get(driver.id, []), key=lambda item: item["round"], reverse=True)
+            results = sorted(driver_results.get(driver.id, []), key=lambda item: (item["season"], item["round"]), reverse=True)
+            current_results = [item for item in results if item.get("season") == self._season]
             recent = results[:lookback_races]
             classified = [item for item in recent if isinstance(item.get("position"), int)]
+            grids = [item["grid"] for item in recent if isinstance(item.get("grid"), int) and item.get("grid", 0) > 0]
+            grid_deltas = [
+                item["grid"] - item["position"]
+                for item in recent
+                if isinstance(item.get("grid"), int)
+                and item.get("grid", 0) > 0
+                and isinstance(item.get("position"), int)
+            ]
             avg_finish = (
                 sum(item["position"] for item in classified) / len(classified)
                 if classified else None
             )
+            avg_grid = sum(grids) / len(grids) if grids else None
+            avg_grid_delta = sum(grid_deltas) / len(grid_deltas) if grid_deltas else 0.0
             recent_points = sum(item.get("points", 0.0) for item in recent)
             podiums = sum(1 for item in recent if isinstance(item.get("position"), int) and item["position"] <= 3)
             wins = sum(1 for item in recent if item.get("position") == 1)
             dnfs = sum(1 for item in recent if not _is_finished_status(item.get("status")))
+            mechanical_dnfs = sum(1 for item in recent if _is_mechanical_status(item.get("status")))
+            incident_dnfs = sum(1 for item in recent if _is_incident_status(item.get("status")))
+            teammate_delta = _avg(teammate_deltas.get(driver.id) or [])
 
             standing_score = (driver.points / max_driver_points) if max_driver_points else 0.0
             finish_score = 0.45 if avg_finish is None else max(0.0, min(1.0, (21 - avg_finish) / 20))
             points_score = min(1.0, recent_points / max(1.0, lookback_races * 25.0))
             podium_score = min(1.0, podiums / max(1.0, min(lookback_races, 4)))
             reliability_score = 1.0 - min(0.7, dnfs / max(1, len(recent)) if recent else 0.15)
-            form_score = 0.38 * finish_score + 0.34 * points_score + 0.18 * podium_score + 0.10 * standing_score
+            qualifying_pace_score = 0.48 if avg_grid is None else max(0.02, min(1.0, (22 - avg_grid) / 21))
+            race_pace_score = max(0.02, min(1.0, finish_score + max(-0.12, min(0.12, avg_grid_delta / 50.0))))
+            teammate_score = max(0.02, min(1.0, 0.50 + teammate_delta / 12.0))
+            trend_score = _trend_score(current_results or recent)
+            form_score = (
+                0.30 * finish_score
+                + 0.25 * points_score
+                + 0.15 * podium_score
+                + 0.10 * standing_score
+                + 0.10 * qualifying_pace_score
+                + 0.10 * trend_score
+            )
 
             driver_features[driver.id] = {
                 "starts": len(results),
+                "current_season_starts": len(current_results),
                 "recent_starts": len(recent),
                 "recent_points": round(recent_points, 2),
                 "recent_avg_finish": round(avg_finish, 2) if avg_finish is not None else None,
+                "recent_avg_grid": round(avg_grid, 2) if avg_grid is not None else None,
+                "recent_grid_delta": round(avg_grid_delta, 2),
                 "recent_wins": wins,
                 "recent_podiums": podiums,
                 "recent_dnfs": dnfs,
+                "mechanical_dnfs": mechanical_dnfs,
+                "incident_dnfs": incident_dnfs,
                 "form_score": round(form_score, 4),
                 "reliability_score": round(reliability_score, 4),
+                "qualifying_pace_score": round(qualifying_pace_score, 4),
+                "race_pace_score": round(race_pace_score, 4),
+                "teammate_score": round(teammate_score, 4),
+                "trend_score": round(trend_score, 4),
                 "recent_summary": _recent_driver_summary(recent, avg_finish, podiums, dnfs),
             }
 
@@ -317,9 +390,15 @@ class F1Client(SportsDataClient):
                 "team_score": round(0.45 * standings_score + 0.35 * points_score + 0.20 * finish_score, 4),
                 "recent_points": round(recent_points, 2),
                 "recent_avg_finish": round(avg_finish, 2) if avg_finish is not None else None,
+                "recent_starts": len(recent),
+                "reliability_score": round(1.0 - min(0.55, sum(1 for item in recent if not _is_finished_status(item.get("status"))) / max(1, len(recent)) if recent else 0.10), 4),
             }
 
-        return {
+        weather_by_round = {}
+        for race in _weather_candidate_races(self._races):
+            weather_by_round[str(race.round)] = await self._weather_client.get_race_weather(race.latitude, race.longitude, race.date)
+
+        result = {
             "season": self._season,
             "lookback_races": lookback_races,
             "completed_races": len(races_data),
@@ -327,7 +406,54 @@ class F1Client(SportsDataClient):
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "drivers": driver_features,
             "constructors": constructor_features,
+            "races": {
+                str(race.round): {
+                    "round": race.round,
+                    "name": race.name,
+                    "circuit": race.circuit,
+                    "circuit_id": race.circuit_id,
+                    "country": race.country,
+                    "locality": race.locality,
+                    "latitude": race.latitude,
+                    "longitude": race.longitude,
+                    "date": race.date.isoformat(),
+                    "has_sprint": race.has_sprint,
+                    "sessions": race.sessions,
+                }
+                for race in self._races
+            },
+            "track_history": _track_history_features(track_results),
+            "weather_by_round": weather_by_round,
+            "source_coverage": {
+                "current_season_races": len(current_races),
+                "historical_races": len(previous_races),
+                "weather_races": len(weather_by_round),
+            },
         }
+        self._prediction_features_cache[cache_key] = result
+        return result
+
+    async def _fetch_season_results(self, season: int) -> list[dict]:
+        if season in self._season_results_cache:
+            return self._season_results_cache[season]
+        try:
+            resp = await self._client.get(f"/{season}/results.json?limit=2000")
+            resp.raise_for_status()
+            data = resp.json()
+            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch F1 season results for %s: %s", season, e)
+            races = []
+        self._season_results_cache[season] = races
+        return races
+
+    async def get_historical_race_results(self, season: int) -> list[dict]:
+        """Return raw Jolpica race-result rows for a season.
+
+        This is intentionally raw-ish so internal tools like backtesting can
+        replay races without reshaping through live-season dashboard models.
+        """
+        return await self._fetch_season_results(season)
 
     def get_race_by_round(self, round_num: int) -> Race | None:
         return next((r for r in self._races if r.round == round_num), None)
@@ -660,7 +786,7 @@ class F1Client(SportsDataClient):
         ]
         race_dt = race.date
         sessions = []
-        has_sprint = bool(raw.get("Sprint") or raw.get("SprintQualifying"))
+        has_sprint = bool(race.has_sprint or raw.get("Sprint") or raw.get("SprintQualifying") or raw.get("SprintShootout"))
         for code, name, api_key, offset_days, note in session_specs:
             if code in {"sprint", "sprint_qualifying"} and not has_sprint:
                 continue
@@ -886,6 +1012,7 @@ class F1Client(SportsDataClient):
 
     async def close(self):
         await self._client.aclose()
+        await self._weather_client.close()
 
 
 def _is_finished_status(status: str | None) -> bool:
@@ -893,6 +1020,142 @@ def _is_finished_status(status: str | None) -> bool:
         return False
     normalized = status.lower()
     return normalized == "finished" or normalized.startswith("+") or "lap" in normalized
+
+
+def _is_mechanical_status(status: str | None) -> bool:
+    normalized = str(status or "").lower()
+    mechanical_tokens = [
+        "engine", "gearbox", "hydraulics", "power unit", "powerunit", "electrical",
+        "transmission", "brakes", "brake", "suspension", "oil", "water", "fuel",
+        "wheel", "puncture", "tyre", "tire", "overheating",
+    ]
+    return any(token in normalized for token in mechanical_tokens)
+
+
+def _is_incident_status(status: str | None) -> bool:
+    normalized = str(status or "").lower()
+    return any(token in normalized for token in ["accident", "collision", "spun", "damage", "crash", "withdrew"])
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _trend_score(results: list[dict]) -> float:
+    ordered = sorted(results, key=lambda item: (item.get("season", 0), item.get("round", 0)))
+    classified = [item for item in ordered if isinstance(item.get("position"), int)]
+    if len(classified) < 2:
+        return 0.50
+    midpoint = max(1, len(classified) // 2)
+    early = classified[:midpoint]
+    late = classified[midpoint:]
+    early_avg = _avg([float(item["position"]) for item in early])
+    late_avg = _avg([float(item["position"]) for item in late])
+    return max(0.02, min(1.0, 0.50 + (early_avg - late_avg) / 18.0))
+
+
+def _track_key_from_raw_race(race: dict) -> str:
+    circuit = race.get("Circuit") or {}
+    location = circuit.get("Location") or {}
+    text = f"{race.get('raceName', '')} {circuit.get('circuitName', '')} {location.get('country', '')}"
+    normalized = _slug(text)
+    for key in [
+        "albertpark", "shanghai", "suzuka", "miami", "bahrain", "jeddah", "monaco",
+        "barcelona", "redbullring", "silverstone", "spa", "hungaroring", "zandvoort",
+        "monza", "baku", "marinabay", "cota", "mexico", "interlagos", "lasvegas",
+        "losail", "yasmarina", "imola",
+    ]:
+        if key in normalized:
+            return key
+    if "gilles" in normalized or "canadian" in normalized:
+        return "gilles"
+    return normalized[:32] or "default"
+
+
+def _track_history_features(track_results: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:
+    rows = {}
+    for track_key, by_driver in track_results.items():
+        driver_rows = {}
+        for driver_id, results in by_driver.items():
+            classified = [item for item in results if isinstance(item.get("position"), int)]
+            if not classified:
+                continue
+            points = sum(float(item.get("points") or 0.0) for item in results)
+            avg_finish = _avg([float(item["position"]) for item in classified])
+            wins = sum(1 for item in classified if item.get("position") == 1)
+            podiums = sum(1 for item in classified if item.get("position", 99) <= 3)
+            driver_rows[driver_id] = {
+                "starts": len(results),
+                "avg_finish": round(avg_finish, 2),
+                "points": round(points, 2),
+                "wins": wins,
+                "podiums": podiums,
+                "track_score": round(max(0.02, min(1.0, (22 - avg_finish) / 21 + min(0.10, podiums * 0.025))), 4),
+            }
+        rows[track_key] = {"drivers": driver_rows, "source": "jolpica_multi_season_results", "missing_data": not bool(driver_rows)}
+    return rows
+
+
+def _weather_candidate_races(races: list[Race]) -> list[Race]:
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for race in races:
+        days = (race.date - now).days
+        if -3 <= days <= 16:
+            candidates.append(race)
+    if not candidates:
+        next_race = next((race for race in races if race.date >= now), None)
+        if next_race:
+            candidates.append(next_race)
+    return candidates[:4]
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_session_datetime(raw: dict, fallback: datetime) -> datetime:
+    if not raw:
+        return fallback
+    date_str = raw.get("date") or fallback.date().isoformat()
+    time_str = (raw.get("time") or fallback.time().isoformat()).rstrip("Z")
+    try:
+        return datetime.fromisoformat(f"{date_str}T{time_str}").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return fallback
+
+
+def _parse_calendar_sessions(raw_race: dict, race_dt: datetime) -> list[dict]:
+    specs = [
+        ("fp1", "Practice 1", "FirstPractice", -2),
+        ("fp2", "Practice 2", "SecondPractice", -2),
+        ("fp3", "Practice 3", "ThirdPractice", -1),
+        ("sprint_qualifying", "Sprint Qualifying", "SprintQualifying", -1),
+        ("sprint", "Sprint", "Sprint", -1),
+        ("qualifying", "Qualifying", "Qualifying", -1),
+        ("race", "Race", None, 0),
+    ]
+    has_sprint = bool(raw_race.get("Sprint") or raw_race.get("SprintQualifying") or raw_race.get("SprintShootout"))
+    sessions = []
+    now = datetime.now(timezone.utc)
+    for code, name, api_key, offset_days in specs:
+        if code in {"sprint", "sprint_qualifying"} and not has_sprint:
+            continue
+        dt = race_dt + _safe_day_delta(offset_days)
+        if api_key and raw_race.get(api_key):
+            dt = _parse_session_datetime(raw_race.get(api_key) or {}, race_dt)
+        sessions.append({
+            "code": code,
+            "name": name,
+            "date": dt.isoformat(),
+            "status": "completed" if dt < now else "scheduled",
+        })
+    return sessions
 
 
 def _slug(value: str | None) -> str:

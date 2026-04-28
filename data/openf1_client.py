@@ -29,6 +29,80 @@ class OpenF1Client:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def get_session_data(self, race: Race, session: str = "race", live: bool = False) -> dict[str, Any]:
+        session_kind = _session_kind(session)
+        session_rows = await self._find_session_candidates(race, session_kind, live)
+        if not session_rows:
+            return {"ok": False, "source": "openf1", "reason": "openf1_session_unavailable", "session": session_kind}
+        row = session_rows[0]
+        return {"ok": True, "source": "openf1", "session": session_kind, **row}
+
+    async def get_session_features(self, race: Race, session: str = "race", drivers: list[Driver] | None = None, live: bool = False) -> dict[str, Any]:
+        session_info = await self.get_session_data(race, session, live)
+        if not session_info.get("ok"):
+            return session_info
+        session_key = session_info.get("session_key")
+        if not session_key:
+            return {"ok": False, "source": "openf1", "reason": "openf1_session_key_missing"}
+
+        lap_rows = await self.get_laps(int(session_key))
+        position_rows = await self.get_positions(int(session_key))
+        interval_rows = await self.get_intervals(int(session_key))
+        stint_rows = await self.get_stints(int(session_key))
+        pit_rows = await self.get_pits(int(session_key))
+        weather_rows = await self.get_weather(int(session_key))
+        race_control_rows = await self.get_race_control(int(session_key))
+        return {
+            "ok": True,
+            "source": "openf1",
+            "session": session_info.get("session"),
+            "session_key": session_key,
+            "meeting_key": session_info.get("meeting_key"),
+            "laps": _summarize_laps(lap_rows, drivers or []),
+            "positions": _summarize_positions(position_rows, drivers or []),
+            "intervals": _summarize_intervals(interval_rows, drivers or []),
+            "stints": _summarize_stints(stint_rows, drivers or []),
+            "pits": _summarize_pits(pit_rows, drivers or []),
+            "weather": _summarize_weather(weather_rows),
+            "race_control": _summarize_race_control(race_control_rows),
+            "raw_counts": {
+                "laps": len(lap_rows),
+                "positions": len(position_rows),
+                "intervals": len(interval_rows),
+                "stints": len(stint_rows),
+                "pits": len(pit_rows),
+                "weather": len(weather_rows),
+                "race_control": len(race_control_rows),
+            },
+        }
+
+    async def get_laps(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/laps", {"session_key": session_key, **filters})
+
+    async def get_positions(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/position", {"session_key": session_key, **filters})
+
+    async def get_intervals(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/intervals", {"session_key": session_key, **filters})
+
+    async def get_stints(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/stints", {"session_key": session_key, **filters})
+
+    async def get_pits(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/pit", {"session_key": session_key, **filters})
+
+    async def get_weather(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/weather", {"session_key": session_key, **filters})
+
+    async def get_race_control(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/race_control", {"session_key": session_key, **filters})
+
+    async def get_car_data(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/car_data", {"session_key": session_key, **filters})
+
+    async def get_location(self, session_key: int, **filters: Any) -> list[dict[str, Any]]:
+        return await self._get_list("/location", {"session_key": session_key, **filters})
+
     async def get_track_data(
         self,
         race: Race,
@@ -232,6 +306,186 @@ class OpenF1Client:
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
             return []
+
+
+def _driver_code_by_number(drivers: list[Driver]) -> dict[int, str]:
+    return {int(driver.number): driver.code for driver in drivers if driver.number is not None}
+
+
+def _summarize_laps(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
+    by_number: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            number = int(row.get("driver_number"))
+            duration = float(row.get("lap_duration"))
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            by_number.setdefault(number, []).append({**row, "lap_duration": duration})
+    codes = _driver_code_by_number(drivers)
+    driver_rows = {}
+    for number, laps in by_number.items():
+        durations = [float(row["lap_duration"]) for row in laps]
+        clean = sorted(durations)[: max(1, min(5, len(durations)))]
+        driver_rows[str(number)] = {
+            "driver_number": number,
+            "driver_code": codes.get(number),
+            "laps": len(laps),
+            "best_lap": round(min(durations), 3),
+            "median_lap": round(sorted(durations)[len(durations) // 2], 3),
+            "representative_lap": round(sum(clean) / len(clean), 3),
+        }
+    return {"drivers": driver_rows, "source": "openf1_laps", "missing_data": not bool(driver_rows)}
+
+
+def _summarize_positions(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
+    latest: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            number = int(row.get("driver_number"))
+            position = int(row.get("position"))
+        except (TypeError, ValueError):
+            continue
+        current = latest.get(number)
+        if current is None or str(row.get("date") or "") > str(current.get("date") or ""):
+            latest[number] = {**row, "position": position}
+    codes = _driver_code_by_number(drivers)
+    return {
+        "drivers": {
+            str(number): {"driver_number": number, "driver_code": codes.get(number), "position": row["position"], "date": row.get("date")}
+            for number, row in latest.items()
+        },
+        "source": "openf1_position",
+        "missing_data": not bool(latest),
+    }
+
+
+def _summarize_intervals(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
+    latest: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            number = int(row.get("driver_number"))
+        except (TypeError, ValueError):
+            continue
+        current = latest.get(number)
+        if current is None or str(row.get("date") or "") > str(current.get("date") or ""):
+            latest[number] = row
+    codes = _driver_code_by_number(drivers)
+    return {
+        "drivers": {
+            str(number): {
+                "driver_number": number,
+                "driver_code": codes.get(number),
+                "gap_to_leader": row.get("gap_to_leader"),
+                "interval": row.get("interval"),
+                "date": row.get("date"),
+            }
+            for number, row in latest.items()
+        },
+        "source": "openf1_intervals",
+        "missing_data": not bool(latest),
+    }
+
+
+def _summarize_stints(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
+    by_number: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            number = int(row.get("driver_number"))
+        except (TypeError, ValueError):
+            continue
+        by_number.setdefault(number, []).append(row)
+    codes = _driver_code_by_number(drivers)
+    return {
+        "drivers": {
+            str(number): {
+                "driver_number": number,
+                "driver_code": codes.get(number),
+                "stints": len(stints),
+                "compounds": sorted({str(item.get("compound")) for item in stints if item.get("compound")}),
+                "avg_stint_laps": round(sum(_stint_laps(item) for item in stints) / len(stints), 2) if stints else None,
+            }
+            for number, stints in by_number.items()
+        },
+        "source": "openf1_stints",
+        "missing_data": not bool(by_number),
+    }
+
+
+def _summarize_pits(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
+    by_number: dict[int, list[float]] = {}
+    for row in rows:
+        try:
+            number = int(row.get("driver_number"))
+            duration = float(row.get("pit_duration"))
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            by_number.setdefault(number, []).append(duration)
+    codes = _driver_code_by_number(drivers)
+    return {
+        "drivers": {
+            str(number): {
+                "driver_number": number,
+                "driver_code": codes.get(number),
+                "pit_stops": len(durations),
+                "avg_pit_duration": round(sum(durations) / len(durations), 3),
+            }
+            for number, durations in by_number.items()
+        },
+        "source": "openf1_pit",
+        "missing_data": not bool(by_number),
+    }
+
+
+def _summarize_weather(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"source": "openf1_weather", "missing_data": True}
+    latest = rows[-1]
+    rainfall_rows = [row for row in rows if str(row.get("rainfall")).lower() in {"1", "true", "yes"}]
+    return {
+        "air_temperature": _float_or_none(latest.get("air_temperature")),
+        "track_temperature": _float_or_none(latest.get("track_temperature")),
+        "humidity": _float_or_none(latest.get("humidity")),
+        "wind_speed": _float_or_none(latest.get("wind_speed")),
+        "rain_probability": round(len(rainfall_rows) / len(rows), 4),
+        "chaos_score": round(min(1.0, len(rainfall_rows) / len(rows) * 0.75 + (float(latest.get("wind_speed") or 0) / 60.0) * 0.25), 4),
+        "samples": len(rows),
+        "source": "openf1_weather",
+        "missing_data": False,
+    }
+
+
+def _summarize_race_control(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"source": "openf1_race_control", "missing_data": True}
+    text = " ".join(str(row.get("message") or row.get("category") or "").lower() for row in rows)
+    safety_count = text.count("safety car") + text.count("virtual safety car")
+    flag_count = text.count("yellow") + text.count("red flag")
+    return {
+        "messages": len(rows),
+        "safety_car_messages": safety_count,
+        "flag_messages": flag_count,
+        "chaos_score": round(min(1.0, safety_count * 0.12 + flag_count * 0.04), 4),
+        "source": "openf1_race_control",
+        "missing_data": False,
+    }
+
+
+def _stint_laps(row: dict[str, Any]) -> int:
+    try:
+        start = int(row.get("lap_start"))
+        end = int(row.get("lap_end"))
+        return max(0, end - start + 1)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _session_kind(session: str) -> str:
