@@ -1,0 +1,27 @@
+# Local dev stack for the f1_ml package.
+#
+# NOTE: most AyniLabs dev machines already have a `redis` container running on
+# port 6379 (shared with other services). This compose only matters if you
+# don't. If you do, skip it — f1_ml will use the existing instance because all
+# our keys are namespaced under `f1:*`.
+#
+#   docker compose up -d        # start Redis (only if 6379 is free)
+#   docker compose down         # stop & remove
+#   docker compose logs redis   # tail logs
+#
+# The ml/.venv talks to redis://localhost:6379, matching the .NET dashboard's
+# Common/Redis defaults so both sides see the same snapshot keys.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: f1ml-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # no persistence in dev
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped

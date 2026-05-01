@@ -15,3 +15,15 @@ ENV/
 *.sqlite3
 *.db
 data_cache/
+
+# f1_ml caches and artifacts
+.fastf1_cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+artifacts/
+*.pkl
+*.pt
+*.onnx
+*.parquet
+.ipynb_checkpoints/
