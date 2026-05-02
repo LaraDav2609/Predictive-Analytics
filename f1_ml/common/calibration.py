@@ -39,24 +39,61 @@ def reliability_curve(probs: np.ndarray, outcomes: np.ndarray, n_bins: int = 10)
 
 
 class PlattScaler:
-    """Logistic post-hoc calibration. Fit on held-out validation predictions."""
+    """Logistic post-hoc calibration. Fit on held-out validation predictions.
+
+    Maps raw model probabilities `p` through a 1-feature logistic regression on
+    the logit of `p`:  calibrated = sigmoid(a * logit(p) + b).
+
+    `a=1, b=0` is the identity (no recalibration). Fit produces (a, b) that
+    minimize log loss on held-out (probs, outcomes) pairs.
+    """
 
     def __init__(self) -> None:
         self.a: float = 1.0
         self.b: float = 0.0
 
     def fit(self, probs: np.ndarray, outcomes: np.ndarray) -> "PlattScaler":
-        raise NotImplementedError("fit logistic regression of outcomes on logit(probs)")
+        from sklearn.linear_model import LogisticRegression
+
+        eps = 1e-9
+        p = np.clip(np.asarray(probs, dtype=float), eps, 1 - eps)
+        logits = np.log(p / (1 - p))
+        y = np.asarray(outcomes, dtype=int)
+        if len(np.unique(y)) < 2:
+            # Only one outcome class observed; cannot fit. Leave at identity.
+            return self
+        model = LogisticRegression(C=1e9, solver="lbfgs")  # near-unregularized
+        model.fit(logits.reshape(-1, 1), y)
+        self.a = float(model.coef_[0, 0])
+        self.b = float(model.intercept_[0])
+        return self
 
     def transform(self, probs: np.ndarray) -> np.ndarray:
-        raise NotImplementedError
+        eps = 1e-9
+        p = np.clip(np.asarray(probs, dtype=float), eps, 1 - eps)
+        logits = np.log(p / (1 - p))
+        return 1.0 / (1.0 + np.exp(-(self.a * logits + self.b)))
 
 
 class IsotonicCalibrator:
-    """Non-parametric monotonic calibration. More flexible than Platt; needs more data."""
+    """Non-parametric monotonic calibration. More flexible than Platt; needs more data.
+
+    Wraps sklearn.isotonic.IsotonicRegression. Output is a step-monotone
+    function of the input probabilities; clipped to [0, 1] at the boundaries.
+    """
+
+    def __init__(self) -> None:
+        self._model = None  # type: ignore[assignment]
 
     def fit(self, probs: np.ndarray, outcomes: np.ndarray) -> "IsotonicCalibrator":
-        raise NotImplementedError("wrap sklearn.isotonic.IsotonicRegression")
+        from sklearn.isotonic import IsotonicRegression
+
+        self._model = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        self._model.fit(np.asarray(probs, dtype=float), np.asarray(outcomes, dtype=float))
+        return self
 
     def transform(self, probs: np.ndarray) -> np.ndarray:
-        raise NotImplementedError
+        if self._model is None:
+            # Identity if not yet fit.
+            return np.asarray(probs, dtype=float)
+        return self._model.predict(np.asarray(probs, dtype=float))
