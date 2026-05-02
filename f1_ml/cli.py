@@ -16,13 +16,80 @@ app = typer.Typer(help="Formula 1 race prediction & trading ML CLI.")
 @app.command()
 def backtest(
     season: int = typer.Option(..., help="Season to test on; trains on all earlier seasons."),
-    provider: str = typer.Option("fastf1", help="TelemetryProvider name."),
-    sim_iterations: int = typer.Option(50_000),
-    output_dir: str = typer.Option("artifacts/backtest"),
+    provider: str = typer.Option("synthetic", help="TelemetryProvider name. 'synthetic' or 'fastf1'."),
+    training_seasons: str = typer.Option(
+        "",
+        help="Comma-separated training seasons (e.g. '2022,2023'). Default: all seasons before --season.",
+    ),
+    min_training_races: int = typer.Option(20, help="Skip a test race if fewer training races available."),
+    output_dir: str = typer.Option("artifacts/backtest", help="Directory to write per-race + aggregate CSVs."),
 ) -> None:
-    """Walk-forward backtest over a full season."""
-    typer.echo(f"[stub] backtest season={season} provider={provider}")
-    raise NotImplementedError("wire up f1_ml.backtest.walk_forward.run")
+    """Walk-forward backtest over a full season.
+
+    Default uses a synthetic provider — quick smoke run without network. Pass
+    `--provider fastf1` to use historical telemetry (slow first time).
+    """
+    import json
+    import os
+    from datetime import datetime, timezone
+
+    from f1_ml.backtest.walk_forward import RaceData, WalkForwardConfig, run as run_walk_forward
+
+    if training_seasons:
+        train_seasons = tuple(int(s.strip()) for s in training_seasons.split(",") if s.strip())
+    else:
+        train_seasons = tuple(range(season - 3, season + 1))
+
+    if provider == "synthetic":
+        # Smoke-test path: synthesize a few races so the harness exercises end-to-end
+        # without any external dependencies.
+        races: list[RaceData] = []
+        all_drivers = ["VER", "HAM", "LEC", "NOR", "PIA", "RUS", "ALO", "SAI"]
+        for s in (*train_seasons, season):
+            for r in range(1, 11):
+                races.append(RaceData(
+                    race_id=f"{s}-{r:02d}-SYN",
+                    season=s, round=r,
+                    decision_time=datetime(s, max(1, min(12, r)), 1, 12, 0, tzinfo=timezone.utc),
+                    finish_order=all_drivers.copy(),
+                ))
+
+        class _UniformPredictor:
+            """Equal-probability baseline; useful as a calibration floor."""
+            def predict(self, race: RaceData) -> dict[str, dict[str, float]]:
+                n = len(race.finish_order)
+                return {
+                    "winner": {d: 1.0 / n for d in race.finish_order},
+                    "podium": {d: 3.0 / n for d in race.finish_order},
+                }
+
+        result = run_walk_forward(
+            WalkForwardConfig(
+                test_season=season,
+                training_seasons=train_seasons,
+                min_training_races=min_training_races,
+            ),
+            races,
+            model_factory=lambda _train: _UniformPredictor(),
+        )
+    else:
+        raise typer.BadParameter(
+            f"provider '{provider}' is not yet wired into backtest; only 'synthetic' is supported"
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_path = os.path.join(output_dir, f"per_race_metrics_{season}.csv")
+    aggregate_path = os.path.join(output_dir, f"aggregate_metrics_{season}.json")
+    result.per_race_metrics.to_csv(metrics_path, index=False)
+    with open(aggregate_path, "w") as f:
+        json.dump(result.aggregate_metrics, f, indent=2)
+
+    typer.echo(f"\nWalk-forward backtest done.")
+    typer.echo(f"  per-race metrics: {metrics_path}")
+    typer.echo(f"  aggregate:        {aggregate_path}")
+    if result.aggregate_metrics:
+        for k, v in result.aggregate_metrics.items():
+            typer.echo(f"    {k:35s} {v:.4f}")
 
 
 @app.command()

@@ -52,7 +52,38 @@ class MultiTaskModel(nn.Module):
         }
 
 
-def uncertainty_weighted_loss(losses: dict[str, torch.Tensor], log_vars: torch.Tensor) -> torch.Tensor:
-    """Kendall-et-al combined loss: each task's loss is divided by exp(log_var)
-    plus a regularizer; learnable per-task weights."""
-    raise NotImplementedError
+TASK_NAMES = ("pace", "dnf", "overtake", "pit_time")
+
+
+def uncertainty_weighted_loss(
+    losses: dict[str, torch.Tensor],
+    log_vars: torch.Tensor,
+    task_names: tuple[str, ...] = TASK_NAMES,
+) -> torch.Tensor:
+    """Kendall et al. 2018 multi-task loss with learnable per-task uncertainty.
+
+    L_total = Σ_i  exp(-log_var_i) * L_i  +  log_var_i
+
+    where `log_var_i = log(σ_i²)` is a learnable parameter. The first term
+    down-weights losses with high task noise; the second is a regularizer that
+    keeps log_var from drifting to -∞ (which would zero the loss).
+
+    Args:
+        losses: dict[task_name, scalar tensor] — each task's per-batch loss.
+        log_vars: 1-D tensor with one entry per task, in `task_names` order.
+        task_names: order of `log_vars`. Defaults to TASK_NAMES.
+
+    Returns:
+        Combined scalar loss.
+    """
+    if log_vars.shape != (len(task_names),):
+        raise ValueError(
+            f"log_vars shape {tuple(log_vars.shape)} != ({len(task_names)},)"
+        )
+    total = torch.zeros(1, dtype=log_vars.dtype, device=log_vars.device).squeeze()
+    for i, name in enumerate(task_names):
+        if name not in losses:
+            continue
+        precision = torch.exp(-log_vars[i])
+        total = total + precision * losses[name] + log_vars[i]
+    return total
