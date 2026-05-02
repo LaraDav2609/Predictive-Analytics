@@ -399,6 +399,39 @@ def test_physical_mode_dirty_air_runs_and_changes_outcome():
     )
 
 
+def test_seed_publisher_jitter_normalization():
+    """Seed publisher's jitter step must keep winner probabilities normalized."""
+    import numpy as np
+    from f1_ml.bridge.seed_publisher import _normalize, jitter_probabilities
+
+    initial = _normalize({"A": 0.5, "B": 0.3, "C": 0.2})
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        initial = jitter_probabilities(initial, sigma=0.1, rng=rng)
+        assert sum(initial.values()) == pytest.approx(1.0, abs=1e-9)
+        assert all(0 <= p <= 1 for p in initial.values())
+
+
+def test_seed_publisher_derived_distributions_well_formed():
+    """Podium / fastest-lap / DNF derivations should produce non-negative values
+    in the expected ranges."""
+    import numpy as np
+    from f1_ml.bridge.seed_publisher import _normalize, derive_dnf, derive_fl, derive_podium
+
+    winners = _normalize({"A": 0.6, "B": 0.25, "C": 0.10, "D": 0.05})
+    podium = derive_podium(winners)
+    assert all(0 <= v <= 0.95 for v in podium.values())
+    assert podium["A"] >= podium["B"] >= podium["C"]
+
+    fl = derive_fl(winners)
+    assert all(v >= 0 for v in fl.values())
+    assert sum(fl.values()) == pytest.approx(1.0, abs=1e-6)
+
+    rng = np.random.default_rng(0)
+    dnf = derive_dnf(winners, rng)
+    assert all(0 <= v <= 0.5 for v in dnf.values())
+
+
 def test_thin_slice_dnf_rate_drives_dnf_mass():
     """Increasing per-lap DNF hazard should monotonically increase observed DNF rate."""
     from f1_ml.markets.mapper import dnf_probabilities
