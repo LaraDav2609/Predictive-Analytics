@@ -1,12 +1,14 @@
 """Historical MLB routes backed by the free MLB Stats API."""
 
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 
 from data.mlb_historical_client import DEFAULT_STAT_GROUPS, MLBHistoricalClient
 
 router = APIRouter(prefix="/baseball/history", tags=["baseball-history"])
 
-client: MLBHistoricalClient | None = None
+client: Optional[MLBHistoricalClient] = None
 
 
 def init(historical_client: MLBHistoricalClient):
@@ -14,7 +16,7 @@ def init(historical_client: MLBHistoricalClient):
     client = historical_client
 
 
-def _parse_groups(group: str | None) -> list[str]:
+def _parse_groups(group: Optional[str]) -> list[str]:
     if not group:
         return DEFAULT_STAT_GROUPS
     return [part.strip() for part in group.split(",") if part.strip()]
@@ -23,8 +25,8 @@ def _parse_groups(group: str | None) -> list[str]:
 @router.get("/teams/{team_id}")
 async def get_team_history(
     team_id: int,
-    start_season: int | None = None,
-    end_season: int | None = None,
+    start_season: Optional[int] = None,
+    end_season: Optional[int] = None,
 ):
     history = await client.get_team_history(team_id, start_season, end_season)
     return {
@@ -50,7 +52,7 @@ async def get_team_roster(
 async def get_team_stats(
     team_id: int,
     season: int,
-    group: str | None = Query(default=None, description="Comma-separated: hitting,pitching,fielding"),
+    group: Optional[str] = Query(default=None, description="Comma-separated: hitting,pitching,fielding"),
     stats_type: str = Query(default="season"),
 ):
     stat_groups = _parse_groups(group)
@@ -68,7 +70,7 @@ async def get_team_stats(
 @router.get("/players/{player_id}")
 async def get_player_profile(
     player_id: int,
-    season: int | None = None,
+    season: Optional[int] = None,
 ):
     try:
         player = await client.get_player_profile(player_id, season)
@@ -80,9 +82,9 @@ async def get_player_profile(
 @router.get("/players/{player_id}/stats")
 async def get_player_stats(
     player_id: int,
-    group: str | None = Query(default=None, description="Comma-separated: hitting,pitching,fielding"),
+    group: Optional[str] = Query(default=None, description="Comma-separated: hitting,pitching,fielding"),
     stat_type: str = Query(default="yearByYear"),
-    season: int | None = None,
+    season: Optional[int] = None,
 ):
     stat_groups = _parse_groups(group)
     try:

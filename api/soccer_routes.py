@@ -1,5 +1,7 @@
 """Soccer API routes."""
 
+from typing import Optional
+
 from fastapi import APIRouter, Query
 
 from data.football_data_client import FootballDataClient
@@ -8,8 +10,8 @@ from analytics.soccer_predictor import SoccerPredictor
 router = APIRouter(prefix="/soccer", tags=["soccer"])
 
 # Shared instances (initialized in server.py lifespan)
-client: FootballDataClient | None = None
-predictor: SoccerPredictor | None = None
+client: Optional[FootballDataClient] = None
+predictor: Optional[SoccerPredictor] = None
 
 
 def init(fc: FootballDataClient, sp: SoccerPredictor):
@@ -24,7 +26,7 @@ async def get_teams():
 
 
 @router.get("/matches")
-async def get_matches(filter: str = Query("all", regex="^(all|upcoming|past)$")):
+async def get_matches(filter: str = Query("all", pattern="^(all|upcoming|past)$")):
     matches = client.get_matches(filter_status=filter if filter != "all" else None)
     # Attach predictions to scheduled matches
     if predictor:

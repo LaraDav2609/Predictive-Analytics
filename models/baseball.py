@@ -1,6 +1,8 @@
 """Baseball (MLB) data models."""
 
 from datetime import datetime
+from typing import Optional, Union
+
 from pydantic import BaseModel
 
 
@@ -30,13 +32,13 @@ class MLBGame(BaseModel):
     home_abbrev: str = ""
     away_abbrev: str = ""
     date: datetime
-    venue: str | None = None
+    venue: Optional[str] = None
     status: str = "SCHEDULED"  # SCHEDULED, LIVE, FINAL
-    home_score: int | None = None
-    away_score: int | None = None
-    home_pitcher: str | None = None
-    away_pitcher: str | None = None
-    prediction: "MLBPrediction | None" = None
+    home_score: Optional[int] = None
+    away_score: Optional[int] = None
+    home_pitcher: Optional[str] = None
+    away_pitcher: Optional[str] = None
+    prediction: Optional["MLBPrediction"] = None
 
 
 class MLBPrediction(BaseModel):
@@ -63,7 +65,7 @@ class MLBStanding(BaseModel):
 
 class MLBHistoricalTeamSeason(BaseModel):
     team_id: int
-    season: int | None = None
+    season: Optional[int] = None
     name: str
     location_name: str = ""
     franchise_name: str = ""
@@ -79,13 +81,13 @@ class MLBHistoricalTeamSeason(BaseModel):
 class MLBHistoricalRosterPlayer(BaseModel):
     player_id: int
     full_name: str
-    jersey_number: str | None = None
+    jersey_number: Optional[str] = None
     position: str = ""
     status: str = ""
     status_description: str = ""
-    batting_side: str | None = None
-    pitching_hand: str | None = None
-    birth_date: str | None = None
+    batting_side: Optional[str] = None
+    pitching_hand: Optional[str] = None
+    birth_date: Optional[str] = None
 
 
 class MLBHistoricalTeamRoster(BaseModel):
@@ -97,34 +99,34 @@ class MLBHistoricalTeamRoster(BaseModel):
 
 
 class MLBStatSplit(BaseModel):
-    season: str | None = None
+    season: Optional[str] = None
     stat_type: str = ""
     group: str = ""
-    team_id: int | None = None
-    team_name: str | None = None
-    league_name: str | None = None
-    player_id: int | None = None
-    player_name: str | None = None
-    stat: dict[str, str | int | float | None]
+    team_id: Optional[int] = None
+    team_name: Optional[str] = None
+    league_name: Optional[str] = None
+    player_id: Optional[int] = None
+    player_name: Optional[str] = None
+    stat: dict[str, Optional[Union[str, int, float]]]
 
 
 class MLBHistoricalPlayerProfile(BaseModel):
     player_id: int
     full_name: str
-    primary_number: str | None = None
-    birth_date: str | None = None
-    current_age: int | None = None
-    birth_city: str | None = None
-    birth_state_province: str | None = None
-    birth_country: str | None = None
-    height: str | None = None
-    weight: int | None = None
-    active: bool | None = None
-    primary_position: str | None = None
-    batting_side: str | None = None
-    pitching_hand: str | None = None
-    current_team_id: int | None = None
-    current_team_name: str | None = None
+    primary_number: Optional[str] = None
+    birth_date: Optional[str] = None
+    current_age: Optional[int] = None
+    birth_city: Optional[str] = None
+    birth_state_province: Optional[str] = None
+    birth_country: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[int] = None
+    active: Optional[bool] = None
+    primary_position: Optional[str] = None
+    batting_side: Optional[str] = None
+    pitching_hand: Optional[str] = None
+    current_team_id: Optional[int] = None
+    current_team_name: Optional[str] = None
 
 
 class MLBHistoricalPlayerStats(BaseModel):

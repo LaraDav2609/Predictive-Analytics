@@ -28,7 +28,7 @@ async def list_sports() -> list[SportInfo]:
         ),
         SportInfo(
             sport=Sport.BASEBALL, label="Baseball", icon="fa-baseball",
-            available=True, description="MLB 2026 season predictions",
+            available=True, href="/Sports#baseball", description="MLB 2026 season predictions",
         ),
         SportInfo(
             sport=Sport.TENNIS, label="Tennis", icon="fa-table-tennis-paddle-ball",

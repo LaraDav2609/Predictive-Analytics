@@ -1,4 +1,6 @@
 from enum import Enum
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -17,8 +19,8 @@ class Competition(BaseModel):
     name: str
     sport: Sport
     season: str
-    country: str | None = None
-    api_id: str | None = None
+    country: Optional[str] = None
+    api_id: Optional[str] = None
 
 
 class SportInfo(BaseModel):
@@ -26,5 +28,6 @@ class SportInfo(BaseModel):
     label: str
     icon: str
     available: bool
+    href: str = ""
     competitions: list[Competition] = []
     description: str = ""

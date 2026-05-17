@@ -1,4 +1,6 @@
 from datetime import datetime
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -13,7 +15,7 @@ class MatchPrediction(BaseModel):
 class MatchResult(BaseModel):
     home_score: int
     away_score: int
-    winner: str | None = None  # "HOME", "AWAY", "DRAW"
+    winner: Optional[str] = None  # "HOME", "AWAY", "DRAW"
 
 
 class Match(BaseModel):
@@ -22,13 +24,13 @@ class Match(BaseModel):
     away_team: str
     home_team_id: int
     away_team_id: int
-    home_crest: str | None = None
-    away_crest: str | None = None
+    home_crest: Optional[str] = None
+    away_crest: Optional[str] = None
     date: datetime
     competition: str
-    stage: str | None = None
-    group: str | None = None
-    venue: str | None = None
+    stage: Optional[str] = None
+    group: Optional[str] = None
+    venue: Optional[str] = None
     status: str = "SCHEDULED"  # SCHEDULED, LIVE, FINISHED, POSTPONED
-    result: MatchResult | None = None
-    prediction: MatchPrediction | None = None
+    result: Optional[MatchResult] = None
+    prediction: Optional[MatchPrediction] = None
