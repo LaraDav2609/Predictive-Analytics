@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,10 +21,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 # Shared client instances
-_football_client: FootballDataClient | None = None
-_f1_client: F1Client | None = None
-_mlb_client: MLBClient | None = None
-_mlb_historical_client: MLBHistoricalClient | None = None
+_football_client: Optional[FootballDataClient] = None
+_f1_client: Optional[F1Client] = None
+_mlb_client: Optional[MLBClient] = None
+_mlb_historical_client: Optional[MLBHistoricalClient] = None
 
 
 @asynccontextmanager

@@ -1,6 +1,7 @@
 """Client for historical MLB team and player data using the free MLB Stats API."""
 
 import logging
+from typing import Optional, Union
 
 import httpx
 
@@ -28,10 +29,10 @@ class MLBHistoricalClient:
     async def get_team_history(
         self,
         team_id: int,
-        start_season: int | None = None,
-        end_season: int | None = None,
+        start_season: Optional[int] = None,
+        end_season: Optional[int] = None,
     ) -> list[MLBHistoricalTeamSeason]:
-        params: dict[str, str | int] = {"teamIds": team_id}
+        params: dict[str, Union[str, int]] = {"teamIds": team_id}
         if start_season is not None:
             params["startSeason"] = start_season
         if end_season is not None:
@@ -67,7 +68,7 @@ class MLBHistoricalClient:
         self,
         team_id: int,
         season: int,
-        groups: list[str] | None = None,
+        groups: Optional[list[str]] = None,
         stats_type: str = "season",
     ) -> list[MLBStatSplit]:
         groups = groups or DEFAULT_STAT_GROUPS
@@ -85,9 +86,9 @@ class MLBHistoricalClient:
     async def get_player_profile(
         self,
         player_id: int,
-        season: int | None = None,
+        season: Optional[int] = None,
     ) -> MLBHistoricalPlayerProfile:
-        params: dict[str, str | int] = {}
+        params: dict[str, Union[str, int]] = {}
         if season is not None:
             params["season"] = season
         data = await self._get_json(f"/people/{player_id}", params=params)
@@ -99,13 +100,13 @@ class MLBHistoricalClient:
     async def get_player_year_by_year_stats(
         self,
         player_id: int,
-        groups: list[str] | None = None,
+        groups: Optional[list[str]] = None,
         stat_type: str = "yearByYear",
-        season: int | None = None,
+        season: Optional[int] = None,
     ) -> MLBHistoricalPlayerStats:
         groups = groups or DEFAULT_STAT_GROUPS
         hydrate = f"stats(group=[{','.join(groups)}],type=[{stat_type}])"
-        params: dict[str, str | int] = {"hydrate": hydrate}
+        params: dict[str, Union[str, int]] = {"hydrate": hydrate}
         if season is not None:
             params["season"] = season
 
@@ -123,7 +124,7 @@ class MLBHistoricalClient:
             splits=splits,
         )
 
-    async def _get_json(self, path: str, params: dict[str, str | int] | None = None) -> dict:
+    async def _get_json(self, path: str, params: Optional[dict[str, Union[str, int]]] = None) -> dict:
         try:
             resp = await self._client.get(path, params=params)
             resp.raise_for_status()

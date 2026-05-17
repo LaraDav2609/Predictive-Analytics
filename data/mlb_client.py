@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime, date, timezone
+from typing import Optional
 
 import httpx
 
@@ -177,7 +178,7 @@ class MLBClient(SportsDataClient):
     def get_schedule(self) -> list[MLBGame]:
         return self._schedule
 
-    def get_team_by_id(self, team_id: int) -> MLBTeam | None:
+    def get_team_by_id(self, team_id: int) -> Optional[MLBTeam]:
         return next((t for t in self._teams if t.id == team_id), None)
 
     @staticmethod

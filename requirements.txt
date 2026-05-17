@@ -34,6 +34,7 @@ redis>=5.0
 
 # Models
 pydantic>=2.7.0
+eval-type-backport>=0.2.0
 
 # Utilities
 python-dateutil>=2.9.0

@@ -1,5 +1,7 @@
 """MLB Baseball API routes."""
 
+from typing import Optional
+
 from fastapi import APIRouter
 
 from data.mlb_client import MLBClient
@@ -7,8 +9,8 @@ from analytics.baseball_predictor import BaseballPredictor
 
 router = APIRouter(prefix="/baseball", tags=["baseball"])
 
-client: MLBClient | None = None
-predictor: BaseballPredictor | None = None
+client: Optional[MLBClient] = None
+predictor: Optional[BaseballPredictor] = None
 
 
 def init(mc: MLBClient, bp: BaseballPredictor):

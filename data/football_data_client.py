@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime
+from typing import Optional
 
 import httpx
 
@@ -17,7 +18,7 @@ WC_CODE = "WC"  # FIFA World Cup competition code
 
 
 class FootballDataClient(SportsDataClient):
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: Optional[str] = None):
         headers = {"Accept": "application/json"}
         if api_key:
             headers["X-Auth-Token"] = api_key
@@ -149,20 +150,20 @@ class FootballDataClient(SportsDataClient):
     def get_teams(self) -> list[Team]:
         return self._teams
 
-    def get_matches(self, filter_status: str | None = None) -> list[Match]:
+    def get_matches(self, filter_status: Optional[str] = None) -> list[Match]:
         if filter_status == "upcoming":
             return [m for m in self._matches if m.status in ("SCHEDULED", "TIMED")]
         elif filter_status == "past":
             return [m for m in self._matches if m.status == "FINISHED"]
         return self._matches
 
-    def get_match_by_id(self, match_id: int) -> Match | None:
+    def get_match_by_id(self, match_id: int) -> Optional[Match]:
         return next((m for m in self._matches if m.id == match_id), None)
 
     def get_standings(self) -> list[dict]:
         return self._standings
 
-    def get_team_by_id(self, team_id: int) -> Team | None:
+    def get_team_by_id(self, team_id: int) -> Optional[Team]:
         return next((t for t in self._teams if t.id == team_id), None)
 
     @staticmethod

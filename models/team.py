@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -27,9 +29,9 @@ class Team(BaseModel):
     name: str
     short_name: str
     country_code: str
-    crest_url: str | None = None
-    fifa_ranking: int | None = None
+    crest_url: Optional[str] = None
+    fifa_ranking: Optional[int] = None
     elo_rating: float = 1500.0
-    group: str | None = None
+    group: Optional[str] = None
     stats: TeamStats = TeamStats()
     recent_form: list[str] = []  # e.g. ["W", "W", "D", "L", "W"]

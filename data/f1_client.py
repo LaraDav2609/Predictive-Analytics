@@ -1,5 +1,7 @@
 """Client for Ergast/Jolpica F1 API (free, no auth)."""
 
+from __future__ import annotations
+
 import logging
 import re
 from datetime import datetime, timedelta, timezone

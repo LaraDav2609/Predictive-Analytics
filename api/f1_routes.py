@@ -1,5 +1,7 @@
 """Formula 1 API routes."""
 
+from __future__ import annotations
+
 import json
 
 from fastapi import APIRouter
