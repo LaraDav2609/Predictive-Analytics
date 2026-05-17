@@ -1,7 +1,7 @@
 """Client for MLB Stats API (free, no auth required)."""
 
 import logging
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -120,10 +120,11 @@ class MLBClient(SportsDataClient):
     async def _fetch_schedule(self) -> None:
         try:
             today = date.today()
+            end_date = today + timedelta(days=7)
             resp = await self._client.get("/schedule", params={
                 "sportId": 1,
                 "startDate": today.isoformat(),
-                "endDate": today.isoformat(),
+                "endDate": end_date.isoformat(),
                 "hydrate": "probablePitcher,team",
             })
             resp.raise_for_status()
