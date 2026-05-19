@@ -125,52 +125,58 @@ class MLBClient(SportsDataClient):
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch MLB standings: %s", e)
 
-    async def _fetch_schedule(self) -> None:
+    def _parse_schedule_games(self, data, fallback_date: date) -> list[MLBGame]:
+        games: list[MLBGame] = []
+        for day in data.get("dates", []):
+            for g in day.get("games", []):
+                home = g.get("teams", {}).get("home", {})
+                away = g.get("teams", {}).get("away", {})
+                home_team = home.get("team", {})
+                away_team = away.get("team", {})
+
+                status_code = g.get("status", {}).get("abstractGameState", "Preview")
+                status_map = {"Preview": "SCHEDULED", "Live": "LIVE", "Final": "FINAL"}
+                status = status_map.get(status_code, "SCHEDULED")
+
+                home_pitcher = home.get("probablePitcher", {}).get("fullName")
+                away_pitcher = away.get("probablePitcher", {}).get("fullName")
+
+                games.append(MLBGame(
+                    id=g.get("gamePk", 0),
+                    home_team=home_team.get("name", ""),
+                    away_team=away_team.get("name", ""),
+                    home_team_id=home_team.get("id", 0),
+                    away_team_id=away_team.get("id", 0),
+                    home_abbrev=home_team.get("abbreviation", ""),
+                    away_abbrev=away_team.get("abbreviation", ""),
+                    date=datetime.fromisoformat(g.get("gameDate", fallback_date.isoformat()).replace("Z", "+00:00")),
+                    venue=g.get("venue", {}).get("name"),
+                    status=status,
+                    home_score=home.get("score"),
+                    away_score=away.get("score"),
+                    home_pitcher=home_pitcher,
+                    away_pitcher=away_pitcher,
+                ))
+        return games
+
+    async def fetch_schedule_range(self, start_date: date, end_date: date) -> list[MLBGame]:
+        """Fetch a custom date range without affecting the cached default schedule."""
         try:
-            today = date.today()
-            end_date = today + timedelta(days=7)
             resp = await self._client.get("/schedule", params={
                 "sportId": 1,
-                "startDate": today.isoformat(),
+                "startDate": start_date.isoformat(),
                 "endDate": end_date.isoformat(),
                 "hydrate": "probablePitcher,team",
             })
             resp.raise_for_status()
-            data = resp.json()
-            self._schedule = []
-            for day in data.get("dates", []):
-                for g in day.get("games", []):
-                    home = g.get("teams", {}).get("home", {})
-                    away = g.get("teams", {}).get("away", {})
-                    home_team = home.get("team", {})
-                    away_team = away.get("team", {})
-
-                    status_code = g.get("status", {}).get("abstractGameState", "Preview")
-                    status_map = {"Preview": "SCHEDULED", "Live": "LIVE", "Final": "FINAL"}
-                    status = status_map.get(status_code, "SCHEDULED")
-
-                    home_pitcher = home.get("probablePitcher", {}).get("fullName")
-                    away_pitcher = away.get("probablePitcher", {}).get("fullName")
-
-                    game = MLBGame(
-                        id=g.get("gamePk", 0),
-                        home_team=home_team.get("name", ""),
-                        away_team=away_team.get("name", ""),
-                        home_team_id=home_team.get("id", 0),
-                        away_team_id=away_team.get("id", 0),
-                        home_abbrev=home_team.get("abbreviation", ""),
-                        away_abbrev=away_team.get("abbreviation", ""),
-                        date=datetime.fromisoformat(g.get("gameDate", today.isoformat()).replace("Z", "+00:00")),
-                        venue=g.get("venue", {}).get("name"),
-                        status=status,
-                        home_score=home.get("score"),
-                        away_score=away.get("score"),
-                        home_pitcher=home_pitcher,
-                        away_pitcher=away_pitcher,
-                    )
-                    self._schedule.append(game)
+            return self._parse_schedule_games(resp.json(), start_date)
         except (httpx.HTTPError, KeyError, ValueError) as e:
-            logger.warning("Failed to fetch MLB schedule: %s", e)
+            logger.warning("Failed to fetch MLB schedule %s..%s: %s", start_date, end_date, e)
+            return []
+
+    async def _fetch_schedule(self) -> None:
+        today = date.today()
+        self._schedule = await self.fetch_schedule_range(today, today + timedelta(days=7))
 
     def _get_team_abbrev(self, team_id: int) -> str:
         for t in self._teams:

@@ -1,5 +1,6 @@
 """MLB Baseball API routes."""
 
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter
@@ -31,11 +32,24 @@ async def get_standings():
 
 
 @router.get("/schedule")
-async def get_schedule():
-    games = client.get_schedule()
+async def get_schedule(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+):
+    if start_date or end_date:
+        sd = start_date or date.today()
+        ed = end_date or (sd + timedelta(days=7))
+        games = await client.fetch_schedule_range(sd, ed)
+    else:
+        games = client.get_schedule()
     if predictor:
         games = predictor.predict_games(games)
-    return {"ok": True, "games": [g.model_dump(mode="json") for g in games]}
+    return {
+        "ok": True,
+        "games": [g.model_dump(mode="json") for g in games],
+        "start_date": (start_date.isoformat() if start_date else None),
+        "end_date": (end_date.isoformat() if end_date else None),
+    }
 
 
 @router.post("/refresh")
