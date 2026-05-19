@@ -81,14 +81,22 @@ class MLBClient(SportsDataClient):
             resp.raise_for_status()
             data = resp.json()
             self._standings = []
+            # MLB Stats API division IDs → short name. The /standings response
+            # sometimes returns an empty division.name, so fall back to the ID.
+            div_short_by_id = {
+                200: "West", 201: "East", 202: "Central",   # AL
+                203: "West", 204: "East", 205: "Central",   # NL
+            }
             for record in data.get("records", []):
                 division = record.get("division", {})
                 div_name = division.get("name", "")
                 league = record.get("league", {})
                 league_id = league.get("id", 0)
                 league_abbr = "AL" if league_id == 103 else "NL" if league_id == 104 else league.get("abbreviation", "")
-                # Extract short division name
+                # Extract short division name; prefer ID lookup when name is empty
                 short_div = div_name.replace("American League ", "").replace("National League ", "")
+                if not short_div:
+                    short_div = div_short_by_id.get(division.get("id", 0), "")
                 for entry in record.get("teamRecords", []):
                     team = entry.get("team", {})
                     streak_obj = entry.get("streak", {})
