@@ -3,7 +3,7 @@
 from datetime import date, timedelta
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from data.mlb_client import MLBClient
 from analytics.baseball_predictor import BaseballPredictor
@@ -50,6 +50,17 @@ async def get_schedule(
         "start_date": (start_date.isoformat() if start_date else None),
         "end_date": (end_date.isoformat() if end_date else None),
     }
+
+
+@router.get("/games/{game_pk}")
+async def get_game(game_pk: int):
+    game = await client.fetch_game(game_pk)
+    if not game:
+        raise HTTPException(status_code=404, detail=f"Game {game_pk} not found")
+    games = [game]
+    if predictor:
+        games = predictor.predict_games(games)
+    return {"ok": True, "game": games[0].model_dump(mode="json")}
 
 
 @router.post("/refresh")

@@ -159,6 +159,21 @@ class MLBClient(SportsDataClient):
                 ))
         return games
 
+    async def fetch_game(self, game_pk: int) -> Optional[MLBGame]:
+        """Fetch a single game by gamePk."""
+        try:
+            resp = await self._client.get("/schedule", params={
+                "sportId": 1,
+                "gamePk": game_pk,
+                "hydrate": "probablePitcher,team,linescore",
+            })
+            resp.raise_for_status()
+            games = self._parse_schedule_games(resp.json(), date.today())
+            return games[0] if games else None
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch MLB game %s: %s", game_pk, e)
+            return None
+
     async def fetch_schedule_range(self, start_date: date, end_date: date) -> list[MLBGame]:
         """Fetch a custom date range without affecting the cached default schedule."""
         try:
