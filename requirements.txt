@@ -29,6 +29,9 @@ transformers>=4.40
 # F1 telemetry source
 fastf1>=3.3
 
+# Baseball advanced metrics (FanGraphs/Baseball-Reference scraper)
+pybaseball>=2.2
+
 # Cache + queue
 redis>=5.0
 

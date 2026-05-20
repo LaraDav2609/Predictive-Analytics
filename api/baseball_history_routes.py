@@ -1,19 +1,23 @@
 """Historical MLB routes backed by the free MLB Stats API."""
 
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
 from data.mlb_historical_client import DEFAULT_STAT_GROUPS, MLBHistoricalClient
+from data.pybaseball_client import PybaseballClient
 
 router = APIRouter(prefix="/baseball/history", tags=["baseball-history"])
 
 client: Optional[MLBHistoricalClient] = None
+advanced_client: Optional[PybaseballClient] = None
 
 
-def init(historical_client: MLBHistoricalClient):
-    global client
+def init(historical_client: MLBHistoricalClient, pybaseball_client: Optional[PybaseballClient] = None):
+    global client, advanced_client
     client = historical_client
+    advanced_client = pybaseball_client
 
 
 def _parse_groups(group: Optional[str]) -> list[str]:
@@ -92,3 +96,34 @@ async def get_player_stats(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, **stats.model_dump()}
+
+
+@router.get("/players/{player_id}/advanced")
+async def get_player_advanced(
+    player_id: int,
+    years: int = Query(default=5, ge=1, le=15, description="How many recent seasons to fetch"),
+):
+    """Advanced FanGraphs metrics via pybaseball: WAR, wRC+, wOBA, FIP, etc.
+
+    Returns empty arrays if pybaseball isn't installed or the player isn't on FanGraphs.
+    """
+    if advanced_client is None or not advanced_client.is_available():
+        return {
+            "ok": True,
+            "available": False,
+            "reason": "pybaseball not installed",
+            "hitting": [],
+            "pitching": [],
+        }
+    current = date.today().year
+    year_list = list(range(current - years + 1, current + 1))
+    hitting = advanced_client.get_advanced_batting(player_id, year_list)
+    pitching = advanced_client.get_advanced_pitching(player_id, year_list)
+    return {
+        "ok": True,
+        "available": True,
+        "player_id": player_id,
+        "years": year_list,
+        "hitting": hitting,
+        "pitching": pitching,
+    }

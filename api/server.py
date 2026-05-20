@@ -11,6 +11,7 @@ from data.football_data_client import FootballDataClient
 from data.f1_client import F1Client
 from data.mlb_client import MLBClient
 from data.mlb_historical_client import MLBHistoricalClient
+from data.pybaseball_client import PybaseballClient
 from analytics.soccer_predictor import SoccerPredictor
 from analytics.f1_predictor import F1Predictor
 from analytics.baseball_predictor import BaseballPredictor
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     _f1_client = F1Client()
     _mlb_client = MLBClient()
     _mlb_historical_client = MLBHistoricalClient()
+    pybaseball_client = PybaseballClient()
 
     soccer_pred = SoccerPredictor()
     f1_pred = F1Predictor()
@@ -47,7 +49,7 @@ async def lifespan(app: FastAPI):
     soccer_routes.init(_football_client, soccer_pred)
     f1_routes.init(_f1_client, f1_pred)
     baseball_routes.init(_mlb_client, baseball_pred)
-    baseball_history_routes.init(_mlb_historical_client)
+    baseball_history_routes.init(_mlb_historical_client, pybaseball_client)
 
     # Initial data load
     try:
