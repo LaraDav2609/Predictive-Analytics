@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from f1_predictor.config import MODEL_VERSION
 
@@ -23,6 +23,7 @@ class RaceModelConfig:
     wdc_standings_progress: float
     reliability_dnf_multiplier: float
     probability_temperature: float = 1.0
+    stage_probability_profiles: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def public_dict(self) -> dict:
         return {
@@ -38,13 +39,13 @@ MODEL_CONFIGS: dict[str, RaceModelConfig] = {
         model_version=MODEL_VERSION,
         description="Current production ensemble weights.",
         race_weights={
-            "standing": 0.13,
+            "standing": 0.06,
             "form": 0.17,
-            "team": 0.15,
-            "performance": 0.18,
-            "qualifying_pace": 0.10,
-            "race_pace": 0.12,
-            "track_fit": 0.08,
+            "team": 0.14,
+            "performance": 0.19,
+            "qualifying_pace": 0.12,
+            "race_pace": 0.16,
+            "track_fit": 0.10,
             "tire_strategy": 0.04,
             "weather_risk": 0.03,
         },
@@ -74,7 +75,14 @@ MODEL_CONFIGS: dict[str, RaceModelConfig] = {
         wdc_standings_base=0.14,
         wdc_standings_progress=0.60,
         reliability_dnf_multiplier=0.75,
-        probability_temperature=1.0,
+        probability_temperature=1.10,
+        stage_probability_profiles={
+            "pre_weekend": {"temperature": 1.30, "confidence_scale": 0.82},
+            "practice_available": {"temperature": 1.20, "confidence_scale": 0.90},
+            "post_qualifying": {"temperature": 1.02, "confidence_scale": 1.00},
+            "live": {"temperature": 0.94, "confidence_scale": 1.08},
+            "completed": {"temperature": 0.70, "confidence_scale": 1.00},
+        },
     ),
     "calibrated_candidate_v1": RaceModelConfig(
         model_id="calibrated_candidate_v1",
@@ -119,6 +127,13 @@ MODEL_CONFIGS: dict[str, RaceModelConfig] = {
         wdc_standings_progress=0.56,
         reliability_dnf_multiplier=0.82,
         probability_temperature=1.08,
+        stage_probability_profiles={
+            "pre_weekend": {"temperature": 1.15, "confidence_scale": 0.84},
+            "practice_available": {"temperature": 1.06, "confidence_scale": 0.92},
+            "post_qualifying": {"temperature": 0.92, "confidence_scale": 1.02},
+            "live": {"temperature": 0.86, "confidence_scale": 1.10},
+            "completed": {"temperature": 0.70, "confidence_scale": 1.00},
+        },
     ),
     "conservative_v1": RaceModelConfig(
         model_id="conservative_v1",
@@ -163,6 +178,13 @@ MODEL_CONFIGS: dict[str, RaceModelConfig] = {
         wdc_standings_progress=0.52,
         reliability_dnf_multiplier=0.90,
         probability_temperature=1.18,
+        stage_probability_profiles={
+            "pre_weekend": {"temperature": 1.25, "confidence_scale": 0.78},
+            "practice_available": {"temperature": 1.18, "confidence_scale": 0.86},
+            "post_qualifying": {"temperature": 1.04, "confidence_scale": 0.94},
+            "live": {"temperature": 0.96, "confidence_scale": 1.00},
+            "completed": {"temperature": 0.78, "confidence_scale": 1.00},
+        },
     ),
 }
 

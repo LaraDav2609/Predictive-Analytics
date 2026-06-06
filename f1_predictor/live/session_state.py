@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from models.f1 import Driver, Race
+from f1_predictor.live.free_sources import (
+    enrich_free_live_state,
+    load_fastf1_recorded_state,
+    source_diagnostics,
+)
 
 
 class F1LiveSessionEngine:
@@ -41,6 +46,9 @@ class F1LiveSessionEngine:
         key = (int(race.round), session_key)
         if not self._openf1:
             state = self._unavailable_state(race, session_key, "openf1_client_unavailable")
+            recorded = load_fastf1_recorded_state(race, drivers, session_key)
+            if recorded.get("ok"):
+                state = enrich_free_live_state(state, race, drivers, {}, {}, recorded)
             self._store(key, state)
             return self._with_age(state)
 
@@ -49,9 +57,12 @@ class F1LiveSessionEngine:
             track = await self._openf1.get_track_data(race, drivers, session=session_key, live=True)
         except Exception as exc:
             state = self._unavailable_state(race, session_key, f"openf1_refresh_failed: {exc}")
+            recorded = load_fastf1_recorded_state(race, drivers, session_key)
+            state = enrich_free_live_state(state, race, drivers, {}, {}, recorded)
             self._store(key, state)
             return self._with_age(state)
 
+        recorded = load_fastf1_recorded_state(race, drivers, session_key)
         state = build_live_state(
             race=race,
             drivers=drivers,
@@ -60,8 +71,21 @@ class F1LiveSessionEngine:
             track=track if isinstance(track, dict) else {},
             ttl_seconds=self._ttl_seconds,
         )
+        state = enrich_free_live_state(
+            state=state,
+            race=race,
+            drivers=drivers,
+            openf1_session=session_features if isinstance(session_features, dict) else {},
+            track=track if isinstance(track, dict) else {},
+            recorded=recorded,
+        )
         self._store(key, state)
         return self._with_age(state)
+
+    def get_sources(self, race: Race, session: str = "race") -> dict[str, Any]:
+        session_key = _session_kind(session)
+        key = (int(race.round), session_key)
+        return source_diagnostics(self._with_age(self._cache.get(key)))
 
     def get_timeline(self, race: Race, session: str = "race") -> dict[str, Any]:
         session_key = _session_kind(session)
@@ -74,6 +98,45 @@ class F1LiveSessionEngine:
             "current": self._with_age(current) if current else None,
             "events": list(self._timeline.get(key, [])),
         }
+
+    def record_probability_snapshot(self, race: Race, session: str, payload: dict[str, Any]) -> dict[str, Any]:
+        session_key = _session_kind(session)
+        key = (int(race.round), session_key)
+        rows = payload.get("probabilities") or payload.get("simulations") or []
+        top = []
+        for row in rows[:5]:
+            top.append({
+                "driver_id": row.get("driver_id"),
+                "driver_code": row.get("driver_code") or row.get("code"),
+                "driver_name": row.get("driver_name") or row.get("name"),
+                "team": row.get("team"),
+                "win_probability": row.get("win_probability"),
+                "raw_probability": row.get("raw_probability"),
+                "live_adjusted_probability": row.get("live_adjusted_probability"),
+                "live_probability_delta": row.get("live_probability_delta"),
+                "expected_finish": row.get("expected_finish"),
+            })
+        movers = payload.get("top_probability_movers") or []
+        dynamics = payload.get("live_dynamics") or {}
+        event = {
+            "at": payload.get("generated_at") or datetime.now(timezone.utc).isoformat(),
+            "type": "probability_snapshot",
+            "mode": payload.get("source_mode"),
+            "source_mode": payload.get("source_mode"),
+            "confidence": payload.get("confidence"),
+            "stage": payload.get("stage"),
+            "top": top,
+            "top5": top,
+            "movers": movers[:5] if isinstance(movers, list) else [],
+            "live_dynamics_summary": dynamics.get("summary") or [],
+            "chaos_score": ((payload.get("truth") or {}).get("signals") or {}).get("chaos_score") or (payload.get("weather") or {}).get("chaos_score"),
+            "fallback_reason": payload.get("fallback_reason"),
+        }
+        events = self._timeline.setdefault(key, [])
+        events.append(event)
+        if len(events) > self._max_timeline:
+            del events[: len(events) - self._max_timeline]
+        return {"ok": True, "events": len(events), "latest_type": event["type"]}
 
     def health(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -100,15 +163,21 @@ class F1LiveSessionEngine:
             "round": state.get("round"),
             "session": state.get("session"),
             "mode": state.get("mode"),
+            "source_mode": state.get("source_mode"),
+            "confidence": state.get("confidence"),
             "ok": state.get("ok"),
             "reason": state.get("reason"),
+            "fallback_reason": state.get("fallback_reason"),
             "refreshed_at": state.get("refreshed_at"),
         }
         event = {
             "at": state.get("refreshed_at"),
             "mode": state.get("mode"),
+            "source_mode": state.get("source_mode"),
             "status": state.get("status"),
             "leader": state.get("leader"),
+            "confidence": state.get("confidence"),
+            "fallback_reason": state.get("fallback_reason"),
             "chaos_score": state.get("signals", {}).get("chaos_score"),
             "driver_count": len(state.get("drivers") or []),
         }
@@ -124,6 +193,7 @@ class F1LiveSessionEngine:
         age = _age_seconds(state, now)
         enriched = {**state}
         enriched["age_seconds"] = age
+        enriched["data_age_seconds"] = age
         enriched["stale"] = bool(age is not None and age > self._ttl_seconds)
         if enriched["stale"]:
             enriched["status"] = "stale"
@@ -138,6 +208,12 @@ class F1LiveSessionEngine:
             "session": session,
             "mode": "unavailable",
             "status": "unavailable",
+            "source_mode": "unavailable",
+            "source_chain": [],
+            "confidence": 0.0,
+            "last_successful_source": None,
+            "fallback_reason": reason,
+            "is_estimated": False,
             "reason": reason,
             "session_key": None,
             "meeting_key": None,

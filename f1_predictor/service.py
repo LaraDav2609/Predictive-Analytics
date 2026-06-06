@@ -85,8 +85,8 @@ class F1PredictionService:
             "total_races": self._features.get("total_races", 0),
             "drivers": ranked,
             "method": {
-                "driver_skill": "recent form, reliability, standings signal, podium/win conversion, and F1 experience",
-                "car_performance": "constructor pace from standings, recent team points, and average finish",
+                "driver_skill": "recent form, reliability, bounded championship context, podium/win conversion, and F1 experience",
+                "car_performance": "constructor pace from recent points, average finish, and bounded championship context",
                 "performance_score": "geometric blend of driver skill and car performance with reliability damping",
             },
         }

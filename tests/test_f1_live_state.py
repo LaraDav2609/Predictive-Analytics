@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from f1_predictor.live import F1LiveSessionEngine
+from f1_predictor.live.dynamics import build_live_dynamics
 from f1_predictor.live.session_state import build_live_state
 from f1_predictor.simulation.session_projection import build_session_projection
 from models.f1 import Constructor, Driver, Race
@@ -126,6 +127,49 @@ class F1LiveSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, by_driver["max"]["components"]["live_position"])
         self.assertEqual(2, by_driver["charles"]["components"]["live_position"])
         self.assertLessEqual(by_driver["max"]["expected_finish"], by_driver["charles"]["expected_finish"])
+
+    def test_live_dynamics_rewards_leader_and_close_chaser_without_overlocking(self):
+        truth = {
+            "source_mode": "live",
+            "confidence": 0.92,
+            "drivers": [
+                {"driver_id": "max", "position": 1, "gap_to_leader": "0.000", "interval": "0.000", "representative_lap": 93.2, "compound": "MEDIUM", "tyre_age": 8, "pit_stops": 1},
+                {"driver_id": "charles", "position": 2, "gap_to_leader": "+0.800", "interval": "+0.800", "representative_lap": 92.9, "compound": "HARD", "tyre_age": 6, "pit_stops": 1},
+            ],
+        }
+
+        dynamics = build_live_dynamics(truth, track={"tire_stress": 0.55}, tires={"degradation_rate": 0.55})
+
+        self.assertTrue(dynamics["ok"])
+        self.assertGreater(dynamics["drivers"]["max"]["strength_multiplier"], 1.0)
+        self.assertGreater(dynamics["drivers"]["charles"]["strength_multiplier"], 0.95)
+        self.assertLess(dynamics["drivers"]["max"]["strength_multiplier"], 1.22)
+
+    def test_live_dynamics_penalizes_old_soft_more_than_old_hard(self):
+        truth = {
+            "source_mode": "live",
+            "confidence": 0.90,
+            "drivers": [
+                {"driver_id": "soft", "position": 1, "gap_to_leader": "0.000", "representative_lap": 93.0, "compound": "SOFT", "tyre_age": 30, "pit_stops": 1},
+                {"driver_id": "hard", "position": 2, "gap_to_leader": "+2.000", "representative_lap": 93.0, "compound": "HARD", "tyre_age": 30, "pit_stops": 1},
+            ],
+        }
+
+        dynamics = build_live_dynamics(truth, track={"tire_stress": 0.75}, tires={"degradation_rate": 0.75})
+
+        self.assertLess(dynamics["drivers"]["soft"]["tyre_delta"], dynamics["drivers"]["hard"]["tyre_delta"])
+
+    def test_estimated_source_discounts_live_dynamics(self):
+        base = {
+            "drivers": [
+                {"driver_id": "max", "position": 1, "gap_to_leader": "0.000", "representative_lap": 93.0, "compound": "MEDIUM", "tyre_age": 8},
+                {"driver_id": "charles", "position": 2, "gap_to_leader": "+12.000", "representative_lap": 94.0, "compound": "HARD", "tyre_age": 8},
+            ],
+        }
+        live = build_live_dynamics({**base, "source_mode": "live", "confidence": 0.90})
+        estimated = build_live_dynamics({**base, "source_mode": "estimated", "confidence": 0.90})
+
+        self.assertGreater(abs(live["drivers"]["max"]["live_delta"]), abs(estimated["drivers"]["max"]["live_delta"]))
 
 
 class _FakeOpenF1:

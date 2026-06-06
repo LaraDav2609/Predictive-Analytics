@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from models.f1 import Constructor, Driver, Race
 from f1_predictor.features.historical import HistoricalFeatureProvider
+from f1_predictor.features.car_model import build_car_model_analysis
 from f1_predictor.features.metadata import MetadataFeatureProvider
 from f1_predictor.features.performance import PerformanceFeatureProvider
 from f1_predictor.features.reliability import ReliabilityFeatureProvider
@@ -43,8 +44,20 @@ class F1FeatureBuilder:
         sentiment = SentimentFeatureProvider(self._sentiment).get_features()
         openf1_session = self._features.get("openf1_session") or {}
         track = TrackFeatureProvider(self._features).get_features(race)
-        weather = WeatherFeatureProvider(self._features).get_features(race, openf1_session)
-        tires = TireFeatureProvider().get_features(track, openf1_session)
+        weather = WeatherFeatureProvider(self._features).get_features(race, openf1_session, session=session_stage)
+        tires = TireFeatureProvider().get_features(track, openf1_session, weather=weather)
+        car_model = build_car_model_analysis(
+            race=race,
+            drivers=self._drivers,
+            constructors=self._constructors,
+            features=self._features,
+            sentiment_impact=(self._sentiment.get("race_sentiment_impact") or self._features.get("sentiment_impact")),
+            session=session_stage,
+            track=track,
+            weather=weather,
+            tires=tires,
+            openf1_session=openf1_session,
+        )
         reliability = ReliabilityFeatureProvider(driver_features).get_features(track, weather)
 
         merged_drivers = {}
@@ -78,6 +91,7 @@ class F1FeatureBuilder:
             track=track,
             weather=weather,
             tires=tires,
+            car_model=car_model,
             reliability=reliability,
             sentiment=sentiment.get("drivers") or {},
             missing_data=missing_data,

@@ -247,7 +247,15 @@ def _driver_feature(driver: Driver, recent: list[dict[str, Any]], all_results: l
     race_pace = max(0.02, min(1.0, finish_score + max(-0.12, min(0.12, avg_grid_delta / 50.0))))
     teammate_score = max(0.02, min(1.0, 0.50 + teammate_delta / 12.0))
     trend_score = _trend_score(recent)
-    form_score = 0.30 * finish_score + 0.25 * points_score + 0.15 * podium_score + 0.10 * ((driver.points or 0.0) / max(driver.points or 1.0, 1.0)) + 0.10 * qualifying_pace + 0.10 * trend_score
+    standings_context = min(1.0, float(driver.points or 0.0) / max(1.0, lookback * 25.0))
+    form_score = (
+        0.34 * finish_score
+        + 0.22 * points_score
+        + 0.15 * podium_score
+        + 0.04 * standings_context
+        + 0.13 * qualifying_pace
+        + 0.12 * trend_score
+    )
     return {
         "starts": len(all_results),
         "current_season_starts": len(all_results),
@@ -275,12 +283,12 @@ def _constructor_feature(constructor: Constructor, recent: list[dict[str, Any]],
     positions = [item["position"] for item in recent if isinstance(item.get("position"), int)]
     avg_finish = _avg([float(position) for position in positions]) if positions else None
     recent_points = sum(float(item.get("points") or 0.0) for item in recent)
-    standings_score = constructor.points / max(constructor.points, 1.0)
+    standings_score = min(1.0, float(constructor.points or 0.0) / max(1.0, lookback * 43.0))
     finish_score = 0.45 if avg_finish is None else max(0.0, min(1.0, (21 - avg_finish) / 20))
     points_score = min(1.0, recent_points / max(1.0, lookback * 43.0))
     dnfs = sum(1 for item in recent if not _is_finished_status(item.get("status")))
     return {
-        "team_score": round(0.45 * standings_score + 0.35 * points_score + 0.20 * finish_score, 4),
+        "team_score": round(0.24 * standings_score + 0.34 * points_score + 0.42 * finish_score, 4),
         "recent_points": round(recent_points, 2),
         "recent_avg_finish": round(avg_finish, 2) if avg_finish is not None else None,
         "recent_starts": len(recent),

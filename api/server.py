@@ -1,5 +1,6 @@
 """FastAPI application for sports predictions."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,59 @@ _football_client: FootballDataClient | None = None
 _f1_client: F1Client | None = None
 _mlb_client: MLBClient | None = None
 _mlb_historical_client: MLBHistoricalClient | None = None
+_startup_tasks: set[asyncio.Task] = set()
+
+
+def _track_startup_task(name: str, coro) -> None:
+    task = asyncio.create_task(coro, name=f"startup:{name}")
+    _startup_tasks.add(task)
+
+    def _done(completed: asyncio.Task) -> None:
+        _startup_tasks.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            logger.debug("%s initial data load cancelled", name)
+        except Exception as exc:
+            logger.warning("%s initial data load failed (will use fallback): %s", name, exc)
+
+    task.add_done_callback(_done)
+
+
+async def _load_soccer_data(client: FootballDataClient, predictor: SoccerPredictor) -> None:
+    await client.refresh()
+    predictor.load_teams(client.get_teams())
+    logger.info("Soccer data loaded successfully")
+
+
+async def _load_f1_data(client: F1Client, predictor: F1Predictor) -> None:
+    await client.refresh()
+    f1_features = await client.get_prediction_features()
+    try:
+        f1_sentiment = await asyncio.wait_for(
+            refresh_f1_sentiment(
+                client.get_drivers(),
+                client.get_constructors(),
+                client.season,
+            ),
+            timeout=20,
+        )
+    except Exception as exc:
+        logger.warning("F1 sentiment startup refresh skipped: %s", exc)
+        f1_sentiment = None
+    predictor.load_drivers(
+        client.get_drivers(),
+        client.get_constructors(),
+        f1_features,
+        f1_sentiment,
+    )
+    logger.info("F1 data loaded successfully")
+
+
+async def _load_mlb_data(client: MLBClient, predictor: BaseballPredictor) -> None:
+    await client.refresh()
+    predictor.load_standings(client.get_standings())
+    logger.info("MLB data loaded successfully")
 
 
 @asynccontextmanager
@@ -48,42 +102,19 @@ async def lifespan(app: FastAPI):
     baseball_routes.init(_mlb_client, baseball_pred)
     baseball_history_routes.init(_mlb_historical_client)
 
-    # Initial data load
-    try:
-        await _football_client.refresh()
-        soccer_pred.load_teams(_football_client.get_teams())
-        logger.info("Soccer data loaded successfully")
-    except Exception as e:
-        logger.warning("Soccer data load failed (will use fallback): %s", e)
-
-    try:
-        await _f1_client.refresh()
-        f1_features = await _f1_client.get_prediction_features()
-        f1_sentiment = await refresh_f1_sentiment(
-            _f1_client.get_drivers(),
-            _f1_client.get_constructors(),
-            _f1_client.season,
-        )
-        f1_pred.load_drivers(
-            _f1_client.get_drivers(),
-            _f1_client.get_constructors(),
-            f1_features,
-            f1_sentiment,
-        )
-        logger.info("F1 data loaded successfully")
-    except Exception as e:
-        logger.warning("F1 data load failed (will use fallback): %s", e)
-
-    try:
-        await _mlb_client.refresh()
-        baseball_pred.load_standings(_mlb_client.get_standings())
-        logger.info("MLB data loaded successfully")
-    except Exception as e:
-        logger.warning("MLB data load failed (will use fallback): %s", e)
+    # Initial data loads are intentionally non-blocking. Some upstream sports/F1
+    # APIs can be slow or unavailable, and the dashboard should still boot.
+    _track_startup_task("Soccer", _load_soccer_data(_football_client, soccer_pred))
+    _track_startup_task("F1", _load_f1_data(_f1_client, f1_pred))
+    _track_startup_task("MLB", _load_mlb_data(_mlb_client, baseball_pred))
 
     yield
 
     # Shutdown
+    for task in list(_startup_tasks):
+        task.cancel()
+    if _startup_tasks:
+        await asyncio.gather(*_startup_tasks, return_exceptions=True)
     if _football_client:
         await _football_client.close()
     if _f1_client:

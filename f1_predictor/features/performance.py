@@ -62,14 +62,14 @@ def build_performance_table(
         conversion_score = min(1.0, (recent_wins * 0.28 + recent_podiums * 0.16) / min(4.0, recent_starts))
         experience_score = min(1.0, starts / 80.0)
         driver_skill_score = clamp01(
-            0.30 * form_score
-            + 0.16 * reliability_score
-            + 0.13 * standing_score
+            0.28 * form_score
+            + 0.17 * reliability_score
+            + 0.05 * standing_score
             + 0.10 * conversion_score
             + 0.08 * experience_score
-            + 0.13 * qualifying_pace_score
-            + 0.07 * race_pace_score
-            + 0.03 * teammate_score
+            + 0.15 * qualifying_pace_score
+            + 0.12 * race_pace_score
+            + 0.05 * teammate_score
         )
 
         constructor_standing = (constructor.points / max_constructor_points) if constructor else standing_score
@@ -77,9 +77,9 @@ def build_performance_table(
         recent_team_points = num(constructor_feature.get("recent_points"), 0.0)
         team_points_score = min(1.0, recent_team_points / 344.0)
         car_performance_score = clamp01(
-            0.56 * team_score
-            + 0.28 * constructor_standing
-            + 0.16 * team_points_score
+            0.50 * team_score
+            + 0.14 * constructor_standing
+            + 0.36 * team_points_score
         )
 
         momentum = clamp01(0.50 + (trend_score - 0.50) * 0.50)

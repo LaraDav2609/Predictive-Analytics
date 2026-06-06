@@ -42,6 +42,11 @@ DEFAULT_RSS_FEEDS = [
     "https://www.independent.co.uk/sport/motor-racing/rss",
     "https://www.mirror.co.uk/sport/formula-1/?service=rss",
     "https://www.f1technical.net/rss/news.xml",
+    # Public social/community RSS. These are useful for early paddock chatter,
+    # but scoring below deliberately treats them as noisy, capped signals.
+    "https://www.reddit.com/r/formula1/.rss",
+    "https://www.reddit.com/r/F1Technical/.rss",
+    "https://www.reddit.com/r/F1Strategy/.rss",
 ]
 
 POSITIVE_TERMS = {
@@ -112,6 +117,61 @@ TOPIC_TERMS = {
     "technical": ["aero", "floor", "wing", "suspension", "power unit", "cooling", "brake", "setup", "technical"],
 }
 
+RACE_AWARE_DIMENSIONS = [
+    "performance",
+    "qualifying_pace",
+    "race_pace",
+    "track_fit",
+    "reliability",
+    "strategy",
+    "tires",
+    "weather",
+    "regulation",
+    "driver_personal",
+    "team_operations",
+    "market_noise",
+]
+
+DIMENSION_TERMS = {
+    "performance": ["pace", "lap time", "fastest", "upgrade", "package", "performance", "front-running"],
+    "qualifying_pace": ["qualifying", "quali", "pole", "front row", "grid position", "one-lap", "one lap"],
+    "race_pace": ["race pace", "long run", "stint", "race trim", "degradation", "podium", "win"],
+    "track_fit": ["track fit", "street circuit", "low speed", "high speed", "overtaking", "monaco", "setup"],
+    "reliability": ["reliability", "engine", "power unit", "gearbox", "hydraulic", "brake", "failure", "dnf"],
+    "strategy": ["strategy", "pit stop", "undercut", "overcut", "track position", "safety car"],
+    "tires": ["tyre", "tire", "compound", "soft", "medium", "hard", "degradation", "stint"],
+    "weather": ["weather", "rain", "wet", "wind", "temperature", "forecast", "storm"],
+    "regulation": ["fia", "stewards", "penalty", "grid drop", "regulation", "technical directive", "scrutineering"],
+    "driver_personal": ["driver", "fitness", "injury", "confidence", "mistake", "contract", "future"],
+    "team_operations": ["team principal", "factory", "pit crew", "operations", "strategy", "upgrade", "package"],
+    "market_noise": ["rumour", "rumor", "silly season", "driver market", "seat", "switch", "contract"],
+}
+
+RACE_KEYWORDS = {
+    1: ["australian", "albert park", "melbourne", "australia"],
+    2: ["chinese", "shanghai", "china"],
+    3: ["japanese", "suzuka", "japan"],
+    4: ["miami", "miami international"],
+    5: ["canadian", "gilles villeneuve", "montreal", "canada"],
+    6: ["monaco", "monte carlo", "circuit de monaco"],
+    7: ["spanish", "barcelona", "catalunya", "spain"],
+    8: ["austrian", "red bull ring", "spielberg", "austria"],
+    9: ["british", "silverstone", "great britain", "uk"],
+    10: ["belgian", "spa", "spa-francorchamps", "belgium"],
+    11: ["hungarian", "hungaroring", "hungary"],
+    12: ["dutch", "zandvoort", "netherlands"],
+    13: ["italian", "monza", "italy"],
+    14: ["madrid", "spanish grand prix"],
+    15: ["azerbaijan", "baku"],
+    16: ["singapore", "marina bay"],
+    17: ["united states", "cota", "austin", "americas"],
+    18: ["mexico", "mexican", "mexico city"],
+    19: ["brazil", "brazilian", "interlagos", "sao paulo"],
+    20: ["las vegas", "vegas"],
+    21: ["qatar", "losail", "lusail"],
+    22: ["abu dhabi", "yas marina"],
+}
+
 SOURCE_WEIGHTS = {
     "formula1": 1.05,
     "fia": 1.10,
@@ -131,8 +191,85 @@ SOURCE_WEIGHTS = {
     "independent.co.uk": 0.82,
     "mirror.co.uk": 0.78,
     "f1technical.net": 0.92,
+    "reddit-formula1": 0.48,
+    "reddit-f1technical": 0.56,
+    "reddit-f1strategy": 0.52,
     "jolpica": 1.0,
     "dashboard": 0.75,
+}
+
+SOURCE_KIND_WEIGHTS = {
+    "official": 1.08,
+    "technical": 0.96,
+    "news": 0.88,
+    "tabloid": 0.62,
+    "social": 0.46,
+    "data": 0.98,
+    "internal": 0.70,
+}
+
+SOURCE_CONFIDENCE_CEILINGS = {
+    "official": 0.94,
+    "technical": 0.84,
+    "news": 0.78,
+    "tabloid": 0.58,
+    "social": 0.50,
+    "data": 0.86,
+    "internal": 0.62,
+}
+
+SOURCE_IMPACT_CAPS = {
+    "official": 0.42,
+    "technical": 0.34,
+    "news": 0.28,
+    "tabloid": 0.14,
+    "social": 0.10,
+    "data": 0.18,
+    "internal": 0.12,
+}
+
+SOURCE_WEIGHT_CAPS = {
+    "official": 2.60,
+    "technical": 1.80,
+    "news": 1.60,
+    "tabloid": 0.70,
+    "social": 0.62,
+    "data": 1.40,
+    "internal": 0.80,
+}
+
+RUMOR_TERMS = [
+    "rumour",
+    "rumor",
+    "leak",
+    "leaked",
+    "insider",
+    "unverified",
+    "speculation",
+    "paddock whisper",
+    "reportedly",
+    "could switch",
+    "set to replace",
+]
+
+SIGNIFICANT_TITLE_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "after",
+    "before",
+    "formula",
+    "one",
+    "grand",
+    "prix",
+    "f1",
+    "live",
+    "latest",
+    "news",
+    "update",
+    "updates",
 }
 
 
@@ -148,7 +285,7 @@ async def refresh_f1_sentiment(
     if not items:
         items = [_standings_item(drivers, constructors, season)]
 
-    scored = [_score_item(item) for item in _dedupe_items(items)]
+    scored = [_enrich_scored_item(_score_item(item), drivers, constructors, season) for item in _dedupe_items(items)]
     aggregates = aggregate_f1_sentiment(scored, drivers, constructors)
     published = _publish_scored_items(scored, aggregates, redis_url)
     aggregates["published_items"] = published
@@ -169,15 +306,21 @@ def read_f1_sentiment(
         composite_raw = r.get("sentiment:composite:latest:f1")
         composite = json.loads(composite_raw) if composite_raw else None
         keys = r.zrevrange("feeditems:category:f1", 0, max(limit - 1, 0))
-        items = []
+        raw_items = []
         for key in keys:
             raw = r.get(key)
             if not raw:
                 continue
             payload = json.loads(raw)
-            if payload.get("SentimentScore") is None:
+            if payload.get("SentimentScore") is None or payload.get("SourceKind") is None or payload.get("SentimentModel") != "f1-news-social-governed-rules-v2":
                 payload.update(_score_payload(payload))
-            items.append(payload)
+            if _source_kind(payload) == "social" and not _is_social_prediction_signal(payload.get("Title"), payload.get("Content")):
+                continue
+            raw_items.append(payload)
+        items = [
+            _enrich_scored_item(item, drivers, constructors)
+            for item in _dedupe_items(raw_items)
+        ]
         aggregates = aggregate_f1_sentiment(items, drivers, constructors)
         if composite:
             aggregates["composite"] = composite
@@ -415,7 +558,10 @@ def _parse_rss_items(xml_text: str, feed_url: str, max_items: int) -> list[dict]
             published = parsedate_to_datetime(published_raw).astimezone(timezone.utc) if published_raw else None
         except Exception:
             published = None
-        payload = _payload(title, content or title, _source_from_feed(feed_url), feed_url, url=link, published=published)
+        source = _source_from_feed(feed_url)
+        if source.startswith("reddit-") and not _is_social_prediction_signal(title, content):
+            continue
+        payload = _payload(title, content or title, source, feed_url, url=link, published=published)
         payload["Topics"] = _topics_for_text(title, content)
         items.append(payload)
     return items
@@ -426,12 +572,15 @@ def _dedupe_items(items: list[dict]) -> list[dict]:
     deduped: list[dict] = []
     for item in items:
         title_key = re.sub(r"[^a-z0-9]+", " ", str(item.get("Title") or "").lower()).strip()
-        url_key = str(item.get("Url") or "").strip().lower()
+        title_signature = _title_signature(item.get("Title"))
+        url_key = _canonical_url(item.get("Url"))
         native_key = str(item.get("NativeId") or "").strip().lower()
-        fingerprint = url_key or native_key or title_key or _hash(item)
-        if fingerprint in seen or (title_key and title_key in seen):
+        fingerprint = url_key or native_key or title_signature or title_key or _hash(item)
+        if fingerprint in seen or (title_signature and title_signature in seen) or (title_key and title_key in seen):
             continue
         seen.add(fingerprint)
+        if title_signature:
+            seen.add(title_signature)
         if title_key:
             seen.add(title_key)
         deduped.append(item)
@@ -462,18 +611,163 @@ def _score_payload(item: dict) -> dict:
         hits += 1
         score += 0.03 if score >= 0 else -0.01
     topics = item.get("Topics") or _topics_for_text(item.get("Title", ""), item.get("Content", ""))
+    source_kind = _source_kind(item)
+    bias_flags = _bias_flags(text, source_kind)
+    rumor_penalty = 0.72 if "rumor_or_unverified" in bias_flags else 1.0
+    if "social_source" in bias_flags and abs(score) < 0.08 and hits <= 1:
+        score *= 0.50
     score = max(-1.0, min(1.0, score))
-    confidence = min(0.94, (0.42 + hits * 0.08) * _source_weight(item))
+    confidence = (0.42 + hits * 0.08) * _source_weight(item) * SOURCE_KIND_WEIGHTS.get(source_kind, 0.86) * rumor_penalty
+    confidence = min(SOURCE_CONFIDENCE_CEILINGS.get(source_kind, 0.78), confidence)
     return {
         "SentimentScore": round(score, 4),
         "SentimentLabel": _label(score),
         "SentimentConfidence": round(confidence, 4),
         "SentimentAnalyzer": "f1-live-rules",
         "SentimentAnalyzerUsed": "f1-live-rules",
-        "SentimentModel": "f1-news-rules-v1",
+        "SentimentModel": "f1-news-social-governed-rules-v2",
         "Topics": topics,
         "SourceWeight": round(_source_weight(item), 4),
+        "SourceKind": source_kind,
+        "BiasFlags": bias_flags,
     }
+
+
+def _enrich_scored_item(
+    item: dict,
+    drivers: list[Driver],
+    constructors: list[Constructor],
+    season: int | None = None,
+) -> dict:
+    text = f"{item.get('Title', '')} {item.get('Content', '')}".lower()
+    driver_ids = [
+        driver.id
+        for driver in drivers
+        if any(alias and alias in text for alias in _driver_aliases(driver))
+    ]
+    constructor_ids = [
+        constructor.id
+        for constructor in constructors
+        if any(alias and alias in text for alias in _team_aliases(constructor))
+    ]
+    race_round = _race_round_for_text(text)
+    dimensions = _impact_dimensions_for_text(text, item)
+    session_scope = _session_scope_for_text(text, dimensions)
+    time_decay = _time_decay(item)
+    sentiment_score = float(item.get("SentimentScore") or 0.0)
+    source_weight = float(item.get("SourceWeight") or _source_weight(item))
+    confidence = float(item.get("SentimentConfidence") or 0.45)
+    prediction_impact = _prediction_impact_score(sentiment_score, dimensions, source_weight, confidence, time_decay)
+    prediction_cap = _prediction_impact_cap(item)
+    prediction_impact = round(max(-prediction_cap, min(prediction_cap, prediction_impact)), 4)
+    reason = _prediction_reason(item, dimensions, session_scope, prediction_impact)
+
+    enriched = {
+        "DriverIds": driver_ids,
+        "ConstructorIds": constructor_ids,
+        "RaceRound": race_round,
+        "SessionScope": session_scope,
+        "ImpactDimensions": dimensions,
+        "PredictionImpactScore": prediction_impact,
+        "PredictionImpactCap": prediction_cap,
+        "TimeDecay": time_decay,
+        "PredictionImpactReason": reason,
+        "RaceAwareSeason": season,
+        # JSON-friendly aliases for downstream adapters and diagnostics.
+        "driver_ids": driver_ids,
+        "constructor_ids": constructor_ids,
+        "race_round": race_round,
+        "session_scope": session_scope,
+        "topics": item.get("Topics") or [],
+        "sentiment_score": sentiment_score,
+        "prediction_impact_score": prediction_impact,
+        "prediction_impact_cap": prediction_cap,
+        "source_weight": round(source_weight, 4),
+        "source_kind": item.get("SourceKind") or _source_kind(item),
+        "bias_flags": item.get("BiasFlags") or _bias_flags(text, _source_kind(item)),
+        "confidence_ceiling": SOURCE_CONFIDENCE_CEILINGS.get(_source_kind(item), 0.78),
+        "confidence": round(confidence, 4),
+        "time_decay": time_decay,
+        "reason": reason,
+    }
+    item.update(enriched)
+    return item
+
+
+def _impact_dimensions_for_text(text: str, item: dict) -> dict:
+    sentiment_score = float(item.get("SentimentScore") or 0.0)
+    score_sign = 1.0 if sentiment_score >= 0 else -1.0
+    dimensions: dict[str, float] = {}
+    for dimension, terms in DIMENSION_TERMS.items():
+        hits = sum(1 for term in terms if term in text)
+        if hits <= 0:
+            continue
+        local_sign = score_sign
+        magnitude = min(1.0, abs(sentiment_score) + 0.08 + hits * 0.04)
+        if dimension == "regulation" and any(term in text for term in ["penalty", "grid drop", "stewards", "breach", "disqualified"]):
+            local_sign = -1.0
+        if dimension == "reliability" and any(term in text for term in ["failure", "dnf", "engine", "gearbox", "hydraulic"]):
+            local_sign = -1.0 if sentiment_score <= 0.05 else local_sign
+        dimensions[dimension] = round(max(-1.0, min(1.0, local_sign * magnitude)), 4)
+    return dimensions
+
+
+def _session_scope_for_text(text: str, dimensions: dict) -> str:
+    if any(term in text for term in ["sprint", "sprint shootout"]):
+        return "sprint"
+    if "qualifying_pace" in dimensions or any(term in text for term in ["qualifying", "quali", "pole", "front row"]):
+        return "qualifying"
+    if any(term in text for term in ["race pace", "long run", "stint", "strategy", "pit stop", "safety car"]):
+        return "race"
+    if any(term in text for term in ["practice", "fp1", "fp2", "fp3"]):
+        return "practice"
+    return "weekend"
+
+
+def _prediction_impact_score(
+    sentiment_score: float,
+    dimensions: dict,
+    source_weight: float,
+    confidence: float,
+    time_decay: float,
+) -> float:
+    dimensional_strength = sum(abs(float(value or 0.0)) for value in dimensions.values()) / max(1, len(dimensions))
+    if not dimensions:
+        dimensional_strength = 0.30
+    signed_dimension = sum(float(value or 0.0) for value in dimensions.values()) / max(1, len(dimensions))
+    raw = (0.55 * sentiment_score + 0.45 * signed_dimension) * dimensional_strength
+    weighted = raw * max(0.55, min(1.15, source_weight)) * max(0.20, min(1.0, confidence)) * time_decay
+    return round(max(-0.45, min(0.45, weighted)), 4)
+
+
+def _race_round_for_text(text: str) -> int | None:
+    for round_num, keywords in RACE_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return round_num
+    return None
+
+
+def _time_decay(item: dict) -> float:
+    raw = item.get("PublishedUtc") or item.get("Timestamp")
+    try:
+        published = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return 0.55
+    age_hours = max(0.0, (datetime.now(timezone.utc) - published).total_seconds() / 3600.0)
+    if age_hours <= 24:
+        return 1.0
+    if age_hours <= 72:
+        return 0.75
+    if age_hours <= 168:
+        return 0.45
+    return 0.20
+
+
+def _prediction_reason(item: dict, dimensions: dict, session_scope: str, impact: float) -> str:
+    title = str(item.get("Title") or "F1 news")
+    direction = "raises" if impact > 0.015 else "reduces" if impact < -0.015 else "barely moves"
+    topics = ", ".join(list(dimensions.keys())[:3]) or "general context"
+    return f"{title} {direction} {session_scope} prediction impact via {topics}."
 
 
 def _publish_scored_items(items: list[dict], aggregates: dict, redis_url: str) -> int:
@@ -583,9 +877,9 @@ def _team_aliases(constructor: Constructor) -> list[str]:
 
 
 def _entity_summary(items: list[dict]) -> dict:
-    scores = [_item_score(item) for item in items]
+    scores = _source_capped_scores(items)
     score = _weighted_average(scores)
-    confidence = sum(conf for _, conf in scores) / max(1, len(scores)) if scores else 0.35
+    confidence = _entity_confidence(items, scores)
     return {
         "score": round(score, 4),
         "label": _label(score),
@@ -606,14 +900,86 @@ def _weighted_average(values: list[tuple[float, float]]) -> float:
 
 def _item_score(item: dict) -> tuple[float, float]:
     score = float(item.get("SentimentScore") or 0.0)
-    confidence = float(item.get("SentimentConfidence") or 0.45) * _source_weight(item)
+    confidence = float(item.get("SentimentConfidence") or 0.45) * _source_weight(item) * SOURCE_KIND_WEIGHTS.get(_source_kind(item), 0.86)
     return score, max(0.01, min(1.0, confidence))
+
+
+def _source_capped_scores(items: list[dict]) -> list[tuple[float, float]]:
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    for item in items:
+        grouped.setdefault(str(item.get("Source") or "unknown"), []).append(_item_score(item))
+    capped: list[tuple[float, float]] = []
+    for source, values in grouped.items():
+        source_kind = _source_kind({"Source": source, "Feed": source})
+        cap = SOURCE_WEIGHT_CAPS.get(source_kind, 1.20)
+        total = sum(weight for _, weight in values)
+        scale = min(1.0, cap / total) if total > 0 else 1.0
+        capped.extend((score, weight * scale) for score, weight in values)
+    return capped
+
+
+def _entity_confidence(items: list[dict], scores: list[tuple[float, float]]) -> float:
+    if not items:
+        return 0.12
+    avg_confidence = sum(conf for _, conf in scores) / max(1, len(scores))
+    source_count = len({str(item.get("Source") or "unknown") for item in items})
+    official_count = sum(1 for item in items if _source_kind(item) in {"official", "technical", "data"})
+    social_count = sum(1 for item in items if _source_kind(item) == "social")
+    rumor_count = sum(1 for item in items if "rumor_or_unverified" in (item.get("BiasFlags") or item.get("bias_flags") or []))
+    diversity = min(0.20, source_count / 5.0 * 0.20)
+    official_bonus = min(0.16, official_count / max(1, len(items)) * 0.16)
+    social_penalty = min(0.18, social_count / max(1, len(items)) * 0.18)
+    rumor_penalty = min(0.16, rumor_count / max(1, len(items)) * 0.16)
+    return max(0.08, min(0.92, avg_confidence + diversity + official_bonus - social_penalty - rumor_penalty))
 
 
 def _source_weight(item: dict) -> float:
     source = str(item.get("Source") or "").lower()
     host = urlparse(str(item.get("Feed") or item.get("Url") or "")).netloc.lower()
     return SOURCE_WEIGHTS.get(source) or SOURCE_WEIGHTS.get(host) or 0.86
+
+
+def _source_kind(item: dict) -> str:
+    source = str(item.get("Source") or "").lower()
+    host = urlparse(str(item.get("Feed") or item.get("Url") or "")).netloc.lower()
+    text = f"{source} {host}"
+    if source in {"formula1", "fia"} or "fia.com" in host or "formula1.com" in host:
+        return "official"
+    if source == "jolpica" or "ergast" in host:
+        return "data"
+    if "reddit" in text:
+        return "social"
+    if source in {"f1technical.net"} or "f1technical" in host:
+        return "technical"
+    if source in {"mirror.co.uk", "planetf1.com", "crash.net"} or any(token in host for token in ["mirror.co.uk", "planetf1.com", "crash.net"]):
+        return "tabloid"
+    if source == "dashboard":
+        return "internal"
+    return "news"
+
+
+def _bias_flags(text: str, source_kind: str) -> list[str]:
+    flags: list[str] = []
+    if source_kind == "social":
+        flags.append("social_source")
+    if source_kind == "tabloid":
+        flags.append("low_reliability_source")
+    if any(term in text for term in RUMOR_TERMS):
+        flags.append("rumor_or_unverified")
+    if "confirmed" in text or "official" in text or "fia" in text:
+        flags.append("confirmation_language")
+    return flags
+
+
+def _prediction_impact_cap(item: dict) -> float:
+    source_kind = _source_kind(item)
+    cap = SOURCE_IMPACT_CAPS.get(source_kind, 0.24)
+    flags = item.get("BiasFlags") or item.get("bias_flags") or []
+    if "rumor_or_unverified" in flags:
+        cap *= 0.62
+    if "confirmation_language" in flags and source_kind in {"official", "technical", "news"}:
+        cap *= 1.08
+    return round(max(0.04, min(0.45, cap)), 4)
 
 
 def _source_breakdown(items: list[dict]) -> dict:
@@ -662,6 +1028,16 @@ def _latest_items(items: list[dict], limit: int = 4) -> list[dict]:
             "published_utc": item.get("PublishedUtc"),
             "score": item.get("SentimentScore"),
             "label": item.get("SentimentLabel"),
+            "confidence": item.get("SentimentConfidence") or item.get("confidence"),
+            "source_weight": item.get("SourceWeight") or item.get("source_weight"),
+            "prediction_impact_score": item.get("PredictionImpactScore") or item.get("prediction_impact_score"),
+            "time_decay": item.get("TimeDecay") or item.get("time_decay"),
+            "race_round": item.get("RaceRound") or item.get("race_round"),
+            "session_scope": item.get("SessionScope") or item.get("session_scope"),
+            "driver_ids": item.get("DriverIds") or item.get("driver_ids") or [],
+            "constructor_ids": item.get("ConstructorIds") or item.get("constructor_ids") or [],
+            "dimensions": item.get("ImpactDimensions") or {},
+            "reason": item.get("PredictionImpactReason") or item.get("reason"),
             "topics": item.get("Topics") or [],
         }
         for item in ordered[:limit]
@@ -694,6 +1070,7 @@ def _clean(value: str | None) -> str:
 
 def _source_from_feed(feed_url: str) -> str:
     host = urlparse(feed_url).netloc.lower()
+    path = urlparse(feed_url).path.lower()
     if "fia.com" in host:
         return "fia"
     if "formula1.com" in host:
@@ -704,12 +1081,98 @@ def _source_from_feed(feed_url: str) -> str:
         return "sky-sports"
     if "espn.com" in host:
         return "espn"
+    if "reddit.com" in host:
+        if "/r/f1technical" in path:
+            return "reddit-f1technical"
+        if "/r/f1strategy" in path:
+            return "reddit-f1strategy"
+        if "/r/formula1" in path:
+            return "reddit-formula1"
+        return "reddit"
     return host.replace("www.", "") or "rss"
 
 
 def _is_f1_related(title: str, content: str) -> bool:
     text = f"{title} {content}".lower()
     return any(token in text for token in ["f1", "formula 1", "formula one", "grand prix", "fia", "driver", "constructor"])
+
+
+def _is_social_prediction_signal(title: str | None, content: str | None) -> bool:
+    text = f"{title or ''} {content or ''}".lower()
+    if any(token in text for token in [
+        "lounge",
+        "where can i watch",
+        "new to f1",
+        "wallpaper",
+        "meme",
+        "posted my",
+        "months ago",
+        "cad data",
+        "car design",
+        "battery deployment",
+        "control over the deployment",
+        "boost and overtake",
+        "new driving4answers video",
+    ]):
+        return False
+    signal_terms = [
+        "grand prix",
+        "practice",
+        "fp1",
+        "fp2",
+        "fp3",
+        "qualifying",
+        "quali",
+        "sprint",
+        "race strategy",
+        "race pace",
+        "long run",
+        "stint",
+        "tyre",
+        "tire",
+        "degradation",
+        "pit stop",
+        "safety car",
+        "fia",
+        "regulation",
+        "technical directive",
+        "penalty",
+        "grid drop",
+        "upgrade",
+        "floor",
+        "wing",
+        "engine",
+        "power unit",
+        "reliability",
+        "weather",
+        "rain",
+        "setup",
+    ]
+    race_terms = [keyword for keywords in RACE_KEYWORDS.values() for keyword in keywords]
+    if any(term in text for term in signal_terms + race_terms):
+        return True
+    team_terms = ["ferrari", "mercedes", "mclaren", "red bull", "aston martin", "williams", "alpine", "haas", "sauber", "racing bulls"]
+    team_context_terms = [
+        "pace",
+        "upgrade",
+        "package",
+        "practice",
+        "qualifying",
+        "race",
+        "strategy",
+        "penalty",
+        "regulation",
+        "reliability",
+        "tyre",
+        "tire",
+        "setup",
+        "floor",
+        "wing",
+        "engine",
+        "power unit",
+        "weather",
+    ]
+    return any(term in text for term in team_terms) and any(term in text for term in team_context_terms)
 
 
 def _topics_for_text(title: str | None, content: str | None) -> list[str]:
@@ -725,3 +1188,24 @@ def _finished(status: str) -> bool:
 
 def _hash(value: Any) -> str:
     return hashlib.sha1(str(value or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _canonical_url(value: str | None) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(str(value).strip().lower())
+    if not parsed.netloc:
+        return str(value).strip().lower()
+    path = parsed.path.rstrip("/")
+    return f"{parsed.netloc}{path}"
+
+
+def _title_signature(value: str | None) -> str:
+    tokens = [
+        token
+        for token in re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split()
+        if len(token) > 2 and token not in SIGNIFICANT_TITLE_STOPWORDS
+    ]
+    if not tokens:
+        return ""
+    return " ".join(tokens[:10])

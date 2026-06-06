@@ -41,6 +41,7 @@ class FeatureSnapshot(BaseModel):
     track: dict[str, Any] = Field(default_factory=dict)
     weather: dict[str, Any] = Field(default_factory=dict)
     tires: dict[str, Any] = Field(default_factory=dict)
+    car_model: dict[str, Any] = Field(default_factory=dict)
     reliability: dict[str, dict[str, Any]] = Field(default_factory=dict)
     sentiment: dict[str, dict[str, Any]] = Field(default_factory=dict)
     missing_data: list[str] = Field(default_factory=list)
