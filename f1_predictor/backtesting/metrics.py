@@ -69,6 +69,8 @@ def summarize_races(race_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_log_loss": _avg([float(item.get("log_loss") or 0.0) for item in metrics]),
         "avg_expected_finish_error": _avg([float(item.get("expected_finish_error") or 0.0) for item in metrics if item.get("expected_finish_error") is not None]),
         "calibration_buckets": calibration_buckets(race_rows),
+        "top_pick_calibration": top_pick_calibration(race_rows),
+        "stage_calibration": stage_calibration(race_rows),
     }
 
 
@@ -84,6 +86,61 @@ def calibration_buckets(race_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
             bucket["predicted_sum"] += probability
             if item.get("driver_id") == row.get("actual_winner"):
                 bucket["wins"] += 1
+    ordered = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        count = bucket["count"] or 1
+        ordered.append({
+            "bucket": key,
+            "count": int(bucket["count"]),
+            "avg_predicted_probability": round(bucket["predicted_sum"] / count, 4),
+            "actual_win_rate": round(bucket["wins"] / count, 4),
+        })
+    return ordered
+
+
+def top_pick_calibration(race_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, float]] = {}
+    for row in race_rows:
+        distribution = sorted(row.get("probability_distribution") or [], key=lambda item: float(item.get("win_probability") or 0.0), reverse=True)
+        if not distribution:
+            continue
+        top = distribution[0]
+        probability = float(top.get("win_probability") or 0.0)
+        bucket_key = _bucket_key(probability)
+        bucket = buckets.setdefault(bucket_key, {"count": 0, "predicted_sum": 0.0, "wins": 0})
+        bucket["count"] += 1
+        bucket["predicted_sum"] += probability
+        if top.get("driver_id") == row.get("actual_winner"):
+            bucket["wins"] += 1
+    return _bucket_rows(buckets)
+
+
+def stage_calibration(race_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_stage: dict[str, list[dict[str, Any]]] = {}
+    for row in race_rows:
+        by_stage.setdefault(str(row.get("stage") or "unknown"), []).append(row)
+    rows = []
+    for stage, items in sorted(by_stage.items()):
+        metrics = [item.get("metrics") or {} for item in items]
+        rows.append({
+            "stage": stage,
+            "race_count": len(items),
+            "winner_accuracy": round(sum(1 for item in metrics if item.get("winner_hit")) / max(1, len(items)), 4),
+            "avg_top_probability": _avg([float((item.get("metrics") or {}).get("top_probability") or 0.0) for item in items]),
+            "avg_winner_probability": _avg([float((item.get("metrics") or {}).get("winner_probability") or 0.0) for item in items]),
+            "avg_log_loss": _avg([float((item.get("metrics") or {}).get("log_loss") or 0.0) for item in items]),
+            "top_pick_calibration": top_pick_calibration(items),
+        })
+    return rows
+
+
+def _bucket_key(probability: float) -> str:
+    bucket_floor = int(probability * 10) * 10
+    return f"{bucket_floor:02d}-{bucket_floor + 10:02d}%"
+
+
+def _bucket_rows(buckets: dict[str, dict[str, float]]) -> list[dict[str, Any]]:
     ordered = []
     for key in sorted(buckets):
         bucket = buckets[key]
@@ -117,4 +174,6 @@ def _empty_summary() -> dict[str, Any]:
         "avg_log_loss": 0.0,
         "avg_expected_finish_error": 0.0,
         "calibration_buckets": [],
+        "top_pick_calibration": [],
+        "stage_calibration": [],
     }

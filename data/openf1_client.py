@@ -406,15 +406,57 @@ def _summarize_laps(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[s
     for number, laps in by_number.items():
         durations = [float(row["lap_duration"]) for row in laps]
         clean = sorted(durations)[: max(1, min(5, len(durations)))]
+        ordered = sorted(laps, key=lambda item: str(item.get("date") or ""))
+        split_at = max(1, len(ordered) // 2)
+        early_laps = [float(row["lap_duration"]) for row in ordered[:split_at]]
+        late_laps = [float(row["lap_duration"]) for row in ordered[split_at:]] or early_laps
+        sector_summary = _sector_summary(laps)
+        compounds = sorted({str(row.get("compound")).upper() for row in laps if row.get("compound")})
+        long_run_lap = _median(durations) if len(durations) >= 8 else None
         driver_rows[str(number)] = {
             "driver_number": number,
             "driver_code": codes.get(number),
             "laps": len(laps),
             "best_lap": round(min(durations), 3),
-            "median_lap": round(sorted(durations)[len(durations) // 2], 3),
+            "median_lap": round(_median(durations), 3),
             "representative_lap": round(sum(clean) / len(clean), 3),
+            "long_run_lap": round(long_run_lap, 3) if long_run_lap else None,
+            "track_evolution_delta": round(min(early_laps) - min(late_laps), 3) if early_laps and late_laps else None,
+            "compounds": compounds,
+            **sector_summary,
         }
     return {"drivers": driver_rows, "source": "openf1_laps", "missing_data": not bool(driver_rows)}
+
+
+def _sector_summary(laps: list[dict[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for index in (1, 2, 3):
+        values = []
+        for row in laps:
+            value = _float_or_none(
+                row.get(f"duration_sector_{index}")
+                or row.get(f"sector_{index}")
+                or row.get(f"sector{index}")
+            )
+            if value and value > 0:
+                values.append(value)
+        if not values:
+            continue
+        clean = sorted(values)[: max(1, min(5, len(values)))]
+        payload[f"best_sector_{index}"] = round(min(values), 3)
+        payload[f"representative_sector_{index}"] = round(sum(clean) / len(clean), 3)
+    payload["sector_coverage"] = round(sum(1 for key in payload if key.startswith("representative_sector_")) / 3.0, 4)
+    return payload
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def _summarize_positions(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
@@ -569,6 +611,15 @@ def _float_or_none(value: Any) -> float | None:
 
 def _session_kind(session: str) -> str:
     value = (session or "race").lower()
+    normalized = value.replace("_", " ").replace("-", " ")
+    if normalized in {"fp1", "free practice 1", "practice 1"} or "practice 1" in normalized:
+        return "practice1"
+    if normalized in {"fp2", "free practice 2", "practice 2"} or "practice 2" in normalized:
+        return "practice2"
+    if normalized in {"fp3", "free practice 3", "practice 3"} or "practice 3" in normalized:
+        return "practice3"
+    if normalized.startswith("fp") or "practice" in normalized:
+        return "practice"
     if value.startswith("qual"):
         return "qualifying"
     if value.startswith("sprint"):
@@ -581,7 +632,11 @@ def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> di
         "race": ["race"],
         "qualifying": ["qualifying"],
         "sprint": ["sprint"],
-    }[session_kind]
+        "practice": ["practice", "fp"],
+        "practice1": ["practice 1", "free practice 1", "fp1"],
+        "practice2": ["practice 2", "free practice 2", "fp2"],
+        "practice3": ["practice 3", "free practice 3", "fp3"],
+    }.get(session_kind, ["race"])
     ranked = []
     for item in sessions:
         name = str(item.get("session_name") or "").lower()
@@ -590,6 +645,8 @@ def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> di
             ranked.append(item)
     if not ranked and session_kind == "sprint":
         ranked = [item for item in sessions if "sprint" in str(item.get("session_name") or "").lower()]
+    if ranked and session_kind == "practice":
+        ranked = [item for item in ranked if "practice" in str(item.get("session_name") or "").lower() or str(item.get("session_type") or "").lower() == "practice"]
     return ranked[-1] if ranked else None
 
 

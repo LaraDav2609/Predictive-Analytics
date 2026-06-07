@@ -9,6 +9,7 @@ from f1_predictor.features.historical import HistoricalFeatureProvider
 from f1_predictor.features.car_model import build_car_model_analysis
 from f1_predictor.features.metadata import MetadataFeatureProvider
 from f1_predictor.features.performance import PerformanceFeatureProvider
+from f1_predictor.features.practice import apply_practice_pace_adjustments
 from f1_predictor.features.reliability import ReliabilityFeatureProvider
 from f1_predictor.features.sentiment import SentimentFeatureProvider
 from f1_predictor.features.tires import TireFeatureProvider
@@ -35,6 +36,13 @@ class F1FeatureBuilder:
         metadata = MetadataFeatureProvider(self._drivers, self._constructors).get_features()
         driver_features = historical.get("drivers") or {}
         constructor_features = historical.get("constructors") or {}
+        openf1_session = self._features.get("openf1_session") or {}
+        driver_features = apply_practice_pace_adjustments(
+            self._drivers,
+            driver_features,
+            openf1_session,
+            session_stage=session_stage,
+        )
         performance = PerformanceFeatureProvider(
             self._drivers,
             self._constructors,
@@ -42,7 +50,6 @@ class F1FeatureBuilder:
             constructor_features,
         ).get_features()
         sentiment = SentimentFeatureProvider(self._sentiment).get_features()
-        openf1_session = self._features.get("openf1_session") or {}
         track = TrackFeatureProvider(self._features).get_features(race)
         weather = WeatherFeatureProvider(self._features).get_features(race, openf1_session, session=session_stage)
         tires = TireFeatureProvider().get_features(track, openf1_session, weather=weather)

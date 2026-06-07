@@ -28,9 +28,9 @@ def detect_stage(
 
     if _has_final_classification(profile, truth) or status in {"completed", "final", "classified"}:
         return "completed"
-    if live and source_mode in {"live", "recent", "recorded"} and bool(truth.get("drivers") or truth.get("by_driver_id")):
+    if live and source_mode in {"live", "recent", "recorded", "recorded_confident"} and bool(truth.get("drivers") or truth.get("by_driver_id")):
         return "live"
-    if context.get("has_qualifying") or _has_rows(profile.get("qualifying")) or _has_grid(profile):
+    if _has_rows(profile.get("qualifying")) or _has_grid(profile):
         return "post_qualifying"
     if _has_completed_practice(profile) or int(context.get("completed_sessions") or 0) > 0:
         return "practice_available"

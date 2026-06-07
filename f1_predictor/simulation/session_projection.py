@@ -8,6 +8,7 @@ from typing import Any
 from models.f1 import Constructor, Driver, Race
 from f1_predictor.config import SESSION_SIMULATION_VERSION
 from f1_predictor.features.car_model import build_car_model_analysis
+from f1_predictor.features.practice import apply_practice_pace_adjustments
 from f1_predictor.features.reliability import ReliabilityFeatureProvider
 from f1_predictor.features.tires import TireFeatureProvider
 from f1_predictor.features.track import TrackFeatureProvider
@@ -31,13 +32,19 @@ def build_session_projection(
     live: bool = False,
 ) -> dict[str, Any]:
     session = (session or "race").lower()
-    if session not in {"race", "qualifying", "sprint"}:
+    if session not in {"race", "qualifying", "sprint", "practice", "fp1", "fp2", "fp3"}:
         session = "race"
 
     prediction_items = (prediction or {}).get("driver_predictions") or {}
     driver_features = (features or {}).get("drivers") or {}
     constructor_features = (features or {}).get("constructors") or {}
     openf1_session = (features or {}).get("openf1_session") or {}
+    driver_features = apply_practice_pace_adjustments(
+        drivers,
+        driver_features,
+        openf1_session,
+        session_stage=session,
+    )
     race_truth = (features or {}).get("race_truth") or {}
     live_state = (features or {}).get("live_state") or (race_truth if live else {})
     live_positions = (live_state.get("live_positions") or {}) if live else {}
@@ -106,6 +113,7 @@ def build_session_projection(
         team = float(constructor_feature.get("team_score") or base_prediction.get("team_score") or ((constructor.points / max_constructor_points) if constructor else 0.45))
         car_model_score = float(car_profile.get("overall_car_score") or base_prediction.get("car_performance_score") or team)
         car_model_modifier = float(car_profile.get("car_modifier") or 1.0)
+        car_trait_fit = _car_trait_fit(car_profile, track_features, tire_features, weather_features, session)
         sentiment = float(base_prediction.get("sentiment_score") or 0.0)
         label = base_prediction.get("sentiment_label") or sentiment_label(sentiment)
         sentiment_mentions = int(base_prediction.get("sentiment_mentions") or 0)
@@ -120,7 +128,11 @@ def build_session_projection(
         race_sentiment_explanations = base_prediction.get("race_sentiment_explanations") or []
         wdc_probability = float(base_prediction.get("wdc_prob") or 0.0)
         wdc_modifier = float(base_prediction.get("wdc_modifier") or 1.0)
-        qualifying_score = position_score((quali_by_driver.get(driver.id) or {}).get("position"), default=0.46)
+        quali_row = quali_by_driver.get(driver.id) or {}
+        race_row = race_by_driver.get(driver.id) or {}
+        qualifying_score = position_score(quali_row.get("position") or feature.get("qualifying_position"), default=0.46)
+        grid_context = _grid_context(driver.id, feature, quali_row, race_row, track_features, qualifying_score)
+        race_start_score = grid_context["score"] if session in {"race", "sprint"} else qualifying_score
         sprint_score = position_score((sprint_by_driver.get(driver.id) or {}).get("position"), default=0.48)
         truth_driver_state = truth_by_driver.get(driver.id) or {}
         live_driver_state = live_by_driver.get(driver.id) or live_positions.get(driver.id) or truth_driver_state or {}
@@ -146,7 +158,7 @@ def build_session_projection(
                 0.12 * prior_score(prior, drivers)
                 + 0.20 * form
                 + 0.18 * team
-                + 0.15 * qualifying_score
+                + 0.15 * race_start_score
                 + 0.11 * reliability
                 + 0.08 * strategy
                 + 0.13 * race_pace
@@ -157,7 +169,7 @@ def build_session_projection(
                 0.08 * prior_score(prior, drivers)
                 + 0.12 * form
                 + 0.12 * team
-                + 0.10 * qualifying_score
+                + 0.10 * race_start_score
                 + 0.34 * live_weighted_score
                 + 0.12 * strategy
                 + 0.08 * reliability
@@ -169,7 +181,7 @@ def build_session_projection(
                 0.10 * prior_score(prior, drivers)
                 + 0.18 * form
                 + 0.17 * team
-                + 0.13 * qualifying_score
+                + 0.13 * race_start_score
                 + 0.05 * sprint_score
                 + 0.08 * reliability
                 + 0.18 * race_pace
@@ -183,6 +195,8 @@ def build_session_projection(
             * max(0.60, 1.0 - dnf_probability * 0.55)
             * max(0.94, min(1.06, 1.0 + race_sentiment_delta))
             * max(0.94, min(1.06, car_model_modifier))
+            * car_trait_fit["modifier"]
+            * grid_context["modifier"]
             * live_strength_multiplier,
         )
 
@@ -221,7 +235,18 @@ def build_session_projection(
                 "car_model_confidence": round(float(car_profile.get("confidence") or 0.0), 4),
                 "car_model_scores": car_profile.get("scores") or {},
                 "car_model_missing_data": car_profile.get("missing_data") or [],
+                "car_trait_fit": round(car_trait_fit["score"], 4),
+                "car_trait_modifier": round(car_trait_fit["modifier"], 4),
+                "car_trait_weights": car_trait_fit["weights"],
+                "car_trait_explanations": car_trait_fit["explanations"],
                 "qualifying": round(qualifying_score, 4),
+                "race_start_grid": round(race_start_score, 4),
+                "grid_position": grid_context.get("grid_position"),
+                "qualifying_position": grid_context.get("qualifying_position"),
+                "grid_penalty": grid_context.get("grid_penalty"),
+                "pit_lane_start": grid_context.get("pit_lane_start"),
+                "grid_modifier": round(float(grid_context.get("modifier") or 1.0), 4),
+                "grid_source": grid_context.get("source"),
                 "sprint": round(sprint_score, 4),
                 "live_track_position": round(live_score, 4),
                 "live_confidence": round(source_confidence, 4),
@@ -250,6 +275,19 @@ def build_session_projection(
                 "weather_model_delta_hint": round(float((weather_features.get("weather_model_impact") or {}).get("model_delta_hint") or 0.0), 4),
                 "qualifying_pace": round(qualifying_pace, 4),
                 "race_pace": round(race_pace, 4),
+                "practice_pace_score": feature.get("practice_pace_score"),
+                "practice_qualifying_evidence_score": feature.get("practice_qualifying_evidence_score"),
+                "practice_race_evidence_score": feature.get("practice_race_evidence_score"),
+                "practice_long_run_score": feature.get("practice_long_run_score"),
+                "practice_sector_score": feature.get("practice_sector_score"),
+                "practice_sector_scores": feature.get("practice_sector_scores") or {},
+                "practice_teammate_delta": feature.get("practice_teammate_delta"),
+                "practice_fuel_uncertainty": feature.get("practice_fuel_uncertainty"),
+                "practice_compounds": feature.get("practice_compounds") or [],
+                "practice_source": feature.get("practice_source"),
+                "practice_confidence": feature.get("practice_confidence"),
+                "practice_effective_quali_weight": feature.get("practice_effective_quali_weight"),
+                "practice_effective_race_weight": feature.get("practice_effective_race_weight"),
                 "sentiment": round(sentiment, 4),
                 "personal_news": round(personal_news, 4),
                 "team_news": round(team_news, 4),
@@ -354,6 +392,151 @@ def _strategy_score(driver: Driver, feature: dict, qualifying: float, sprint: fl
     return max(0.02, min(1.0, base))
 
 
+def _car_trait_fit(
+    car_profile: dict[str, Any],
+    track: dict[str, Any],
+    tires: dict[str, Any],
+    weather: dict[str, Any],
+    session: str,
+) -> dict[str, Any]:
+    scores = car_profile.get("scores") or {}
+    confidence = max(0.0, min(1.0, float(car_profile.get("confidence") or 0.0)))
+    if not scores:
+        return {
+            "score": 0.50,
+            "modifier": 1.0,
+            "weights": {},
+            "explanations": ["car trait profile unavailable; neutral modifier applied"],
+        }
+
+    high_speed_need = 0.72 if track.get("high_speed") else 0.32
+    street_need = 0.18 if track.get("street_circuit") else 0.0
+    qualifying_need = max(float(track.get("qualifying_importance") or 0.58), float(track.get("overtaking_difficulty") or 0.48))
+    tire_need = max(float(track.get("tire_stress") or 0.0), float(tires.get("degradation_rate") or 0.0))
+    safety_car = float(track.get("safety_car_probability") or 0.30)
+    pit_loss = float(track.get("pit_loss") or 22.0)
+    chaos = float(weather.get("chaos_score") or 0.0)
+    strategy_need = max(0.0, min(1.0, 0.28 + max(0.0, pit_loss - 20.0) * 0.025 + safety_car * 0.22 + chaos * 0.28))
+    low_speed_need = max(0.0, min(1.0, 1.0 - high_speed_need + street_need + qualifying_need * 0.12))
+
+    if session == "qualifying":
+        raw_weights = {
+            "qualifying_pace": 0.28,
+            "low_speed_track_fit": 0.24 * low_speed_need,
+            "high_speed_track_fit": 0.20 * high_speed_need,
+            "braking_traction_strength": 0.12 + street_need,
+            "drs_straight_line_strength": 0.12 * high_speed_need,
+            "reliability": 0.04,
+        }
+    else:
+        raw_weights = {
+            "race_pace": 0.24,
+            "long_run_pace": 0.14,
+            "high_speed_track_fit": 0.16 * high_speed_need,
+            "low_speed_track_fit": 0.14 * low_speed_need,
+            "tire_behavior": 0.16 * max(0.35, tire_need),
+            "strategy_operations": 0.12 * strategy_need,
+            "drs_straight_line_strength": 0.08 * high_speed_need,
+            "reliability": 0.08,
+        }
+
+    total_weight = sum(max(0.0, value) for value in raw_weights.values()) or 1.0
+    weights = {key: round(max(0.0, value) / total_weight, 4) for key, value in raw_weights.items()}
+    score = 0.0
+    for key, weight in weights.items():
+        score += weight * float(scores.get(key) if scores.get(key) is not None else 0.50)
+    score = max(0.0, min(1.0, score))
+
+    # Car traits are a bounded modifier. Telemetry-backed profiles may move a
+    # driver more than fallback profiles, but never enough to dominate grid/live truth.
+    source_discount = 0.45 + confidence * 0.55
+    session_cap = 0.045 if session == "qualifying" else 0.040
+    modifier = 1.0 + (score - 0.50) * session_cap * source_discount
+    modifier = max(0.965, min(1.045, modifier))
+
+    explanations = []
+    if high_speed_need >= 0.60:
+        explanations.append("high-speed and DRS efficiency weighted for this circuit")
+    else:
+        explanations.append("low-speed traction and braking weighted for this circuit")
+    if tire_need >= 0.65 and session != "qualifying":
+        explanations.append("tire behaviour has elevated race weight")
+    if qualifying_need >= 0.78:
+        explanations.append("track-position importance increases qualifying/car fit weight")
+    if confidence < 0.45:
+        explanations.append("fallback car profile discounted by source confidence")
+
+    return {
+        "score": score,
+        "modifier": modifier,
+        "weights": weights,
+        "explanations": explanations,
+    }
+
+
+def _grid_context(
+    driver_id: str,
+    feature: dict[str, Any],
+    qualifying_row: dict[str, Any],
+    race_row: dict[str, Any],
+    track: dict[str, Any],
+    fallback_score: float,
+) -> dict[str, Any]:
+    qualifying_position = _int_or_none(
+        feature.get("qualifying_position")
+        or qualifying_row.get("position")
+    )
+    grid_position = _int_or_none(
+        feature.get("grid_position")
+        or qualifying_row.get("grid")
+        or race_row.get("grid")
+        or qualifying_position
+    )
+    penalty = _int_or_none(
+        feature.get("grid_penalty")
+        or qualifying_row.get("grid_penalty")
+        or race_row.get("grid_penalty")
+        or race_row.get("penalty_positions")
+    ) or 0
+    if qualifying_position and grid_position and grid_position > qualifying_position:
+        penalty = max(penalty, grid_position - qualifying_position)
+
+    pit_lane_start = bool(
+        feature.get("pit_lane_start")
+        or qualifying_row.get("pit_lane_start")
+        or race_row.get("pit_lane_start")
+        or grid_position in {0, -1}
+        or "pit" in str(race_row.get("status") or "").lower()
+    )
+    if pit_lane_start:
+        grid_score = 0.04
+        source = "pit_lane_start"
+    elif grid_position:
+        grid_score = position_score(grid_position, default=fallback_score)
+        source = "grid_position"
+    else:
+        grid_score = fallback_score
+        source = "qualifying_fallback"
+
+    track_position_importance = max(
+        float(track.get("qualifying_importance") or 0.0),
+        float(track.get("overtaking_difficulty") or 0.0),
+    )
+    penalty_strength = min(0.12, max(0, penalty) * (0.004 + track_position_importance * 0.004))
+    pit_penalty = 0.10 if pit_lane_start else 0.0
+    modifier = max(0.78, min(1.02, 1.0 - penalty_strength - pit_penalty))
+    return {
+        "driver_id": driver_id,
+        "score": max(0.02, min(1.0, grid_score)),
+        "modifier": modifier,
+        "grid_position": grid_position,
+        "qualifying_position": qualifying_position,
+        "grid_penalty": penalty,
+        "pit_lane_start": pit_lane_start,
+        "source": source,
+    }
+
+
 def _strategy_state(track: dict[str, Any], tires: dict[str, Any], weather: dict[str, Any], live_dynamics: dict[str, Any]) -> dict[str, Any]:
     tire_stress = float(track.get("tire_stress") or tires.get("degradation_rate") or 0.50)
     pit_loss = float(track.get("pit_loss") or 23.0)
@@ -440,13 +623,20 @@ def _source_mode(live: bool, live_driver_state: dict[str, Any], live_state: dict
     return race_truth.get("source_mode") or "model"
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None and value != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _calculation_notes(session: str, live: bool, has_results: bool) -> list[dict[str, Any]]:
     if session == "qualifying":
         weights = {"prior": 14, "recent_form": 22, "team_pace": 22, "qualifying_if_available": 12, "reliability": 3, "qualifying_pace": 24, "news_sentiment": 3}
     elif session == "sprint":
-        weights = {"prior": 12, "recent_form": 20, "team_pace": 18, "qualifying": 15, "reliability": 11, "strategy": 8, "race_pace": 13, "news_sentiment": 3}
+        weights = {"prior": 12, "recent_form": 20, "team_pace": 18, "grid_start": 15, "reliability": 11, "strategy": 8, "race_pace": 13, "news_sentiment": 3}
     elif live and has_results:
-        weights = {"prior": 8, "recent_form": 12, "team_pace": 12, "qualifying": 10, "live_position": 34, "strategy": 12, "reliability": 8, "race_pace": 2, "news_sentiment": 2}
+        weights = {"prior": 8, "recent_form": 12, "team_pace": 12, "grid_start": 10, "live_position": 34, "strategy": 12, "reliability": 8, "race_pace": 2, "news_sentiment": 2}
     else:
-        weights = {"prior": 10, "recent_form": 18, "team_pace": 17, "qualifying": 13, "sprint": 5, "reliability": 8, "race_pace": 18, "strategy": 9, "news_sentiment": 2}
+        weights = {"prior": 10, "recent_form": 18, "team_pace": 17, "grid_start": 13, "sprint": 5, "reliability": 8, "race_pace": 18, "strategy": 9, "news_sentiment": 2}
     return [{"factor": key, "weight": value} for key, value in weights.items()]

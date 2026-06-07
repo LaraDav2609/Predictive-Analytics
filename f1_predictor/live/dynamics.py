@@ -111,14 +111,18 @@ def _source_confidence(source_mode: str, value: Any) -> float:
     except (TypeError, ValueError):
         base = {
             "live": 0.88,
+            "recorded_confident": 0.80,
             "recorded": 0.76,
+            "recording_pending": 0.18,
             "recent": 0.62,
             "historical": 0.58,
             "estimated": 0.24,
         }.get(source_mode, 0.0)
     source_cap = {
         "live": 0.95,
+        "recorded_confident": 0.85,
         "recorded": 0.82,
+        "recording_pending": 0.25,
         "recent": 0.68,
         "historical": 0.64,
         "estimated": 0.30,

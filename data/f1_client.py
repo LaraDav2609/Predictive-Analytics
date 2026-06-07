@@ -103,6 +103,7 @@ class F1Client(SportsDataClient):
         self._constructor_seasons_cache: dict[str, list[dict]] = {}
         self._constructor_driver_titles_cache: dict[tuple[str, int], dict | None] = {}
         self._season_results_cache: dict[int, list[dict]] = {}
+        self._season_qualifying_cache: dict[int, list[dict]] = {}
         self._prediction_features_cache: dict[tuple[int, int], dict] = {}
         self._weather_client = OpenMeteoClient()
 
@@ -479,6 +480,22 @@ class F1Client(SportsDataClient):
         replay races without reshaping through live-season dashboard models.
         """
         return await self._fetch_season_results(season)
+
+    async def get_historical_qualifying_results(self, season: int) -> list[dict]:
+        """Return raw Jolpica qualifying rows for a season, grouped by race."""
+
+        if season in self._season_qualifying_cache:
+            return self._season_qualifying_cache[season]
+        try:
+            resp = await self._client.get(f"/{season}/qualifying.json?limit=2000")
+            resp.raise_for_status()
+            data = resp.json()
+            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch F1 season qualifying for %s: %s", season, e)
+            races = []
+        self._season_qualifying_cache[season] = races
+        return races
 
     def get_race_by_round(self, round_num: int) -> Race | None:
         return next((r for r in self._races if r.round == round_num), None)

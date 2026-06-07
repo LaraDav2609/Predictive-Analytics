@@ -16,6 +16,10 @@ class F1ProbabilityEngineTests(unittest.TestCase):
         )
         self.assertEqual("post_qualifying", detect_stage({"qualifying": [{"driver_id": "max", "position": 1}]}, {}))
         self.assertEqual(
+            "practice_available",
+            detect_stage({"context": {"has_qualifying": True, "completed_sessions": 3}}, {}),
+        )
+        self.assertEqual(
             "live",
             detect_stage({"qualifying": []}, {"source_mode": "live", "drivers": [{"driver_id": "max"}]}, live=True),
         )
@@ -88,6 +92,38 @@ class F1ProbabilityEngineTests(unittest.TestCase):
         self.assertIn("raw_probability", first)
         self.assertIn("calibrated_probability", first)
         self.assertIn("probability_audit", enriched)
+
+    def test_enrich_payload_uses_finish_distribution_for_points_buckets(self):
+        payload = {
+            "simulations": [
+                {
+                    "driver_id": "max",
+                    "win_probability": 0.65,
+                    "podium_probability": 0.99,
+                    "top5_probability": 0.99,
+                    "points_probability": 0.99,
+                    "expected_finish": 4.0,
+                    "finish_distribution": {"1": 0.10, "2": 0.10, "6": 0.80},
+                },
+                {
+                    "driver_id": "charles",
+                    "win_probability": 0.35,
+                    "podium_probability": 0.99,
+                    "top5_probability": 0.99,
+                    "points_probability": 0.99,
+                    "expected_finish": 5.0,
+                    "finish_distribution": {"1": 0.05, "3": 0.10, "11": 0.85},
+                },
+            ],
+        }
+
+        enriched = enrich_probability_payload(payload, profile={}, truth={"source_mode": "recent", "confidence": 0.7})
+        by_driver = {row["driver_id"]: row for row in enriched["simulations"]}
+
+        self.assertAlmostEqual(0.20, by_driver["max"]["podium_probability"], places=3)
+        self.assertAlmostEqual(1.00, by_driver["max"]["points_probability"], places=3)
+        self.assertAlmostEqual(0.15, by_driver["charles"]["podium_probability"], places=3)
+        self.assertAlmostEqual(0.15, by_driver["charles"]["points_probability"], places=3)
 
     def test_monte_carlo_emits_top5_and_finish_distribution(self):
         result = MonteCarloSimulator(iterations=25, seed=7).run({"max": 0.9, "charles": 0.7}, {"laps": 2})

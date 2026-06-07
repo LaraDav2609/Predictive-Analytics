@@ -41,6 +41,16 @@ _STATIC_RESPONSE_CACHE_TTL_SECONDS = 60.0
 _simulation_response_cache: dict[tuple[int, str], tuple[float, dict]] = {}
 _track_response_cache: dict[tuple[int, str], tuple[float, dict]] = {}
 
+_WEEKEND_SESSION_LABELS = {
+    "fp1": "Practice 1",
+    "fp2": "Practice 2",
+    "fp3": "Practice 3",
+    "sprint_qualifying": "Sprint Qualifying",
+    "sprint": "Sprint",
+    "qualifying": "Qualifying",
+    "race": "Race",
+}
+
 
 def _get_static_cache(cache: dict, key: tuple[int, str]) -> dict | None:
     entry = cache.get(key)
@@ -447,11 +457,13 @@ def _confidence_report(
     diagnostics: dict | None = None,
     probabilities: list[dict] | None = None,
 ) -> dict:
+    round_num = (live_state or {}).get("round") or (truth or {}).get("round")
+    session = (live_state or {}).get("session") or (truth or {}).get("session") or "race"
     return build_live_confidence_report(
         truth or {},
         live_state=live_state or {},
         diagnostics=diagnostics or {},
-        recorder_status=(live_recorder.status() if live_recorder else {"ok": False, "reason": "live_recorder_unavailable"}),
+        recorder_status=(live_recorder.status(round_num=round_num, session=session) if live_recorder else {"ok": False, "reason": "live_recorder_unavailable"}),
         probabilities=probabilities or [],
     )
 
@@ -510,6 +522,21 @@ async def _live_state_for_round(round_num: int, session: str = "race", force: bo
             "race": race.model_dump(mode="json"),
         }
     state = await live_engine.get_state(race, client.get_drivers(), session=session, force=force)
+    if live_recorder:
+        recorder_status = live_recorder.status(round_num=round_num, session=session)
+        state["recorder_status"] = recorder_status
+        recording_mode = recorder_status.get("recording_source_mode")
+        if recording_mode == "recording_pending" and (state.get("source_mode") in {"estimated", "unavailable"} or state.get("mode") in {"estimated", "unavailable"}):
+            state["mode"] = "recording_pending"
+            state["status"] = "recording_pending"
+            state["source_mode"] = "recording_pending"
+            state["is_estimated"] = True
+            state["confidence"] = min(float(state.get("confidence") or 0.16), 0.18)
+            state["fallback_reason"] = recorder_status.get("next_setup_action") or "fastf1_recorder_running_waiting_for_timing_rows"
+        elif recording_mode in {"recorded", "recorded_confident"} and state.get("source_mode") == "recorded":
+            state["mode"] = recording_mode
+            state["status"] = recording_mode
+            state["source_mode"] = recording_mode
     attach_confidence_report(state, _confidence_report({}, live_state=state))
     if storage and state:
         state["storage"] = await storage.persist_live_state(client.season, race, session, state)
@@ -729,6 +756,281 @@ async def _truth_snapshot_for_round(
     return truth
 
 
+def _canonical_weekend_session(session: str | None) -> str:
+    value = (session or "race").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "practice1": "fp1",
+        "practice_1": "fp1",
+        "free_practice_1": "fp1",
+        "p1": "fp1",
+        "practice2": "fp2",
+        "practice_2": "fp2",
+        "free_practice_2": "fp2",
+        "p2": "fp2",
+        "practice3": "fp3",
+        "practice_3": "fp3",
+        "free_practice_3": "fp3",
+        "p3": "fp3",
+        "quali": "qualifying",
+        "qualification": "qualifying",
+        "sq": "sprint_qualifying",
+        "sprint_quali": "sprint_qualifying",
+        "sprint_shootout": "sprint_qualifying",
+        "grand_prix": "race",
+    }
+    return aliases.get(value, value if value in _WEEKEND_SESSION_LABELS else "race")
+
+
+def _openf1_session_arg(session_code: str) -> str:
+    return {
+        "fp1": "fp1",
+        "fp2": "fp2",
+        "fp3": "fp3",
+        "qualifying": "qualifying",
+        "sprint_qualifying": "sprint_qualifying",
+        "sprint": "sprint",
+        "race": "race",
+    }.get(session_code, "race")
+
+
+async def _weekend_session_result(round_num: int, session: str) -> dict:
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+
+    session_code = _canonical_weekend_session(session)
+    profile = await client.get_race_profile(round_num, predictor)
+    if not profile.get("ok"):
+        return profile
+
+    meta = next((item for item in profile.get("sessions") or [] if item.get("code") == session_code), None)
+    if not meta and session_code in {"fp1", "fp2", "fp3", "qualifying", "race"}:
+        meta = {"code": session_code, "name": _WEEKEND_SESSION_LABELS.get(session_code, session_code), "status": "unknown"}
+    if not meta:
+        return {
+            "ok": True,
+            "available": False,
+            "code": "session_not_scheduled",
+            "reason": f"{_WEEKEND_SESSION_LABELS.get(session_code, session_code)} is not scheduled for this Grand Prix",
+            "race": race.model_dump(mode="json"),
+            "session": {"code": session_code, "name": _WEEKEND_SESSION_LABELS.get(session_code, session_code)},
+            "results": [],
+        }
+
+    official_rows = _official_session_rows(profile, session_code)
+    openf1_payload = {}
+    if openf1:
+        try:
+            openf1_payload = await openf1.get_session_features(
+                race=race,
+                session=_openf1_session_arg(session_code),
+                drivers=client.get_drivers(),
+                live=False,
+            )
+        except Exception as exc:
+            openf1_payload = {"ok": False, "source": "openf1", "reason": f"openf1_error:{exc.__class__.__name__}"}
+
+    timing_rows = _openf1_timing_rows(openf1_payload, client.get_drivers())
+    if official_rows:
+        rows = _merge_official_and_timing(official_rows, timing_rows, session_code)
+        source = "jolpica_official"
+        if timing_rows:
+            source += "+openf1_timing"
+    else:
+        rows = timing_rows
+        source = (openf1_payload or {}).get("source") or "openf1"
+
+    rows = _rank_session_rows(rows, session_code)
+    available = bool(rows)
+    reason = None
+    if not available:
+        reason = "Session has not started yet" if meta.get("status") != "completed" else "No classified timing/result rows are available yet"
+        if (openf1_payload or {}).get("reason"):
+            reason = f"{reason}; {(openf1_payload or {}).get('reason')}"
+
+    return {
+        "ok": True,
+        "available": available,
+        "race": race.model_dump(mode="json"),
+        "session": {
+            "code": session_code,
+            "name": meta.get("name") or _WEEKEND_SESSION_LABELS.get(session_code, session_code),
+            "date": meta.get("date"),
+            "status": "completed" if available else meta.get("status") or "unavailable",
+            "note": meta.get("note"),
+        },
+        "source": source if available else "unavailable",
+        "source_detail": {
+            "official_rows": len(official_rows),
+            "openf1_rows": len(timing_rows),
+            "openf1_ok": bool((openf1_payload or {}).get("ok")),
+            "openf1_reason": (openf1_payload or {}).get("reason"),
+            "raw_counts": (openf1_payload or {}).get("raw_counts") or {},
+        },
+        "reason": reason,
+        "results": rows,
+        "result_count": len(rows),
+    }
+
+
+def _official_session_rows(profile: dict, session_code: str) -> list[dict]:
+    if session_code == "race":
+        return [dict(row) for row in profile.get("results") or []]
+    if session_code == "qualifying":
+        rows = []
+        for row in profile.get("qualifying") or []:
+            item = dict(row)
+            best_seconds = _best_qualifying_seconds(item)
+            item["best_time"] = _format_lap_time(best_seconds) if best_seconds else None
+            item["best_time_seconds"] = best_seconds
+            rows.append(item)
+        return rows
+    if session_code == "sprint":
+        return [dict(row) for row in profile.get("sprint") or []]
+    return []
+
+
+def _openf1_timing_rows(openf1_payload: dict | None, drivers: list) -> list[dict]:
+    if not openf1_payload or not openf1_payload.get("ok"):
+        return []
+    by_number = _driver_lookup_by_number(drivers)
+    rows = []
+    lap_drivers = ((openf1_payload.get("laps") or {}).get("drivers") or {})
+    positions = ((openf1_payload.get("positions") or {}).get("drivers") or {})
+    intervals = ((openf1_payload.get("intervals") or {}).get("drivers") or {})
+    stints = ((openf1_payload.get("stints") or {}).get("drivers") or {})
+    pits = ((openf1_payload.get("pits") or {}).get("drivers") or {})
+    numbers = set(lap_drivers.keys()) | set(positions.keys()) | set(intervals.keys()) | set(stints.keys()) | set(pits.keys())
+    for number_key in numbers:
+        lap = lap_drivers.get(str(number_key)) or {}
+        position = positions.get(str(number_key)) or {}
+        interval = intervals.get(str(number_key)) or {}
+        stint = stints.get(str(number_key)) or {}
+        pit = pits.get(str(number_key)) or {}
+        try:
+            number = int(number_key)
+        except (TypeError, ValueError):
+            number = int(lap.get("driver_number") or position.get("driver_number") or 0)
+        driver = by_number.get(number)
+        best_seconds = _safe_float(lap.get("best_lap"))
+        rows.append({
+            "position": _safe_int(position.get("position")),
+            "driver_id": getattr(driver, "id", None),
+            "driver_number": number or lap.get("driver_number"),
+            "driver_code": lap.get("driver_code") or position.get("driver_code") or getattr(driver, "code", None),
+            "driver_name": f"{getattr(driver, 'first_name', '')} {getattr(driver, 'last_name', '')}".strip() or None,
+            "team": getattr(driver, "team", None),
+            "best_time": _format_lap_time(best_seconds) if best_seconds else None,
+            "best_time_seconds": best_seconds,
+            "representative_time": _format_lap_time(_safe_float(lap.get("representative_lap"))) if lap.get("representative_lap") else None,
+            "median_time": _format_lap_time(_safe_float(lap.get("median_lap"))) if lap.get("median_lap") else None,
+            "laps": _safe_int(lap.get("laps")),
+            "compound": "/".join(lap.get("compounds") or []) or stint.get("compound"),
+            "stint_laps": stint.get("avg_stint_laps"),
+            "pit_stops": pit.get("pit_stops"),
+            "gap_to_leader": interval.get("gap_to_leader"),
+            "interval": interval.get("interval"),
+            "source": "openf1_timing",
+        })
+    return rows
+
+
+def _merge_official_and_timing(official_rows: list[dict], timing_rows: list[dict], session_code: str) -> list[dict]:
+    by_id = {str(row.get("driver_id") or "").lower(): row for row in timing_rows if row.get("driver_id")}
+    by_code = {str(row.get("driver_code") or "").upper(): row for row in timing_rows if row.get("driver_code")}
+    merged = []
+    for row in official_rows:
+        timing = by_id.get(str(row.get("driver_id") or "").lower()) or by_code.get(str(row.get("driver_code") or "").upper()) or {}
+        best_seconds = _safe_float(timing.get("best_time_seconds")) or _safe_float(row.get("best_time_seconds"))
+        item = {
+            **row,
+            "driver_number": timing.get("driver_number") or row.get("driver_number"),
+            "best_time": timing.get("best_time") or row.get("best_time") or row.get("time"),
+            "best_time_seconds": best_seconds,
+            "representative_time": timing.get("representative_time"),
+            "median_time": timing.get("median_time"),
+            "laps": timing.get("laps"),
+            "compound": timing.get("compound"),
+            "stint_laps": timing.get("stint_laps"),
+            "pit_stops": timing.get("pit_stops"),
+            "gap_to_leader": timing.get("gap_to_leader"),
+            "interval": timing.get("interval"),
+            "source": "official+openf1_timing" if timing else "official",
+        }
+        if session_code == "race":
+            item["finish_time"] = row.get("time")
+        merged.append(item)
+    return merged
+
+
+def _rank_session_rows(rows: list[dict], session_code: str) -> list[dict]:
+    if not rows:
+        return []
+    if session_code in {"fp1", "fp2", "fp3"}:
+        ranked = sorted(rows, key=lambda row: (_safe_float(row.get("best_time_seconds")) or 99999, _safe_int(row.get("position")) or 999))
+        for index, row in enumerate(ranked, start=1):
+            row["position"] = row.get("position") or index
+        return ranked
+    return sorted(rows, key=lambda row: _safe_int(row.get("position")) or 999)
+
+
+def _driver_lookup_by_number(drivers: list) -> dict[int, object]:
+    lookup = {}
+    for driver in drivers:
+        try:
+            if driver.number is not None:
+                lookup[int(driver.number)] = driver
+        except (TypeError, ValueError):
+            continue
+    return lookup
+
+
+def _best_qualifying_seconds(row: dict) -> float | None:
+    values = [_time_to_seconds(row.get(key)) for key in ("q1", "q2", "q3")]
+    values = [value for value in values if value is not None]
+    return min(values) if values else None
+
+
+def _time_to_seconds(value) -> float | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        if ":" in text:
+            minutes, seconds = text.split(":", 1)
+            return int(minutes) * 60 + float(seconds)
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_lap_time(value) -> str | None:
+    seconds = _safe_float(value)
+    if seconds is None:
+        return None
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes}:{remainder:06.3f}" if minutes else f"{remainder:.3f}"
+
+
+def _safe_int(value) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @router.get("/drivers")
 async def get_drivers():
     drivers = client.get_drivers()
@@ -812,9 +1114,9 @@ async def get_f1_models():
 
 
 @router.get("/models/compare")
-async def compare_f1_models(season: int | None = None, include_races: bool = False, allow_partial: bool = False):
+async def compare_f1_models(season: int | None = None, include_races: bool = False, allow_partial: bool = False, stage: str = "pre_weekend"):
     backtester = F1BacktestService(client)
-    return await backtester.compare_season(season=season, include_races=include_races, allow_partial=allow_partial)
+    return await backtester.compare_season(season=season, include_races=include_races, allow_partial=allow_partial, stage=stage)
 
 
 @router.get("/models/compare/summary")
@@ -823,6 +1125,7 @@ async def compare_f1_models_summary(
     end_season: int | None = None,
     include_races: bool = False,
     allow_partial: bool = False,
+    stage: str = "pre_weekend",
 ):
     backtester = F1BacktestService(client)
     end = end_season if end_season is not None else max(start_season, client.season - 1)
@@ -831,6 +1134,7 @@ async def compare_f1_models_summary(
         end_season=end,
         include_races=include_races,
         allow_partial=allow_partial,
+        stage=stage,
     )
 
 
@@ -927,9 +1231,9 @@ async def get_f1_storage_health():
 
 
 @router.get("/backtest")
-async def get_f1_backtest(season: int | None = None, include_races: bool = False, allow_partial: bool = False, model_id: str | None = None):
+async def get_f1_backtest(season: int | None = None, include_races: bool = False, allow_partial: bool = False, model_id: str | None = None, stage: str = "pre_weekend"):
     backtester = F1BacktestService(client)
-    result = await backtester.backtest_season(season=season, include_races=include_races, allow_partial=allow_partial, model_id=model_id)
+    result = await backtester.backtest_season(season=season, include_races=include_races, allow_partial=allow_partial, model_id=model_id, stage=stage)
     if storage and result.get("ok"):
         result["storage"] = await storage.persist_backtest_result(result)
     return result
@@ -1005,7 +1309,7 @@ async def get_f1_live_diagnostics(round_num: int, session: str = "race"):
         "source_chain": [],
     }
     timeline = live_engine.get_timeline(race, session=session) if live_engine else {"events": []}
-    recorder_status = live_recorder.status() if live_recorder else {"ok": False, "reason": "live_recorder_unavailable"}
+    recorder_status = live_recorder.status(round_num=round_num, session=session) if live_recorder else {"ok": False, "reason": "live_recorder_unavailable"}
     storage_health = await storage.health() if storage else {
         "redis": {"available": False, "last_error": "storage_unavailable"},
         "clickhouse": {"available": False, "last_error": "storage_unavailable"},
@@ -1062,6 +1366,12 @@ async def get_f1_live_diagnostics(round_num: int, session: str = "race"):
             "tyre_count": (report.get("coverage_counts") or {}).get("tyre_count"),
             "race_control_available": (report.get("coverage_counts") or {}).get("race_control_available"),
             "confidence_blocker": ((report.get("confidence_blockers") or [{}])[0] or {}).get("message"),
+            "fastf1_available": recorder_status.get("fastf1_available"),
+            "signalrcore_available": recorder_status.get("signalrcore_available"),
+            "recorder_running": recorder_status.get("running"),
+            "file_growth": recorder_status.get("recording_file_growth"),
+            "parsed_driver_count": recorder_status.get("parsed_driver_count"),
+            "recording_source_mode": recorder_status.get("recording_source_mode"),
         },
         "probability_timeline": {
             "event_count": len(probability_events),
@@ -1096,7 +1406,7 @@ async def get_f1_live_confidence(round_num: int, session: str = "race"):
 async def get_f1_live_recorder(round_num: int, session: str = "race"):
     if not live_recorder:
         return {"ok": False, "reason": "live_recorder_unavailable"}
-    return live_recorder.status()
+    return live_recorder.status(round_num=round_num, session=session)
 
 
 @router.post("/live/{round_num}/recorder/start")
@@ -1235,6 +1545,7 @@ async def get_f1_backtest_summary(
     include_races: bool = False,
     allow_partial: bool = False,
     model_id: str | None = None,
+    stage: str = "pre_weekend",
 ):
     backtester = F1BacktestService(client)
     end = end_season if end_season is not None else max(start_season, client.season - 1)
@@ -1244,6 +1555,7 @@ async def get_f1_backtest_summary(
         include_races=include_races,
         allow_partial=allow_partial,
         model_id=model_id,
+        stage=stage,
     )
     if storage and result.get("ok"):
         result["storage"] = await storage.persist_backtest_result(result)
@@ -1251,9 +1563,9 @@ async def get_f1_backtest_summary(
 
 
 @router.get("/backtest/races/{season}/{round_num}")
-async def get_f1_backtest_race(season: int, round_num: int, allow_partial: bool = True, model_id: str | None = None):
+async def get_f1_backtest_race(season: int, round_num: int, allow_partial: bool = True, model_id: str | None = None, stage: str = "pre_weekend"):
     backtester = F1BacktestService(client)
-    result = await backtester.backtest_race(season=season, round_num=round_num, allow_partial=allow_partial, model_id=model_id)
+    result = await backtester.backtest_race(season=season, round_num=round_num, allow_partial=allow_partial, model_id=model_id, stage=stage)
     if storage and result.get("ok"):
         result["storage"] = await storage.persist_backtest_result(result)
     return result
@@ -1391,6 +1703,11 @@ async def get_race(round_num: int):
 @router.get("/races/{round_num}/profile")
 async def get_race_profile(round_num: int):
     return await client.get_race_profile(round_num, predictor)
+
+
+@router.get("/races/{round_num}/sessions/{session}")
+async def get_race_session_result(round_num: int, session: str):
+    return await _weekend_session_result(round_num, session)
 
 
 @router.get("/races/{round_num}/truth")

@@ -118,10 +118,10 @@ def enrich_probability_payload(
         row["finish_distribution"] = audited["finish_distribution"]
         row["probability_source_breakdown"] = audited["probability_source_breakdown"]
         row["win_probability"] = audited["calibrated_probability"]
-        row.setdefault("podium_probability", audited["finish_distribution"].get("podium", 0.0))
-        row.setdefault("top5_probability", audited["finish_distribution"].get("top5", 0.0))
-        row.setdefault("points_probability", audited["finish_distribution"].get("points", 0.0))
-        row.setdefault("expected_finish", audited["finish_distribution"].get("expected_finish"))
+        row["podium_probability"] = audited["finish_distribution"].get("podium", 0.0)
+        row["top5_probability"] = audited["finish_distribution"].get("top5", 0.0)
+        row["points_probability"] = audited["finish_distribution"].get("points", 0.0)
+        row["expected_finish"] = audited["finish_distribution"].get("expected_finish")
 
     rows.sort(key=lambda item: (float(item.get("win_probability") or 0.0), -float(item.get("expected_finish") or 99.0)), reverse=True)
     for index, row in enumerate(rows, start=1):
@@ -141,15 +141,39 @@ def enrich_probability_payload(
 
 
 def _finish_distribution(row: dict[str, Any], calibrated_win: float) -> dict[str, Any]:
+    existing_distribution = row.get("finish_distribution") or row.get("position_distribution") or {}
+    existing_summary = existing_distribution if isinstance(existing_distribution, dict) and "positions" in existing_distribution else {}
+    positions = (existing_summary.get("positions") if existing_summary else existing_distribution) or {}
+    podium = _position_probability(positions, 3)
+    top5 = _position_probability(positions, 5)
+    points = _position_probability(positions, 10)
+    expected_finish = row.get("expected_finish")
+    if expected_finish is None:
+        expected_finish = existing_summary.get("expected_finish")
+    if expected_finish is None and positions:
+        expected_finish = sum(_position_key(position) * float(probability or 0.0) for position, probability in positions.items())
     return {
         "win": round(calibrated_win, 4),
-        "podium": round(float(row.get("podium_probability") or 0.0), 4),
-        "top5": round(float(row.get("top5_probability") or 0.0), 4),
-        "points": round(float(row.get("points_probability") or 0.0), 4),
-        "dnf": round(float(row.get("dnf_probability") or 0.0), 4),
-        "expected_finish": round(float(row.get("expected_finish") or 0.0), 2),
-        "positions": row.get("finish_distribution") or row.get("position_distribution") or {},
+        "podium": round(podium if podium is not None else float(existing_summary.get("podium") or row.get("podium_probability") or 0.0), 4),
+        "top5": round(top5 if top5 is not None else float(existing_summary.get("top5") or row.get("top5_probability") or 0.0), 4),
+        "points": round(points if points is not None else float(existing_summary.get("points") or row.get("points_probability") or 0.0), 4),
+        "dnf": round(float(existing_summary.get("dnf") or row.get("dnf_probability") or 0.0), 4),
+        "expected_finish": round(float(expected_finish or 0.0), 2),
+        "positions": positions,
     }
+
+
+def _position_probability(positions: dict[str, Any], top_n: int) -> float | None:
+    if not positions:
+        return None
+    return sum(float(probability or 0.0) for position, probability in positions.items() if _position_key(position) <= top_n)
+
+
+def _position_key(position: Any) -> int:
+    try:
+        return int(position)
+    except (TypeError, ValueError):
+        return 99
 
 
 def _source_breakdown(
@@ -269,8 +293,12 @@ def _top_probability_cap(stage: str, source_mode: str, confidence: float, missin
         base = 0.34 if stage in {"pre_weekend", "practice_available"} else 0.42
     elif source_mode == "recent":
         base = 0.48
+    elif source_mode == "recording_pending":
+        base = 0.34 if stage in {"pre_weekend", "practice_available"} else 0.38
     elif source_mode == "recorded":
         base = 0.58
+    elif source_mode == "recorded_confident":
+        base = 0.64
     elif source_mode == "live":
         base = 0.70
     else:

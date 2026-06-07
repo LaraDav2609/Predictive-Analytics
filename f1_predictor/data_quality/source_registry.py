@@ -36,7 +36,9 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
 MODE_TO_SOURCE = {
     "live": "live_session_engine",
     "recent": "openf1_session_facts",
+    "recording_pending": "fastf1_recorded_file",
     "recorded": "fastf1_recorded_file",
+    "recorded_confident": "fastf1_recorded_file",
     "historical": "f1_client_official_results",
     "estimated": "estimated_standings_order",
     "unavailable": "unavailable",

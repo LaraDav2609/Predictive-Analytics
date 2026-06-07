@@ -338,6 +338,9 @@ def _estimated_progress(index: int, count: int) -> float:
 
 def _session_kind(session: str) -> str:
     value = (session or "race").lower()
+    normalized = value.replace("_", " ").replace("-", " ")
+    if normalized.startswith("fp") or "practice" in normalized:
+        return "practice"
     if value.startswith("qual"):
         return "qualifying"
     if value.startswith("sprint"):

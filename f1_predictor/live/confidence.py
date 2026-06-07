@@ -10,7 +10,9 @@ SOURCE_CEILINGS = {
     "estimated": 0.25,
     "recent": 0.55,
     "historical": 0.55,
+    "recording_pending": 0.25,
     "recorded": 0.75,
+    "recorded_confident": 0.85,
     "live": 0.90,
 }
 FULL_LIVE_CEILING = 0.95
@@ -19,7 +21,9 @@ SOURCE_FLOORS = {
     "estimated": 0.08,
     "recent": 0.22,
     "historical": 0.22,
+    "recording_pending": 0.10,
     "recorded": 0.38,
+    "recorded_confident": 0.52,
     "live": 0.50,
 }
 
@@ -165,6 +169,8 @@ def _missing_groups(
         missing.add("session_weather")
     if not coverage["race_control_available"]:
         missing.add("race_control")
+    if source_mode == "recording_pending":
+        missing.add("fastf1_timing_rows")
     if source_mode == "estimated" and not recorder_status.get("running") and not recorder_status.get("file_size"):
         missing.add("fastf1_recording")
     return sorted(missing)
@@ -178,7 +184,9 @@ def _blockers(
     probabilities: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
-    if source_mode in {"estimated", "unavailable"}:
+    if source_mode == "recording_pending":
+        blockers.append({"code": "recording_pending", "message": "Recorder is running, but no usable timing rows have arrived yet.", "severity": "high"})
+    elif source_mode in {"estimated", "unavailable"}:
         blockers.append({"code": "estimated_source", "message": "No real live timing source is active.", "severity": "high"})
     if coverage["usable_driver_count"] < 18:
         blockers.append({"code": "thin_driver_rows", "message": "Fewer than 18 drivers have usable timing rows.", "severity": "high"})
@@ -191,7 +199,7 @@ def _blockers(
     if truth.get("source_disagreement"):
         blockers.append({"code": "source_disagreement", "message": "Source disagreement detected; confidence is flattened.", "severity": "medium"})
     top = max([float(row.get("win_probability") or row.get("calibrated_probability") or 0.0) for row in probabilities] or [0.0])
-    if top >= 0.45 and source_mode in {"estimated", "unavailable", "recent"}:
+    if top >= 0.45 and source_mode in {"estimated", "unavailable", "recording_pending", "recent"}:
         blockers.append({"code": "overconfidence_guard", "message": "Top probability is high for the current source quality.", "severity": "medium"})
     if source_mode == "estimated" and not recorder_status.get("fastf1_available"):
         blockers.append({"code": "fastf1_unavailable", "message": "FastF1 recorder is not available in the dashboard runtime.", "severity": "medium"})
@@ -200,6 +208,16 @@ def _blockers(
 
 def _confidence_ceiling(source_mode: str, coverage: dict[str, Any]) -> float:
     ceiling = SOURCE_CEILINGS.get(source_mode, SOURCE_CEILINGS["estimated"])
+    if source_mode == "recording_pending":
+        ceiling = min(ceiling, SOURCE_CEILINGS["recording_pending"])
+    if source_mode == "recorded_confident":
+        has_core_timing = (
+            coverage["usable_driver_count"] >= 18
+            and coverage["real_positions"] >= 18
+            and (coverage["real_gaps"] >= 12 or coverage["real_intervals"] >= 12)
+        )
+        if not has_core_timing:
+            ceiling = min(ceiling, SOURCE_CEILINGS["recorded"])
     if source_mode == "live":
         full_live = (
             coverage["real_positions"] >= 18
@@ -224,7 +242,9 @@ def _raw_confidence(
     if base <= 0:
         base = {
             "live": 0.78,
+            "recorded_confident": 0.72,
             "recorded": 0.62,
+            "recording_pending": 0.16,
             "recent": 0.46,
             "historical": 0.42,
             "estimated": 0.18,
@@ -240,6 +260,8 @@ def _raw_confidence(
     )
     if source_mode in {"estimated", "unavailable"}:
         evidence *= 0.35
+    elif source_mode == "recording_pending":
+        evidence *= 0.45
     severity_penalty = sum({"high": 0.08, "medium": 0.045, "low": 0.02}.get(item.get("severity"), 0.025) for item in blockers)
     return max(0.0, base * 0.55 + evidence * 0.45 - severity_penalty)
 
@@ -268,8 +290,12 @@ def _next_best_action(
 ) -> str:
     if source_mode == "live":
         return "Monitor refresh stability and race-control/weather events."
+    if source_mode == "recorded_confident":
+        return "Keep recorder running; recorded timing has enough driver coverage for live testing."
     if source_mode == "recorded":
         return "Keep recorder running and verify file growth."
+    if source_mode == "recording_pending":
+        return "Keep FastF1 recorder running; waiting for timing stream rows to arrive."
     if "fastf1_recording" in missing:
         if recorder_status.get("fastf1_available"):
             return "Start FastF1 recorder before or during the live session."

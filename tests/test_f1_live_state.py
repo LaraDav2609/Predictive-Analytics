@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from f1_predictor.live import F1LiveSessionEngine
+from f1_predictor.live.confidence import build_live_confidence_report
 from f1_predictor.live.dynamics import build_live_dynamics
 from f1_predictor.live.session_state import build_live_state
 from f1_predictor.simulation.session_projection import build_session_projection
@@ -170,6 +171,54 @@ class F1LiveSessionStateTests(unittest.IsolatedAsyncioTestCase):
         estimated = build_live_dynamics({**base, "source_mode": "estimated", "confidence": 0.90})
 
         self.assertGreater(abs(live["drivers"]["max"]["live_delta"]), abs(estimated["drivers"]["max"]["live_delta"]))
+
+    def test_recording_pending_confidence_stays_low_and_explains_waiting(self):
+        report = build_live_confidence_report(
+            {
+                "source_mode": "recording_pending",
+                "confidence": 0.7,
+                "drivers": [
+                    {"driver_id": "max", "position": 1, "source_mode": "estimated"},
+                    {"driver_id": "charles", "position": 2, "source_mode": "estimated"},
+                ],
+            },
+            recorder_status={
+                "running": True,
+                "fastf1_available": True,
+                "signalrcore_available": True,
+                "recording_source_mode": "recording_pending",
+                "parsed_driver_count": 0,
+            },
+        )
+
+        self.assertLessEqual(report["confidence"], 0.25)
+        self.assertIn("fastf1_timing_rows", report["missing_confidence_groups"])
+        self.assertIn("waiting", report["next_best_action"].lower())
+
+    def test_recorded_confident_confidence_can_exceed_recorded_floor(self):
+        rows = [
+            {
+                "driver_id": f"driver_{idx}",
+                "position": idx,
+                "gap_to_leader": "0.000" if idx == 1 else f"+{idx}.000",
+                "interval": "0.000" if idx == 1 else "+1.000",
+                "lap": 20,
+                "compound": "MEDIUM",
+                "tyre_age": 8,
+                "pit_stops": 1,
+                "source_mode": "recorded_confident",
+            }
+            for idx in range(1, 21)
+        ]
+
+        report = build_live_confidence_report(
+            {"source_mode": "recorded_confident", "confidence": 0.82, "drivers": rows},
+            recorder_status={"running": True, "fastf1_available": True, "signalrcore_available": True},
+        )
+
+        self.assertGreaterEqual(report["confidence_ceiling"], 0.85)
+        self.assertGreater(report["confidence"], 0.55)
+        self.assertNotIn("usable_live_timing_rows", report["missing_confidence_groups"])
 
 
 class _FakeOpenF1:

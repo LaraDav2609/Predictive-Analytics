@@ -61,6 +61,8 @@ def load_fastf1_recorded_state(race: Race, drivers: list[Driver], session: str) 
 
     newest = max(candidates, key=lambda item: item.stat().st_mtime)
     rows = _read_recording_rows(newest)
+    parsed_numbers = {_driver_number(row) for row in rows}
+    parsed_numbers.discard(None)
     if not rows:
         return {
             "ok": False,
@@ -68,6 +70,8 @@ def load_fastf1_recorded_state(race: Race, drivers: list[Driver], session: str) 
             "reason": "recording_empty_or_unparsed",
             "path": str(newest),
             "file_size": newest.stat().st_size,
+            "parsed_driver_count": 0,
+            "parsed_row_count": 0,
             "drivers": {},
         }
 
@@ -111,6 +115,11 @@ def load_fastf1_recorded_state(race: Race, drivers: list[Driver], session: str) 
         "source": "fastf1_recorded_file",
         "path": str(newest),
         "file_size": newest.stat().st_size,
+        "parsed_driver_count": len(parsed_numbers),
+        "parsed_row_count": len(rows),
+        "parsed_real_gap_count": sum(1 for row in rows if _first(row, "gap_to_leader", "GapToLeader", "gap", "IntervalToPositionAhead", "interval")),
+        "parsed_tyre_count": sum(1 for row in rows if _first(row, "compound", "Compound", "tyre_compound") or _first(row, "Stints", "stints")),
+        "last_parsed_timestamp": _last_timestamp(rows),
         "drivers": normalized,
         "reason": None if normalized else "recording_has_no_matching_drivers",
     }
@@ -322,7 +331,11 @@ def _flatten_records(value: Any) -> list[dict[str, Any]]:
             if rows:
                 return rows
         rows = []
-        for key in ["data", "Data", "cars", "Cars", "timing", "TimingData", "lines", "Lines"]:
+        for key in [
+            "data", "Data", "cars", "Cars", "timing", "TimingData", "lines", "Lines",
+            "Position", "PositionData", "Entries", "SessionData", "WeatherData",
+            "RaceControlMessages", "Messages", "TrackStatus", "TimingAppData",
+        ]:
             child = value.get(key)
             if isinstance(child, (list, dict)):
                 rows.extend(_flatten_records(child))
@@ -425,7 +438,8 @@ def _source_mode(state: dict[str, Any], openf1_session: dict[str, Any], track: d
     if openf1_session.get("ok") and any(int(raw_counts.get(key) or 0) > 0 for key in ["positions", "laps", "intervals"]):
         return "recent"
     if recorded.get("ok"):
-        return "recorded"
+        parsed = _safe_int(recorded.get("parsed_driver_count")) or len(recorded.get("drivers") or {})
+        return "recorded_confident" if parsed >= 18 else "recorded"
     if state.get("drivers") or track.get("path"):
         return "estimated"
     return "unavailable"
@@ -439,6 +453,10 @@ def _source_confidence(source_mode: str, raw_counts: dict[str, Any], state: dict
         return round(min(0.78, 0.45 + count / 900.0), 3)
     if source_mode == "recorded":
         return round(min(0.70, 0.38 + len(recorded_rows) / 60.0), 3)
+    if source_mode == "recorded_confident":
+        return round(min(0.82, 0.58 + len(recorded_rows) / 70.0), 3)
+    if source_mode == "recording_pending":
+        return 0.16
     if source_mode == "estimated":
         with_positions = len(state.get("live_positions") or {})
         return round(0.18 + min(0.12, with_positions / 200.0), 3)
@@ -446,8 +464,10 @@ def _source_confidence(source_mode: str, raw_counts: dict[str, Any], state: dict
 
 
 def _driver_source_mode(item: dict[str, Any], source_mode: str) -> str:
-    if source_mode in {"live", "recorded"}:
+    if source_mode in {"live", "recorded", "recorded_confident"}:
         return source_mode
+    if source_mode == "recording_pending":
+        return "estimated"
     if source_mode == "recent" and (item.get("position") is not None or item.get("representative_lap") is not None):
         return "recent"
     if item.get("x") is not None and item.get("y") is not None:
@@ -470,14 +490,20 @@ def _fallback_reason(source_mode: str, openf1_session: dict[str, Any], track: di
         return "true_live_location_unavailable_using_recent_openf1_rest"
     if source_mode == "recorded":
         return "openf1_live_unavailable_using_local_fastf1_recording"
+    if source_mode == "recorded_confident":
+        return "openf1_live_unavailable_using_high_coverage_fastf1_recording"
+    if source_mode == "recording_pending":
+        return "fastf1_recorder_running_waiting_for_timing_rows"
     if source_mode == "estimated":
         return openf1_session.get("reason") or track.get("reason") or recorded.get("reason") or "free_live_sources_unavailable_using_estimate"
     return openf1_session.get("reason") or track.get("reason") or recorded.get("reason") or "free_live_sources_unavailable"
 
 
 def _collector_hint(source_mode: str, recorded: dict[str, Any], schedule: dict[str, Any]) -> str | None:
-    if source_mode in {"live", "recent", "recorded"}:
+    if source_mode in {"live", "recent", "recorded", "recorded_confident"}:
         return None
+    if source_mode == "recording_pending":
+        return "collector_running_waiting_for_timing_messages"
     reason = recorded.get("reason")
     seconds_until = schedule.get("seconds_until_start")
     if reason == "recording_empty_or_unparsed" and isinstance(seconds_until, (int, float)) and seconds_until > 0:
@@ -494,6 +520,8 @@ def _last_success(source_mode: str) -> str | None:
         "live": "openf1_rest_live_or_recent",
         "recent": "openf1_recent_historical",
         "recorded": "fastf1_recorded_file",
+        "recorded_confident": "fastf1_recorded_file",
+        "recording_pending": "fastf1_recorded_file",
         "estimated": "estimated_minisector",
     }.get(source_mode)
 
@@ -577,6 +605,11 @@ def _point_from_progress(progress: float, track: dict[str, Any], position: int, 
 
 def _row_time(row: dict[str, Any]) -> str:
     return str(_first(row, "date", "timestamp", "Utc", "utc", "Time") or "")
+
+
+def _last_timestamp(rows: list[dict[str, Any]]) -> str | None:
+    values = [_row_time(row) for row in rows if _row_time(row)]
+    return values[-1] if values else None
 
 
 def _driver_number(row: dict[str, Any]) -> int | None:
