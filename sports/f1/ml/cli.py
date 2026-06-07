@@ -33,7 +33,7 @@ def backtest(
     import os
     from datetime import datetime, timezone
 
-    from sports.f1.ml.backtest.walk_forward import RaceData, WalkForwardConfig, run as run_walk_forward
+    from common.ml.backtest.walk_forward import RaceData, WalkForwardConfig, run as run_walk_forward
 
     if training_seasons:
         train_seasons = tuple(int(s.strip()) for s in training_seasons.split(",") if s.strip())
@@ -271,7 +271,7 @@ def live(
 @app.command()
 def list_models() -> None:
     """List all model factories registered in the registry."""
-    from sports.f1.ml.common.registry import list_registered
+    from common.ml.registry import list_registered
 
     # Force imports so all @register decorators run.
     import sports.f1.ml.ratings.hierarchical_bayes  # noqa: F401

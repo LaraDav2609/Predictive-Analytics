@@ -13,13 +13,13 @@ def test_package_imports():
     """All sub-packages import cleanly."""
     import sports.f1.ml  # noqa: F401
     import sports.f1.ml.common.types  # noqa: F401
-    import sports.f1.ml.common.registry  # noqa: F401
-    import sports.f1.ml.common.calibration  # noqa: F401
+    import common.ml.registry  # noqa: F401
+    import common.ml.calibration  # noqa: F401
     import sports.f1.ml.providers.base  # noqa: F401
     import sports.f1.ml.providers.fastf1_provider  # noqa: F401
     import sports.f1.ml.features.mini_sectors  # noqa: F401
     import sports.f1.ml.features.tire_degradation  # noqa: F401
-    import sports.f1.ml.features.knowable_as_of  # noqa: F401
+    import common.ml.knowable_as_of  # noqa: F401
     import sports.f1.ml.ratings.hierarchical_bayes  # noqa: F401
     import sports.f1.ml.events.dnf_weibull  # noqa: F401
     import sports.f1.ml.events.safety_car_poisson  # noqa: F401
@@ -33,33 +33,33 @@ def test_package_imports():
     import sports.f1.ml.soft_signals.llm_extractor  # noqa: F401
     import sports.f1.ml.stretch.diffusion_trajectories  # noqa: F401
     import sports.f1.ml.simulator.race_sim  # noqa: F401
-    import sports.f1.ml.markets.kelly  # noqa: F401
-    import sports.f1.ml.backtest.walk_forward  # noqa: F401
-    import sports.f1.ml.backtest.look_ahead_audit  # noqa: F401
+    import common.ml.markets.kelly  # noqa: F401
+    import common.ml.backtest.walk_forward  # noqa: F401
+    import common.ml.backtest.look_ahead_audit  # noqa: F401
     import sports.f1.ml.bridge.redis_publisher  # noqa: F401
 
 
 def test_kelly_full_kelly_formula():
     """Full Kelly: P=0.6 model, market implies P=0.5 → f* = 0.2."""
-    from sports.f1.ml.markets.kelly import kelly_fraction
+    from common.ml.markets.kelly import kelly_fraction
     assert kelly_fraction(0.6, 0.5) == pytest.approx(0.2, rel=1e-3)
 
 
 def test_kelly_no_edge_returns_zero():
-    from sports.f1.ml.markets.kelly import kelly_fraction
+    from common.ml.markets.kelly import kelly_fraction
     assert kelly_fraction(0.5, 0.5) == 0.0
     assert kelly_fraction(0.4, 0.5) == 0.0
 
 
 def test_shrunk_kelly_is_quarter_of_full():
-    from sports.f1.ml.markets.kelly import kelly_fraction, shrunk_kelly
+    from common.ml.markets.kelly import kelly_fraction, shrunk_kelly
     assert shrunk_kelly(0.6, 0.5, shrinkage=0.25) == pytest.approx(0.25 * kelly_fraction(0.6, 0.5))
 
 
 def test_calibration_brier_perfect():
     """Perfectly correct probabilities give Brier = 0."""
     import numpy as np
-    from sports.f1.ml.common.calibration import brier_score
+    from common.ml.calibration import brier_score
     probs = np.array([1.0, 0.0, 1.0, 0.0])
     out = np.array([1, 0, 1, 0])
     assert brier_score(probs, out) == 0.0
@@ -68,7 +68,7 @@ def test_calibration_brier_perfect():
 def test_calibration_brier_worst_case():
     """Maximally wrong gives Brier = 1."""
     import numpy as np
-    from sports.f1.ml.common.calibration import brier_score
+    from common.ml.calibration import brier_score
     probs = np.array([0.0, 1.0, 0.0, 1.0])
     out = np.array([1, 0, 1, 0])
     assert brier_score(probs, out) == 1.0
@@ -85,7 +85,7 @@ def test_lookahead_audit_blocks_future_features():
     """The audit must reject any feature row dated after the decision time."""
     from datetime import datetime, timedelta
     import pandas as pd
-    from sports.f1.ml.features.knowable_as_of import LookaheadError, assert_no_lookahead
+    from common.ml.knowable_as_of import LookaheadError, assert_no_lookahead
 
     decision = datetime(2026, 4, 26, 13, 0)
     future_ts = decision + timedelta(hours=1)
@@ -97,7 +97,7 @@ def test_lookahead_audit_blocks_future_features():
 def test_lookahead_audit_passes_past_features():
     from datetime import datetime, timedelta
     import pandas as pd
-    from sports.f1.ml.features.knowable_as_of import assert_no_lookahead
+    from common.ml.knowable_as_of import assert_no_lookahead
 
     decision = datetime(2026, 4, 26, 13, 0)
     past_ts = decision - timedelta(hours=1)

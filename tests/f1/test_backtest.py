@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from sports.f1.ml.backtest.in_race_replay import InRaceReplayConfig, run as run_replay
-from sports.f1.ml.backtest.walk_forward import (
+from common.ml.backtest.walk_forward import (
     RaceData,
     WalkForwardConfig,
     run as run_walk_forward,

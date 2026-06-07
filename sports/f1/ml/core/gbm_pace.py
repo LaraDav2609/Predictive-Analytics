@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 
-from sports.f1.ml.common.registry import register
+from common.ml.registry import register
 
 
 @register("core.gbm_pace")

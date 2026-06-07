@@ -9,8 +9,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sports.f1.ml.markets.edge import EdgeOpportunity, MarketQuote, compute_edge
-from sports.f1.ml.markets.slippage import FillEstimate, OrderbookLevel, kalshi_limit_fill_prob, walk_book
+from common.ml.markets.edge import EdgeOpportunity, MarketQuote, compute_edge
+from common.ml.markets.slippage import FillEstimate, OrderbookLevel, kalshi_limit_fill_prob, walk_book
 
 
 # ----------------------------------------------------------------- edge.compute_edge

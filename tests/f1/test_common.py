@@ -9,14 +9,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sports.f1.ml.common.calibration import (
+from common.ml.calibration import (
     IsotonicCalibrator,
     PlattScaler,
     brier_score,
     log_loss,
     reliability_curve,
 )
-from sports.f1.ml.common.io import ArtifactManifest, load, manifest_path, read_manifest, save, write_manifest
+from common.ml.io import ArtifactManifest, load, manifest_path, read_manifest, save, write_manifest
 
 
 # -------------------------------------------------------------- calibration

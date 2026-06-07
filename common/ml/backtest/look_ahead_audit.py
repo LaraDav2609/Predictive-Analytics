@@ -16,7 +16,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from sports.f1.ml.features.knowable_as_of import LookaheadError, assert_no_lookahead
+from common.ml.knowable_as_of import LookaheadError, assert_no_lookahead
 
 
 def audit_features(features: pd.DataFrame, decision_time: datetime) -> None:

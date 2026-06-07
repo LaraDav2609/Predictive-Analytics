@@ -25,7 +25,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
-from sports.f1.ml.common.calibration import brier_score, log_loss
+from common.ml.calibration import brier_score, log_loss
 
 
 # ------------------------------------------------------------------ data shapes

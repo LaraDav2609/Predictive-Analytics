@@ -36,7 +36,7 @@ def test_stacking_logistic_fits_and_predicts():
 
 def test_stacking_meta_beats_or_matches_individual_bases():
     """Stacked meta should achieve Brier ≤ best base on the same training data."""
-    from sports.f1.ml.common.calibration import brier_score
+    from common.ml.calibration import brier_score
     df, y = _make_oof_predictions(n=2000)
     ens = StackedEnsemble(base_model_names=["physics_mc", "gbm"]).fit(df, y)
     meta_probs = ens.predict_proba(df)
