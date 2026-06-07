@@ -58,7 +58,7 @@ def simulation_signals(
     if live and driver.id in race:
         notes.append(f"race position P{race[driver.id].get('position')}")
     if not notes:
-        notes.append("pre-session estimate from standings, form, team pace, and reliability")
+        notes.append("pre-session estimate from race pace, form, team pace, reliability, and bounded championship context")
     return notes[:4]
 
 

@@ -58,6 +58,11 @@ class DriverRacePrediction(BaseModel):
     team_news_mentions: int = 0
     overall_news_score: float | None = None
     news_win_modifier: float | None = None
+    race_sentiment_impact_score: float | None = None
+    race_sentiment_delta: float | None = None
+    race_sentiment_confidence: float | None = None
+    race_sentiment_articles: int = 0
+    race_sentiment_explanations: list[str] = Field(default_factory=list)
     wdc_prob: float | None = None
     wdc_modifier: float | None = None
     reliability_score: float | None = None

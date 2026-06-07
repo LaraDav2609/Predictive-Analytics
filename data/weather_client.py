@@ -18,19 +18,32 @@ class OpenMeteoClient:
     def __init__(self) -> None:
         self._forecast = httpx.AsyncClient(base_url=FORECAST_BASE_URL, timeout=20.0)
         self._historical = httpx.AsyncClient(base_url=HISTORICAL_FORECAST_BASE_URL, timeout=25.0)
-        self._cache: dict[tuple[float, float, str], dict[str, Any]] = {}
+        self._cache: dict[tuple[float, float, str, str], dict[str, Any]] = {}
 
     async def close(self) -> None:
         await self._forecast.aclose()
         await self._historical.aclose()
 
     async def get_race_weather(self, latitude: float | None, longitude: float | None, at: datetime | None) -> dict[str, Any]:
+        return await self.get_session_weather(latitude, longitude, at, session="race_day")
+
+    async def get_session_weather(
+        self,
+        latitude: float | None,
+        longitude: float | None,
+        at: datetime | None,
+        session: str = "race",
+    ) -> dict[str, Any]:
         if latitude is None or longitude is None or at is None:
-            return _fallback("missing_coordinates")
+            result = _fallback("missing_coordinates")
+            result["session"] = _session_key(session)
+            result["requested_at"] = at.isoformat() if at else None
+            return result
 
         at_utc = at.astimezone(timezone.utc) if at.tzinfo else at.replace(tzinfo=timezone.utc)
         date_key = at_utc.date().isoformat()
-        cache_key = (round(float(latitude), 4), round(float(longitude), 4), date_key)
+        hour_key = at_utc.replace(minute=0, second=0, microsecond=0).isoformat()
+        cache_key = (round(float(latitude), 4), round(float(longitude), 4), hour_key, _session_key(session))
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -68,6 +81,8 @@ class OpenMeteoClient:
             logger.warning("Open-Meteo request failed for %.4f, %.4f at %s: %s", latitude, longitude, date_key, exc)
             result = _fallback("open_meteo_unavailable")
 
+        result["session"] = _session_key(session)
+        result["requested_at"] = at_utc.isoformat()
         self._cache[cache_key] = result
         return result
 
@@ -132,6 +147,8 @@ def _fallback(reason: str) -> dict[str, Any]:
         "track_temperature": None,
         "humidity": None,
         "wind_speed": None,
+        "wind_gusts": None,
+        "cloud_cover": None,
         "weather_change_probability": 0.0,
         "chaos_score": 0.0,
         "source": "weather_fallback",
@@ -139,3 +156,18 @@ def _fallback(reason: str) -> dict[str, Any]:
         "confidence": 0.0,
         "missing_data": True,
     }
+
+
+def _session_key(session: str | None) -> str:
+    value = str(session or "race").lower().replace("-", "_")
+    if value.startswith("qual"):
+        return "qualifying"
+    if value.startswith("sprint_quali") or value in {"sq", "sprint_shootout"}:
+        return "sprint_qualifying"
+    if value.startswith("sprint"):
+        return "sprint"
+    if value.startswith("fp") or value.startswith("practice"):
+        return value
+    if value == "race_day":
+        return value
+    return "race"

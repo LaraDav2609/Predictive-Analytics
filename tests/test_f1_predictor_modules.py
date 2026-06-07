@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 
 from f1_predictor.features.builder import F1FeatureBuilder
 from f1_predictor.features.performance import build_performance_table
+from f1_predictor.backtesting.replay import _constructor_feature, _driver_feature
 from f1_predictor.service import F1PredictionService
+from data.openf1_client import _summarize_laps
 from models.f1 import Constructor, Driver, Race
 
 
@@ -63,7 +65,8 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertIn("antonelli", rows)
         self.assertGreater(rows["antonelli"]["driver_skill_score"], 0)
         self.assertGreater(rows["antonelli"]["car_performance_score"], 0)
-        self.assertGreater(rows["antonelli"]["performance_score"], rows["russell"]["performance_score"])
+        self.assertGreater(rows["antonelli"]["form_score"], rows["russell"]["form_score"])
+        self.assertGreater(rows["russell"]["performance_score"], 0)
 
     def test_feature_builder_keeps_fallback_missing_data_flags(self):
         snapshot = F1FeatureBuilder(self.drivers, self.constructors, self.features, sentiment={}).build(self.race)
@@ -73,6 +76,84 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertIn("sentiment", snapshot.missing_data)
         self.assertEqual("circuit_trait_registry", snapshot.track["source"])
         self.assertEqual("track_tire_trait_registry", snapshot.tires["source"])
+
+    def test_feature_builder_blends_openf1_practice_pace_when_laps_exist(self):
+        features = {
+            **self.features,
+            "openf1_session": {
+                "ok": True,
+                "source": "openf1_practice_laps",
+                "laps": {
+                    "drivers": {
+                        "12": {
+                            "best_lap": 72.1,
+                            "representative_lap": 73.0,
+                            "long_run_lap": 73.4,
+                            "laps": 18,
+                            "representative_sector_1": 23.1,
+                            "representative_sector_2": 25.0,
+                            "representative_sector_3": 24.9,
+                            "track_evolution_delta": 0.4,
+                            "compounds": ["MEDIUM"],
+                        },
+                        "63": {
+                            "best_lap": 73.8,
+                            "representative_lap": 75.0,
+                            "long_run_lap": 75.2,
+                            "laps": 16,
+                            "representative_sector_1": 24.0,
+                            "representative_sector_2": 25.8,
+                            "representative_sector_3": 25.2,
+                            "track_evolution_delta": 0.4,
+                            "compounds": ["HARD"],
+                        },
+                    }
+                },
+                "stints": {
+                    "drivers": {
+                        "12": {"avg_stint_laps": 18, "compounds": ["MEDIUM"]},
+                        "63": {"avg_stint_laps": 16, "compounds": ["HARD"]},
+                    }
+                },
+            },
+        }
+
+        snapshot = F1FeatureBuilder(self.drivers, self.constructors, features, sentiment={}).build(
+            self.race,
+            session_stage="practice",
+        )
+        antonelli = snapshot.drivers["antonelli"]
+        russell = snapshot.drivers["russell"]
+
+        self.assertIn("practice_pace_score", antonelli)
+        self.assertGreater(antonelli["practice_pace_score"], russell["practice_pace_score"])
+        self.assertIn("practice_sector_scores", antonelli)
+        self.assertGreater(antonelli["practice_sector_score"], russell["practice_sector_score"])
+        self.assertGreater(antonelli["practice_long_run_score"], russell["practice_long_run_score"])
+        self.assertLess(antonelli["practice_fuel_uncertainty"], 0.35)
+        self.assertEqual(["MEDIUM"], antonelli["practice_compounds"])
+        self.assertGreater(antonelli["qualifying_pace_score"], russell["qualifying_pace_score"])
+
+    def test_openf1_lap_summary_keeps_sector_long_run_and_evolution(self):
+        rows = [
+            {"driver_number": 12, "lap_duration": 75.0, "duration_sector_1": 24.0, "duration_sector_2": 26.0, "duration_sector_3": 25.0, "compound": "MEDIUM", "date": "2026-06-05T10:00:00Z"},
+            {"driver_number": 12, "lap_duration": 73.0, "duration_sector_1": 23.0, "duration_sector_2": 25.0, "duration_sector_3": 25.0, "compound": "MEDIUM", "date": "2026-06-05T10:01:00Z"},
+            {"driver_number": 12, "lap_duration": 72.8, "duration_sector_1": 22.9, "duration_sector_2": 24.9, "duration_sector_3": 25.0, "compound": "SOFT", "date": "2026-06-05T10:02:00Z"},
+            {"driver_number": 12, "lap_duration": 74.2, "duration_sector_1": 23.4, "duration_sector_2": 25.5, "duration_sector_3": 25.3, "compound": "SOFT", "date": "2026-06-05T10:03:00Z"},
+            {"driver_number": 12, "lap_duration": 72.4, "duration_sector_1": 22.8, "duration_sector_2": 24.7, "duration_sector_3": 24.9, "compound": "SOFT", "date": "2026-06-05T10:04:00Z"},
+            {"driver_number": 12, "lap_duration": 73.8, "duration_sector_1": 23.2, "duration_sector_2": 25.3, "duration_sector_3": 25.3, "compound": "SOFT", "date": "2026-06-05T10:05:00Z"},
+            {"driver_number": 12, "lap_duration": 74.0, "duration_sector_1": 23.3, "duration_sector_2": 25.4, "duration_sector_3": 25.3, "compound": "SOFT", "date": "2026-06-05T10:06:00Z"},
+            {"driver_number": 12, "lap_duration": 74.1, "duration_sector_1": 23.5, "duration_sector_2": 25.2, "duration_sector_3": 25.4, "compound": "SOFT", "date": "2026-06-05T10:07:00Z"},
+        ]
+
+        summary = _summarize_laps(rows, self.drivers)
+        antonelli = summary["drivers"]["12"]
+
+        self.assertEqual(8, antonelli["laps"])
+        self.assertEqual(["MEDIUM", "SOFT"], antonelli["compounds"])
+        self.assertIn("representative_sector_1", antonelli)
+        self.assertIsNotNone(antonelli["long_run_lap"])
+        self.assertGreater(antonelli["track_evolution_delta"], 0)
 
     def test_prediction_service_works_without_sentiment(self):
         service = F1PredictionService()
@@ -87,6 +168,101 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertIsNotNone(antonelli.track_fit_score)
         self.assertIsNotNone(antonelli.dnf_prob)
         self.assertEqual("Neutral", antonelli.sentiment_label)
+
+    def test_championship_leader_does_not_override_race_evidence(self):
+        drivers = [
+            Driver(
+                id="leader",
+                number=1,
+                code="LED",
+                first_name="Points",
+                last_name="Leader",
+                nationality="Test",
+                team="Legacy",
+                points=160,
+                wins=4,
+                position=1,
+            ),
+            Driver(
+                id="pace",
+                number=2,
+                code="PAC",
+                first_name="Race",
+                last_name="Pace",
+                nationality="Test",
+                team="Momentum",
+                points=55,
+                wins=0,
+                position=6,
+            ),
+        ]
+        constructors = [
+            Constructor(id="legacy", name="Legacy", nationality="Test", points=190, wins=4, position=1),
+            Constructor(id="momentum", name="Momentum", nationality="Test", points=80, wins=0, position=4),
+        ]
+        features = {
+            "completed_races": 3,
+            "total_races": 22,
+            "drivers": {
+                "leader": {
+                    "form_score": 0.38,
+                    "reliability_score": 0.68,
+                    "qualifying_pace_score": 0.35,
+                    "race_pace_score": 0.36,
+                    "teammate_score": 0.42,
+                    "trend_score": 0.35,
+                    "recent_wins": 0,
+                    "recent_podiums": 0,
+                    "recent_starts": 3,
+                    "starts": 120,
+                },
+                "pace": {
+                    "form_score": 0.91,
+                    "reliability_score": 0.93,
+                    "qualifying_pace_score": 0.88,
+                    "race_pace_score": 0.94,
+                    "teammate_score": 0.72,
+                    "trend_score": 0.80,
+                    "recent_wins": 1,
+                    "recent_podiums": 3,
+                    "recent_starts": 3,
+                    "starts": 70,
+                },
+            },
+            "constructors": {
+                "legacy": {"team_score": 0.48, "recent_points": 8, "reliability_score": 0.72},
+                "momentum": {"team_score": 0.88, "recent_points": 58, "reliability_score": 0.90},
+            },
+        }
+        service = F1PredictionService()
+        service.load(drivers, constructors, features, sentiment={})
+
+        prediction = service.predict_race(self.race)
+        leader = prediction.driver_predictions["leader"]
+        pace = prediction.driver_predictions["pace"]
+
+        self.assertGreater(pace.win_prob, leader.win_prob)
+        self.assertLess(leader.win_prob, 0.45)
+
+    def test_backtest_replay_does_not_turn_points_into_perfect_form(self):
+        driver = Driver(
+            id="leader",
+            code="LED",
+            first_name="Points",
+            last_name="Leader",
+            nationality="Test",
+            team="Legacy",
+            points=300,
+            wins=8,
+            position=1,
+        )
+        constructor = Constructor(id="legacy", name="Legacy", nationality="Test", points=300, wins=8, position=1)
+
+        driver_feature = _driver_feature(driver, recent=[], all_results=[], teammate_delta=0.0, lookback=8)
+        constructor_feature = _constructor_feature(constructor, recent=[], lookback=8)
+
+        self.assertLess(driver_feature["form_score"], 0.45)
+        self.assertLess(constructor_feature["team_score"], 0.50)
 
     def test_feature_builder_uses_weather_and_reliability_context(self):
         features = {

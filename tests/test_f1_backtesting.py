@@ -21,6 +21,31 @@ class F1BacktestingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(25.0, replay.drivers[0].points)
         self.assertEqual("charles", replay.actual_winner)
 
+    def test_replay_stage_controls_current_weekend_evidence(self):
+        races = [
+            self.races[0],
+            _race(
+                2,
+                "Second GP",
+                "charles",
+                "max",
+                qualifying_order=["max", "charles"],
+                practice_laps={"max": 71.0, "charles": 72.5},
+            ),
+        ]
+
+        pre_weekend = RaceReplayBuilder().build(2025, races, 2, stage="pre_weekend")
+        post_quali = RaceReplayBuilder().build(2025, races, 2, stage="post_qualifying")
+        practice = RaceReplayBuilder().build(2025, races, 2, stage="practice")
+
+        self.assertNotIn("qualifying_source", pre_weekend.features["drivers"]["max"])
+        self.assertNotIn("practice_pace_score", pre_weekend.features["drivers"]["max"])
+        self.assertEqual("target_qualifying_results", post_quali.features["drivers"]["max"]["qualifying_source"])
+        self.assertEqual(1, post_quali.features["drivers"]["max"]["grid_position"])
+        self.assertTrue(post_quali.features["backtest"]["target_qualifying_used"])
+        self.assertIn("practice_pace_score", practice.features["drivers"]["max"])
+        self.assertTrue(practice.features["backtest"]["target_practice_used"])
+
     def test_metrics_calculate_accuracy_and_probability_quality(self):
         prediction = RacePrediction(
             driver_predictions={
@@ -84,6 +109,32 @@ class F1BacktestingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("conservative_v1", result["model_id"])
 
+    async def test_backtest_accepts_stage_and_reports_replay_evidence(self):
+        races = [
+            self.races[0],
+            _race(2, "Second GP", "charles", "max", qualifying_order=["max", "charles"]),
+        ]
+        service = F1BacktestService(_FakeClient(races))
+
+        result = await service.backtest_race(2025, 2, stage="post_quali")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("post_qualifying", result["stage"])
+        self.assertEqual("post_qualifying", result["replay_evidence"]["stage"])
+        self.assertTrue(result["replay_evidence"]["backtest"]["target_qualifying_used"])
+
+    async def test_backtest_scores_session_projection_probabilities(self):
+        service = F1BacktestService(_FakeClient(self.races))
+
+        result = await service.backtest_race(2025, 2, stage="pre_weekend")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("probability_audit", result)
+        self.assertIn("calibration_profile", result)
+        self.assertIn("session-simulator", result["model_version"])
+        self.assertTrue(result["probability_distribution"])
+        self.assertIn("grid_position", next(iter(result["component_scores"].values())))
+
     async def test_current_partial_season_is_rejected_without_flag(self):
         service = F1BacktestService(_FakeClient(self.races, season=2025))
 
@@ -111,6 +162,33 @@ class F1BacktestingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, summary["race_count"])
         self.assertTrue(summary["calibration_buckets"])
+        self.assertTrue(summary["top_pick_calibration"])
+        self.assertTrue(summary["stage_calibration"])
+        self.assertEqual("unknown", summary["stage_calibration"][0]["stage"])
+
+    def test_summary_reports_stage_specific_calibration(self):
+        rows = [
+            {
+                "stage": "pre_weekend",
+                "actual_winner": "max",
+                "probability_distribution": [{"driver_id": "max", "win_probability": 0.40}],
+                "metrics": {"winner_hit": True, "top_probability": 0.40, "winner_probability": 0.40, "log_loss": 0.9},
+            },
+            {
+                "stage": "post_qualifying",
+                "actual_winner": "charles",
+                "probability_distribution": [{"driver_id": "max", "win_probability": 0.60}],
+                "metrics": {"winner_hit": False, "top_probability": 0.60, "winner_probability": 0.20, "log_loss": 1.6},
+            },
+        ]
+
+        summary = summarize_races(rows)
+        by_stage = {item["stage"]: item for item in summary["stage_calibration"]}
+
+        self.assertIn("pre_weekend", by_stage)
+        self.assertIn("post_qualifying", by_stage)
+        self.assertEqual(1.0, by_stage["pre_weekend"]["winner_accuracy"])
+        self.assertEqual(0.0, by_stage["post_qualifying"]["winner_accuracy"])
 
 
 class _FakeClient:
@@ -121,8 +199,15 @@ class _FakeClient:
     async def get_historical_race_results(self, season):
         return self._races
 
+    async def get_historical_qualifying_results(self, season):
+        return [
+            {"round": race.get("round"), "QualifyingResults": race.get("QualifyingResults") or []}
+            for race in self._races
+            if race.get("QualifyingResults")
+        ]
 
-def _race(round_num, race_name, winner_id, runner_up_id):
+
+def _race(round_num, race_name, winner_id, runner_up_id, qualifying_order=None, practice_laps=None):
     drivers = {
         "max": {
             "driverId": "max",
@@ -146,7 +231,7 @@ def _race(round_num, race_name, winner_id, runner_up_id):
         "charles": {"constructorId": "ferrari", "name": "Ferrari", "nationality": "Italian"},
     }
     order = [winner_id, runner_up_id]
-    return {
+    raw = {
         "season": "2025",
         "round": str(round_num),
         "raceName": race_name,
@@ -169,6 +254,29 @@ def _race(round_num, race_name, winner_id, runner_up_id):
             for index, driver_id in enumerate(order)
         ],
     }
+    if qualifying_order:
+        raw["QualifyingResults"] = [
+            {
+                "position": str(index + 1),
+                "Driver": drivers[driver_id],
+                "Constructor": constructors[driver_id],
+                "Q1": "1:20.000",
+                "Q2": "1:19.500",
+                "Q3": f"1:18.{index:03d}",
+            }
+            for index, driver_id in enumerate(qualifying_order)
+        ]
+    if practice_laps:
+        raw["PracticeResults"] = [
+            {
+                "driver_id": driver_id,
+                "best_lap": lap,
+                "representative_lap": lap + 0.4,
+                "laps": 18,
+            }
+            for driver_id, lap in practice_laps.items()
+        ]
+    return raw
 
 
 def _parse_actual(raw):

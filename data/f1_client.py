@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -98,11 +99,13 @@ class F1Client(SportsDataClient):
         self._constructors: list[Constructor] = []
         self._races: list[Race] = []
         self._loaded = False
+        self._refresh_lock = asyncio.Lock()
         self._photo_cache: dict[str, str | None] = {}
         self._driver_seasons_cache: dict[str, list[dict]] = {}
         self._constructor_seasons_cache: dict[str, list[dict]] = {}
         self._constructor_driver_titles_cache: dict[tuple[str, int], dict | None] = {}
         self._season_results_cache: dict[int, list[dict]] = {}
+        self._season_qualifying_cache: dict[int, list[dict]] = {}
         self._prediction_features_cache: dict[tuple[int, int], dict] = {}
         self._weather_client = OpenMeteoClient()
 
@@ -126,14 +129,15 @@ class F1Client(SportsDataClient):
         return self._season
 
     async def refresh(self) -> None:
-        self._season_results_cache.pop(self._season, None)
-        self._prediction_features_cache.clear()
-        await self._fetch_driver_standings()
-        await self._fetch_constructor_standings()
-        await self._fetch_race_calendar()
-        self._loaded = True
-        logger.info("F1 data refreshed: %d drivers, %d constructors, %d races",
-                     len(self._drivers), len(self._constructors), len(self._races))
+        async with self._refresh_lock:
+            self._season_results_cache.pop(self._season, None)
+            self._prediction_features_cache.clear()
+            await self._fetch_driver_standings()
+            await self._fetch_constructor_standings()
+            await self._fetch_race_calendar()
+            self._loaded = True
+            logger.info("F1 data refreshed: %d drivers, %d constructors, %d races",
+                         len(self._drivers), len(self._constructors), len(self._races))
 
     async def _fetch_driver_standings(self) -> None:
         try:
@@ -144,13 +148,18 @@ class F1Client(SportsDataClient):
             if not standings_lists:
                 self._drivers = self._get_fallback_drivers()
                 return
-            self._drivers = []
+            drivers: list[Driver] = []
+            seen: set[str] = set()
             for entry in standings_lists[0].get("DriverStandings", []):
                 d = entry.get("Driver", {})
                 constructors = entry.get("Constructors", [{}])
                 team = constructors[0].get("name", "") if constructors else ""
                 driver_id = d.get("driverId", "")
-                self._drivers.append(Driver(
+                driver_key = driver_id or d.get("code", "")
+                if not driver_key or driver_key in seen:
+                    continue
+                seen.add(driver_key)
+                drivers.append(Driver(
                     id=driver_id,
                     number=int(d.get("permanentNumber", 0)) if d.get("permanentNumber") else None,
                     code=d.get("code", ""),
@@ -169,6 +178,7 @@ class F1Client(SportsDataClient):
                     wins=int(entry.get("wins", 0)),
                     position=int(entry.get("position", 0)),
                 ))
+            self._drivers = drivers
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch F1 driver standings: %s", e)
             if not self._drivers:
@@ -347,12 +357,12 @@ class F1Client(SportsDataClient):
             teammate_score = max(0.02, min(1.0, 0.50 + teammate_delta / 12.0))
             trend_score = _trend_score(current_results or recent)
             form_score = (
-                0.30 * finish_score
-                + 0.25 * points_score
+                0.34 * finish_score
+                + 0.22 * points_score
                 + 0.15 * podium_score
-                + 0.10 * standing_score
-                + 0.10 * qualifying_pace_score
-                + 0.10 * trend_score
+                + 0.04 * standing_score
+                + 0.13 * qualifying_pace_score
+                + 0.12 * trend_score
             )
 
             driver_features[driver.id] = {
@@ -389,7 +399,7 @@ class F1Client(SportsDataClient):
             finish_score = 0.45 if avg_finish is None else max(0.0, min(1.0, (21 - avg_finish) / 20))
             points_score = min(1.0, recent_points / max(1.0, lookback_races * 43.0))
             constructor_features[key] = {
-                "team_score": round(0.45 * standings_score + 0.35 * points_score + 0.20 * finish_score, 4),
+                "team_score": round(0.24 * standings_score + 0.34 * points_score + 0.42 * finish_score, 4),
                 "recent_points": round(recent_points, 2),
                 "recent_avg_finish": round(avg_finish, 2) if avg_finish is not None else None,
                 "recent_starts": len(recent),
@@ -397,8 +407,22 @@ class F1Client(SportsDataClient):
             }
 
         weather_by_round = {}
+        weather_by_round_session = {}
         for race in _weather_candidate_races(self._races):
-            weather_by_round[str(race.round)] = await self._weather_client.get_race_weather(race.latitude, race.longitude, race.date)
+            race_key = str(race.round)
+            weather_by_round[race_key] = await self._weather_client.get_race_weather(race.latitude, race.longitude, race.date)
+            session_weather = {}
+            for session in race.sessions or []:
+                session_code = _weather_session_key(session.get("code") or session.get("name"))
+                session_dt = _prediction_weather_session_datetime(session, race.date)
+                session_weather[session_code] = await self._weather_client.get_session_weather(
+                    race.latitude,
+                    race.longitude,
+                    session_dt,
+                    session=session_code,
+                )
+            if session_weather:
+                weather_by_round_session[race_key] = session_weather
 
         result = {
             "season": self._season,
@@ -426,10 +450,12 @@ class F1Client(SportsDataClient):
             },
             "track_history": _track_history_features(track_results),
             "weather_by_round": weather_by_round,
+            "weather_by_round_session": weather_by_round_session,
             "source_coverage": {
                 "current_season_races": len(current_races),
                 "historical_races": len(previous_races),
                 "weather_races": len(weather_by_round),
+                "weather_sessions": sum(len(items) for items in weather_by_round_session.values()),
             },
         }
         self._prediction_features_cache[cache_key] = result
@@ -456,6 +482,22 @@ class F1Client(SportsDataClient):
         replay races without reshaping through live-season dashboard models.
         """
         return await self._fetch_season_results(season)
+
+    async def get_historical_qualifying_results(self, season: int) -> list[dict]:
+        """Return raw Jolpica qualifying rows for a season, grouped by race."""
+
+        if season in self._season_qualifying_cache:
+            return self._season_qualifying_cache[season]
+        try:
+            resp = await self._client.get(f"/{season}/qualifying.json?limit=2000")
+            resp.raise_for_status()
+            data = resp.json()
+            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch F1 season qualifying for %s: %s", season, e)
+            races = []
+        self._season_qualifying_cache[season] = races
+        return races
 
     def get_race_by_round(self, round_num: int) -> Race | None:
         return next((r for r in self._races if r.round == round_num), None)
@@ -1130,6 +1172,33 @@ def _parse_session_datetime(raw: dict, fallback: datetime) -> datetime:
         return datetime.fromisoformat(f"{date_str}T{time_str}").replace(tzinfo=timezone.utc)
     except ValueError:
         return fallback
+
+
+def _prediction_weather_session_datetime(session: dict, fallback: datetime) -> datetime:
+    value = (session or {}).get("date")
+    if not value:
+        return fallback
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+
+
+def _weather_session_key(session: str | None) -> str:
+    value = str(session or "race").lower().replace("-", "_").replace(" ", "_")
+    if value.startswith("qual"):
+        return "qualifying"
+    if value.startswith("sprint_qual"):
+        return "sprint_qualifying"
+    if value.startswith("sprint"):
+        return "sprint"
+    if value.startswith("fp1") or "practice_1" in value:
+        return "fp1"
+    if value.startswith("fp2") or "practice_2" in value:
+        return "fp2"
+    if value.startswith("fp3") or "practice_3" in value:
+        return "fp3"
+    return "race"
 
 
 def _parse_calendar_sessions(raw_race: dict, race_dt: datetime) -> list[dict]:

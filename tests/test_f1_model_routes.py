@@ -41,6 +41,36 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("podium_prob", first)
         self.assertIn("track_fit_score", first)
 
+    async def test_session_result_uses_official_qualifying_rows(self):
+        result = await f1_routes.get_race_session_result(1, "qualifying")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["available"])
+        self.assertEqual("qualifying", result["session"]["code"])
+        self.assertEqual(2, result["result_count"])
+        self.assertEqual("VER", result["results"][0]["driver_code"])
+        self.assertEqual("1:29.100", result["results"][0]["best_time"])
+
+    async def test_session_result_uses_openf1_practice_rows_when_available(self):
+        f1_routes.openf1 = _FakeOpenF1()
+
+        result = await f1_routes.get_race_session_result(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["available"])
+        self.assertEqual("fp1", result["session"]["code"])
+        self.assertEqual("LEC", result["results"][0]["driver_code"])
+        self.assertEqual("1:30.900", result["results"][0]["best_time"])
+        self.assertEqual(7, result["results"][0]["laps"])
+
+    async def test_session_result_reports_unavailable_when_no_rows_exist(self):
+        result = await f1_routes.get_race_session_result(1, "fp2")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["available"])
+        self.assertEqual("fp2", result["session"]["code"])
+        self.assertEqual([], result["results"])
+
 
 class _FakeF1Client:
     season = 2026
@@ -79,6 +109,48 @@ class _FakeF1Client:
 
     def get_race_by_round(self, round_num):
         return self.races[0] if round_num == 1 else None
+
+    async def get_race_profile(self, round_num, predictor=None):
+        race = self.get_race_by_round(round_num)
+        return {
+            "ok": True,
+            "race": race.model_dump(mode="json"),
+            "sessions": [
+                {"code": "fp1", "name": "Practice 1", "status": "completed", "date": "2026-02-27T12:00:00Z", "note": "Practice"},
+                {"code": "fp2", "name": "Practice 2", "status": "completed", "date": "2026-02-27T16:00:00Z", "note": "Practice"},
+                {"code": "qualifying", "name": "Qualifying", "status": "completed", "date": "2026-02-28T15:00:00Z", "note": "Grid order"},
+                {"code": "race", "name": "Race", "status": "scheduled", "date": "2026-03-01T14:00:00Z", "note": "Grand Prix"},
+            ],
+            "results": [],
+            "qualifying": [
+                {"position": 1, "driver_id": "max", "driver_code": "VER", "driver_name": "Max Verstappen", "team": "Red Bull Racing", "q1": "1:30.000", "q2": "1:29.500", "q3": "1:29.100"},
+                {"position": 2, "driver_id": "charles", "driver_code": "LEC", "driver_name": "Charles Leclerc", "team": "Ferrari", "q1": "1:30.100", "q2": "1:29.700", "q3": "1:29.300"},
+            ],
+            "sprint": [],
+            "context": {"has_sprint": False, "has_results": False, "has_qualifying": True},
+        }
+
+
+class _FakeOpenF1:
+    async def get_session_features(self, race, session="race", drivers=None, live=False):
+        if session != "fp1":
+            return {"ok": False, "source": "openf1", "reason": "openf1_session_unavailable"}
+        return {
+            "ok": True,
+            "source": "openf1",
+            "session": "practice1",
+            "laps": {
+                "drivers": {
+                    "1": {"driver_number": 1, "driver_code": "VER", "laps": 5, "best_lap": 91.2, "representative_lap": 91.4, "median_lap": 91.7, "compounds": ["SOFT"]},
+                    "16": {"driver_number": 16, "driver_code": "LEC", "laps": 7, "best_lap": 90.9, "representative_lap": 91.1, "median_lap": 91.5, "compounds": ["MEDIUM"]},
+                }
+            },
+            "positions": {"drivers": {}},
+            "intervals": {"drivers": {}},
+            "stints": {"drivers": {}},
+            "pits": {"drivers": {}},
+            "raw_counts": {"laps": 12},
+        }
 
 
 if __name__ == "__main__":

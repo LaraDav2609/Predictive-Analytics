@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from f1_predictor.features.practice import apply_practice_pace_adjustments
 from models.f1 import Constructor, Driver, Race
 
 
@@ -13,6 +14,7 @@ from models.f1 import Constructor, Driver, Race
 class RaceReplay:
     season: int
     round: int
+    stage: str
     race: Race
     drivers: list[Driver]
     constructors: list[Constructor]
@@ -27,7 +29,8 @@ class RaceReplayBuilder:
     def __init__(self, lookback_races: int = 8):
         self.lookback_races = lookback_races
 
-    def build(self, season: int, races: list[dict[str, Any]], round_num: int) -> RaceReplay:
+    def build(self, season: int, races: list[dict[str, Any]], round_num: int, stage: str = "pre_weekend") -> RaceReplay:
+        stage = _stage_key(stage)
         ordered = sorted(races, key=lambda race: int(race.get("round") or 0))
         target = next((race for race in ordered if int(race.get("round") or 0) == int(round_num)), None)
         if not target:
@@ -40,11 +43,12 @@ class RaceReplayBuilder:
         actual_results = _parse_results(target)
         drivers = _build_drivers(actual_results, previous)
         constructors = _build_constructors(drivers, previous)
-        features = self._build_features(season, ordered, previous, drivers, constructors)
+        features = self._build_features(season, ordered, previous, drivers, constructors, target=target, stage=stage)
 
         return RaceReplay(
             season=season,
             round=round_num,
+            stage=stage,
             race=race_model,
             drivers=drivers,
             constructors=constructors,
@@ -62,6 +66,9 @@ class RaceReplayBuilder:
         previous_races: list[dict[str, Any]],
         drivers: list[Driver],
         constructors: list[Constructor],
+        *,
+        target: dict[str, Any],
+        stage: str,
     ) -> dict[str, Any]:
         driver_results: dict[str, list[dict[str, Any]]] = {}
         constructor_results: dict[str, list[dict[str, Any]]] = {}
@@ -89,6 +96,20 @@ class RaceReplayBuilder:
             recent = results[: self.lookback_races]
             driver_features[driver.id] = _driver_feature(driver, recent, results, teammate_scores.get(driver.id, 0.0), self.lookback_races)
 
+        openf1_session = _practice_session_payload(target, drivers) if stage in {"practice_available", "post_qualifying", "live", "completed"} else {}
+        if openf1_session:
+            driver_features = apply_practice_pace_adjustments(
+                drivers,
+                driver_features,
+                openf1_session,
+                session_stage="practice",
+            )
+
+        qualifying_rows = []
+        if stage in {"post_qualifying", "live", "completed"}:
+            qualifying_rows = _qualifying_rows(target)
+            _apply_qualifying_features(driver_features, qualifying_rows, drivers)
+
         constructor_features = {}
         for constructor in constructors:
             key = constructor.name.lower()
@@ -104,14 +125,25 @@ class RaceReplayBuilder:
             "drivers": driver_features,
             "constructors": constructor_features,
             "track_history": _track_history_features(track_results),
+            "openf1_session": openf1_session,
+            "replay_profile": {
+                "qualifying": qualifying_rows,
+                "practice_available": bool(openf1_session),
+            },
             "source_coverage": {
                 "current_season_races": len(previous_races),
                 "historical_races": 0,
                 "weather_races": 0,
+                "practice_sessions": 1 if openf1_session else 0,
+                "qualifying_sessions": 1 if qualifying_rows else 0,
             },
             "backtest": {
                 "replay_mode": True,
+                "stage": stage,
                 "future_rounds_removed": len([race for race in all_races if int(race.get("round") or 0) >= len(previous_races) + 1]),
+                "target_race_results_removed": True,
+                "target_qualifying_used": bool(qualifying_rows),
+                "target_practice_used": bool(openf1_session),
             },
         }
 
@@ -164,6 +196,155 @@ def _parse_results(raw: dict[str, Any]) -> list[dict[str, Any]]:
             "status": item.get("status") or "Unknown",
         })
     return rows
+
+
+def _stage_key(stage: str | None) -> str:
+    value = str(stage or "pre_weekend").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "pre": "pre_weekend",
+        "pre_race": "pre_weekend",
+        "practice": "practice_available",
+        "post_practice": "practice_available",
+        "fp": "practice_available",
+        "post_fp": "practice_available",
+        "quali": "post_qualifying",
+        "qualifying": "post_qualifying",
+        "post_quali": "post_qualifying",
+        "post_qualifying": "post_qualifying",
+        "race_live": "live",
+        "replay": "live",
+        "complete": "completed",
+    }
+    value = aliases.get(value, value)
+    if value not in {"pre_weekend", "practice_available", "post_qualifying", "live", "completed"}:
+        return "pre_weekend"
+    return value
+
+
+def _qualifying_rows(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for item in raw.get("QualifyingResults") or raw.get("qualifying") or []:
+        driver = item.get("Driver") or {}
+        constructor = item.get("Constructor") or {}
+        driver_id = item.get("driver_id") or driver.get("driverId")
+        position = _safe_int(item.get("position"))
+        if not driver_id or not position:
+            continue
+        rows.append({
+            "driver_id": driver_id,
+            "driver_code": item.get("driver_code") or driver.get("code") or str(driver_id)[:3].upper(),
+            "driver_name": item.get("driver_name") or f"{driver.get('givenName', '')} {driver.get('familyName', '')}".strip(),
+            "team": item.get("team") or constructor.get("name"),
+            "position": position,
+            "grid": position,
+            "q1": item.get("q1") or item.get("Q1"),
+            "q2": item.get("q2") or item.get("Q2"),
+            "q3": item.get("q3") or item.get("Q3"),
+            "source": "target_qualifying_results",
+        })
+    if rows:
+        return sorted(rows, key=lambda row: row["position"])
+
+    for item in _parse_results(raw):
+        grid = item.get("grid")
+        if isinstance(grid, int) and grid > 0:
+            rows.append({
+                "driver_id": item.get("driver_id"),
+                "driver_code": item.get("driver_code"),
+                "driver_name": item.get("driver_name"),
+                "team": item.get("team"),
+                "position": grid,
+                "grid": grid,
+                "source": "target_race_grid_only",
+            })
+    return sorted(rows, key=lambda row: row["position"])
+
+
+def _apply_qualifying_features(
+    driver_features: dict[str, dict[str, Any]],
+    qualifying_rows: list[dict[str, Any]],
+    drivers: list[Driver],
+) -> None:
+    if not qualifying_rows:
+        return
+    field_size = max(len(drivers), len(qualifying_rows), 1)
+    for row in qualifying_rows:
+        driver_id = row.get("driver_id")
+        position = _safe_int(row.get("position"))
+        if not driver_id or not position:
+            continue
+        feature = driver_features.setdefault(driver_id, {})
+        grid_score = max(0.02, min(1.0, (field_size + 1 - position) / field_size))
+        old_quali = _safe_float(feature.get("qualifying_pace_score")) or _safe_float(feature.get("form_score")) or 0.50
+        old_race = _safe_float(feature.get("race_pace_score")) or _safe_float(feature.get("form_score")) or 0.50
+        feature["qualifying_position"] = position
+        feature["grid_position"] = row.get("grid") or position
+        feature["grid_score"] = round(grid_score, 4)
+        feature["grid_confidence"] = 0.86 if row.get("source") == "target_qualifying_results" else 0.72
+        feature["qualifying_source"] = row.get("source") or "target_grid"
+        feature["q1"] = row.get("q1")
+        feature["q2"] = row.get("q2")
+        feature["q3"] = row.get("q3")
+        feature["qualifying_pace_score"] = round(old_quali * 0.40 + grid_score * 0.60, 4)
+        feature["race_pace_score"] = round(old_race * 0.82 + grid_score * 0.18, 4)
+
+
+def _practice_session_payload(raw: dict[str, Any], drivers: list[Driver]) -> dict[str, Any]:
+    rows = _practice_rows(raw)
+    if not rows:
+        return {}
+    driver_lookup = {driver.id: driver for driver in drivers}
+    laps_by_number = {}
+    for row in rows:
+        driver_id = row.get("driver_id")
+        driver = driver_lookup.get(str(driver_id))
+        if not driver or driver.number is None:
+            continue
+        representative = _lap_seconds(row.get("representative_lap") or row.get("median_lap") or row.get("best_lap"))
+        best = _lap_seconds(row.get("best_lap") or row.get("representative_lap"))
+        if not representative:
+            continue
+        laps_by_number[str(driver.number)] = {
+            "driver_number": driver.number,
+            "driver_code": driver.code,
+            "laps": _safe_int(row.get("laps")) or _safe_int(row.get("lap_count")) or 0,
+            "best_lap": best,
+            "median_lap": representative,
+            "representative_lap": representative,
+        }
+    if not laps_by_number:
+        return {}
+    return {
+        "ok": True,
+        "source": "backtest_target_practice_rows",
+        "session": "practice",
+        "laps": {"drivers": laps_by_number, "missing_data": False},
+        "raw_counts": {"laps": sum(1 for _ in laps_by_number)},
+    }
+
+
+def _practice_rows(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(raw.get("PracticeResults"), list):
+        return list(raw.get("PracticeResults") or [])
+    rows = []
+    for session in raw.get("PracticeSessions") or raw.get("Practice") or []:
+        rows.extend(session.get("Results") or session.get("results") or [])
+    return rows
+
+
+def _lap_seconds(value: Any) -> float | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    try:
+        if ":" not in text:
+            return float(text)
+        minutes, seconds = text.split(":", 1)
+        return int(minutes) * 60.0 + float(seconds)
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_drivers(actual_results: list[dict[str, Any]], previous_races: list[dict[str, Any]]) -> list[Driver]:
@@ -247,7 +428,15 @@ def _driver_feature(driver: Driver, recent: list[dict[str, Any]], all_results: l
     race_pace = max(0.02, min(1.0, finish_score + max(-0.12, min(0.12, avg_grid_delta / 50.0))))
     teammate_score = max(0.02, min(1.0, 0.50 + teammate_delta / 12.0))
     trend_score = _trend_score(recent)
-    form_score = 0.30 * finish_score + 0.25 * points_score + 0.15 * podium_score + 0.10 * ((driver.points or 0.0) / max(driver.points or 1.0, 1.0)) + 0.10 * qualifying_pace + 0.10 * trend_score
+    standings_context = min(1.0, float(driver.points or 0.0) / max(1.0, lookback * 25.0))
+    form_score = (
+        0.34 * finish_score
+        + 0.22 * points_score
+        + 0.15 * podium_score
+        + 0.04 * standings_context
+        + 0.13 * qualifying_pace
+        + 0.12 * trend_score
+    )
     return {
         "starts": len(all_results),
         "current_season_starts": len(all_results),
@@ -275,12 +464,12 @@ def _constructor_feature(constructor: Constructor, recent: list[dict[str, Any]],
     positions = [item["position"] for item in recent if isinstance(item.get("position"), int)]
     avg_finish = _avg([float(position) for position in positions]) if positions else None
     recent_points = sum(float(item.get("points") or 0.0) for item in recent)
-    standings_score = constructor.points / max(constructor.points, 1.0)
+    standings_score = min(1.0, float(constructor.points or 0.0) / max(1.0, lookback * 43.0))
     finish_score = 0.45 if avg_finish is None else max(0.0, min(1.0, (21 - avg_finish) / 20))
     points_score = min(1.0, recent_points / max(1.0, lookback * 43.0))
     dnfs = sum(1 for item in recent if not _is_finished_status(item.get("status")))
     return {
-        "team_score": round(0.45 * standings_score + 0.35 * points_score + 0.20 * finish_score, 4),
+        "team_score": round(0.24 * standings_score + 0.34 * points_score + 0.42 * finish_score, 4),
         "recent_points": round(recent_points, 2),
         "recent_avg_finish": round(avg_finish, 2) if avg_finish is not None else None,
         "recent_starts": len(recent),

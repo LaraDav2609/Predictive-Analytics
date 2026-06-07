@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,6 +20,11 @@ VIEWBOX_WIDTH = 1000
 VIEWBOX_HEIGHT = 430
 PADDING_X = 70
 PADDING_Y = 42
+TRACK_GEOMETRY_DIR = Path(__file__).resolve().parent / "track_geometry"
+WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
+WIKIMEDIA_HEADERS = {
+    "User-Agent": "F1PredictorDashboard/1.0 (https://localhost.localdomain)",
+}
 
 
 class OpenF1Client:
@@ -25,6 +32,7 @@ class OpenF1Client:
         self._client = httpx.AsyncClient(base_url=OPENF1_BASE_URL, timeout=35.0)
         self._session_cache: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
         self._trace_cache: dict[tuple[int, str], dict[str, Any]] = {}
+        self._svg_trace_cache: dict[str, dict[str, Any]] = {}
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -117,12 +125,25 @@ class OpenF1Client:
         yet, callers receive ok=false and can fall back to local estimates.
         """
         session_kind = _session_kind(session)
+        track_key = _track_key(race)
+        if track_key in CURATED_PREFERRED_TRACKS and not live:
+            return _estimated_trace(race, "preferred_curated_centerline_geometry")
+
+        prefer_svg_geometry = track_key in SVG_PREFERRED_TRACKS and not live
+        if prefer_svg_geometry:
+            svg_trace = await self._svg_trace(race, "preferred_static_svg_geometry")
+            if svg_trace:
+                return svg_trace
+
         session_rows = await self._find_session_candidates(race, session_kind, live)
         if not session_rows:
             if session_kind != "race":
                 fallback = await self._fallback_race_trace(race, drivers, f"openf1_{session_kind}_session_unavailable")
                 if fallback:
                     return fallback
+            svg_trace = await self._svg_trace(race, "openf1_session_unavailable")
+            if svg_trace:
+                return svg_trace
             return _estimated_trace(race, "openf1_session_unavailable")
 
         last_failure = _unavailable("openf1_location_trace_unavailable")
@@ -150,7 +171,7 @@ class OpenF1Client:
                 drivers,
             ) if live else []
 
-            return {
+            return _with_track_geometry({
                 **trace,
                 "integration_version": "openf1-trace-v2",
                 "source": "openf1",
@@ -159,14 +180,72 @@ class OpenF1Client:
                 "session_key": session_key,
                 "session_name": session_row.get("session_name"),
                 "live_positions": live_positions,
-            }
+            }, race)
 
         reason = last_failure.get("reason") or f"openf1_{session_kind}_location_trace_unavailable"
         if session_kind != "race":
             fallback = await self._fallback_race_trace(race, drivers, reason)
             if fallback:
                 return fallback
+        svg_trace = await self._svg_trace(race, reason)
+        if svg_trace:
+            return svg_trace
         return _estimated_trace(race, reason)
+
+    async def _svg_trace(self, race: Race, reason: str) -> dict[str, Any] | None:
+        key = _track_key(race)
+        if key in self._svg_trace_cache:
+            cached = dict(self._svg_trace_cache[key])
+            cached["reason"] = reason
+            return cached
+        filename = SVG_TRACK_FILES.get(key)
+        if not filename:
+            return None
+        local_path = TRACK_GEOMETRY_DIR / f"{key}.svg"
+        try:
+            if local_path.exists():
+                svg = local_path.read_text(encoding="utf-8")
+                url = local_path.as_posix()
+            else:
+                url = await self._resolve_wikimedia_svg_url(filename)
+                response = await self._client.get(url, follow_redirects=True, timeout=25.0, headers=WIKIMEDIA_HEADERS)
+                response.raise_for_status()
+                svg = response.text
+                try:
+                    TRACK_GEOMETRY_DIR.mkdir(parents=True, exist_ok=True)
+                    local_path.write_text(svg, encoding="utf-8")
+                except OSError as cache_exc:
+                    logger.debug("SVG track disk cache write failed for %s: %s", key, cache_exc)
+        except (OSError, httpx.HTTPError, ValueError) as exc:
+            logger.warning("SVG track fetch failed for %s: %s", key, exc)
+            return None
+        trace = _trace_from_svg(svg, key, reason, url)
+        if trace.get("ok"):
+            self._svg_trace_cache[key] = trace
+            return trace
+        return None
+
+    async def _resolve_wikimedia_svg_url(self, filename: str) -> str:
+        response = await self._client.get(
+            WIKIMEDIA_API_URL,
+            params={
+                "action": "query",
+                "titles": f"File:{filename}",
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "format": "json",
+            },
+            timeout=20.0,
+            headers=WIKIMEDIA_HEADERS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        pages = payload.get("query", {}).get("pages", {})
+        for page in pages.values():
+            image_info = page.get("imageinfo") or []
+            if image_info and image_info[0].get("url"):
+                return str(image_info[0]["url"])
+        raise ValueError(f"wikimedia_svg_url_unavailable:{filename}")
 
     async def _fallback_race_trace(self, race: Race, drivers: list[Driver], reason: str) -> dict[str, Any] | None:
         race_sessions = await self._find_session_candidates(race, "race", False)
@@ -182,7 +261,7 @@ class OpenF1Client:
                 if trace.get("ok"):
                     self._trace_cache[cache_key] = trace
             if trace.get("ok"):
-                return {
+                return _with_track_geometry({
                     **trace,
                     "integration_version": "openf1-trace-v2",
                     "source": "openf1",
@@ -193,7 +272,7 @@ class OpenF1Client:
                     "session_name": f"{session_row.get('session_name') or 'Race'} trace fallback",
                     "trace_fallback": "race",
                     "live_positions": [],
-                }
+                }, race)
         return None
 
     async def _find_session_candidates(self, race: Race, session_kind: str, live: bool) -> list[dict[str, Any]]:
@@ -241,7 +320,7 @@ class OpenF1Client:
         normalized, bounds = _normalize_points(raw_points)
         simplified = _simplify_points(normalized, max_points=520, min_distance=3.5)
         path = _path_from_points(simplified)
-        return {
+        return _with_track_geometry({
             "ok": True,
             "source": "openf1",
             "mode": "historical",
@@ -250,7 +329,7 @@ class OpenF1Client:
             "path": path,
             "bounds": bounds,
             "sample_count": len(raw_points),
-        }
+        }, race=None)
 
     async def _latest_locations(
         self,
@@ -327,15 +406,57 @@ def _summarize_laps(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[s
     for number, laps in by_number.items():
         durations = [float(row["lap_duration"]) for row in laps]
         clean = sorted(durations)[: max(1, min(5, len(durations)))]
+        ordered = sorted(laps, key=lambda item: str(item.get("date") or ""))
+        split_at = max(1, len(ordered) // 2)
+        early_laps = [float(row["lap_duration"]) for row in ordered[:split_at]]
+        late_laps = [float(row["lap_duration"]) for row in ordered[split_at:]] or early_laps
+        sector_summary = _sector_summary(laps)
+        compounds = sorted({str(row.get("compound")).upper() for row in laps if row.get("compound")})
+        long_run_lap = _median(durations) if len(durations) >= 8 else None
         driver_rows[str(number)] = {
             "driver_number": number,
             "driver_code": codes.get(number),
             "laps": len(laps),
             "best_lap": round(min(durations), 3),
-            "median_lap": round(sorted(durations)[len(durations) // 2], 3),
+            "median_lap": round(_median(durations), 3),
             "representative_lap": round(sum(clean) / len(clean), 3),
+            "long_run_lap": round(long_run_lap, 3) if long_run_lap else None,
+            "track_evolution_delta": round(min(early_laps) - min(late_laps), 3) if early_laps and late_laps else None,
+            "compounds": compounds,
+            **sector_summary,
         }
     return {"drivers": driver_rows, "source": "openf1_laps", "missing_data": not bool(driver_rows)}
+
+
+def _sector_summary(laps: list[dict[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for index in (1, 2, 3):
+        values = []
+        for row in laps:
+            value = _float_or_none(
+                row.get(f"duration_sector_{index}")
+                or row.get(f"sector_{index}")
+                or row.get(f"sector{index}")
+            )
+            if value and value > 0:
+                values.append(value)
+        if not values:
+            continue
+        clean = sorted(values)[: max(1, min(5, len(values)))]
+        payload[f"best_sector_{index}"] = round(min(values), 3)
+        payload[f"representative_sector_{index}"] = round(sum(clean) / len(clean), 3)
+    payload["sector_coverage"] = round(sum(1 for key in payload if key.startswith("representative_sector_")) / 3.0, 4)
+    return payload
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def _summarize_positions(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
@@ -490,6 +611,15 @@ def _float_or_none(value: Any) -> float | None:
 
 def _session_kind(session: str) -> str:
     value = (session or "race").lower()
+    normalized = value.replace("_", " ").replace("-", " ")
+    if normalized in {"fp1", "free practice 1", "practice 1"} or "practice 1" in normalized:
+        return "practice1"
+    if normalized in {"fp2", "free practice 2", "practice 2"} or "practice 2" in normalized:
+        return "practice2"
+    if normalized in {"fp3", "free practice 3", "practice 3"} or "practice 3" in normalized:
+        return "practice3"
+    if normalized.startswith("fp") or "practice" in normalized:
+        return "practice"
     if value.startswith("qual"):
         return "qualifying"
     if value.startswith("sprint"):
@@ -502,7 +632,11 @@ def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> di
         "race": ["race"],
         "qualifying": ["qualifying"],
         "sprint": ["sprint"],
-    }[session_kind]
+        "practice": ["practice", "fp"],
+        "practice1": ["practice 1", "free practice 1", "fp1"],
+        "practice2": ["practice 2", "free practice 2", "fp2"],
+        "practice3": ["practice 3", "free practice 3", "fp3"],
+    }.get(session_kind, ["race"])
     ranked = []
     for item in sessions:
         name = str(item.get("session_name") or "").lower()
@@ -511,6 +645,8 @@ def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> di
             ranked.append(item)
     if not ranked and session_kind == "sprint":
         ranked = [item for item in sessions if "sprint" in str(item.get("session_name") or "").lower()]
+    if ranked and session_kind == "practice":
+        ranked = [item for item in ranked if "practice" in str(item.get("session_name") or "").lower() or str(item.get("session_type") or "").lower() == "practice"]
     return ranked[-1] if ranked else None
 
 
@@ -676,6 +812,382 @@ def _path_from_points(points: list[dict[str, float]]) -> str:
     return " ".join(chunks)
 
 
+def _with_track_geometry(track: dict[str, Any], race: Race | None) -> dict[str, Any]:
+    key = _track_key(race) if race else track.get("track_key") or "default"
+    source = track.get("source") or "estimated"
+    base_points = _coerce_points(track.get("points"))
+    if len(base_points) < 3:
+        base_points = _points_from_path(str(track.get("path") or ESTIMATED_TRACK_PATHS.get(key) or ESTIMATED_TRACK_PATHS["default"]))
+    if len(base_points) < 3:
+        base_points = _points_from_path(ESTIMATED_TRACK_PATHS["default"])
+
+    display_points = _simplify_points(base_points, max_points=280, min_distance=2.5)
+    racing_line = _resample_closed_line(display_points, samples=360)
+    lap_distance = _line_distance(racing_line, closed=True)
+    marker_meta = TRACK_GEOMETRY_MARKERS.get(key) or TRACK_GEOMETRY_MARKERS["default"]
+    path = track.get("path") or _path_from_points(display_points)
+    confidence = _geometry_confidence(source, track, key)
+
+    return {
+        **track,
+        "ok": True,
+        "geometry_version": "f1-track-geometry-v1",
+        "track_key": key,
+        "path": path,
+        "points": track.get("points") or display_points,
+        "display_points": display_points,
+        "racing_line": racing_line,
+        "start_finish_index": int(marker_meta.get("start_finish_index", 0)),
+        "lap_distance": round(lap_distance, 2),
+        "direction": marker_meta.get("direction", "clockwise"),
+        "sectors": marker_meta.get("sectors", []),
+        "drs_zones": marker_meta.get("drs_zones", []),
+        "pit_entry": marker_meta.get("pit_entry"),
+        "pit_exit": marker_meta.get("pit_exit"),
+        "markers": _geometry_markers(marker_meta),
+        "mapping_source": _mapping_source(source, track),
+        "geometry_confidence": confidence,
+        "confidence": track.get("confidence", confidence),
+    }
+
+
+def _mapping_source(source: str, track: dict[str, Any]) -> str:
+    if source == "openf1" and track.get("sample_count"):
+        return "openf1_trace"
+    if source == "wikimedia_svg":
+        return "wikimedia_svg"
+    return "curated_registry"
+
+
+def point_at_progress(track: dict[str, Any], progress: float, lateral_offset: float = 0.0) -> dict[str, float]:
+    line = _coerce_points(track.get("racing_line") or track.get("display_points") or track.get("points"))
+    if len(line) < 2:
+        line = _points_from_path(str(track.get("path") or ESTIMATED_TRACK_PATHS["default"]))
+    if len(line) < 2:
+        return {"x": 500.0, "y": 215.0}
+    progress = ((float(progress or 0.0) % 1.0) + 1.0) % 1.0
+    total = _line_distance(line, closed=True)
+    target = total * progress
+    walked = 0.0
+    for index, start in enumerate(line):
+        end = line[(index + 1) % len(line)]
+        segment = _distance(start, end)
+        if segment <= 0:
+            continue
+        if walked + segment >= target:
+            ratio = (target - walked) / segment
+            x = start["x"] + (end["x"] - start["x"]) * ratio
+            y = start["y"] + (end["y"] - start["y"]) * ratio
+            if lateral_offset:
+                nx = -(end["y"] - start["y"]) / segment
+                ny = (end["x"] - start["x"]) / segment
+                x += nx * lateral_offset
+                y += ny * lateral_offset
+            return {"x": round(x, 2), "y": round(y, 2)}
+        walked += segment
+    return {"x": round(line[0]["x"], 2), "y": round(line[0]["y"], 2)}
+
+
+def progress_from_xy(track: dict[str, Any], x: float, y: float) -> float:
+    nearest = nearest_racing_line_point(track, x, y)
+    return float(nearest.get("progress", 0.0))
+
+
+def nearest_racing_line_point(track: dict[str, Any], x: float, y: float) -> dict[str, float]:
+    line = _coerce_points(track.get("racing_line") or track.get("display_points") or track.get("points"))
+    if len(line) < 2:
+        line = _points_from_path(str(track.get("path") or ESTIMATED_TRACK_PATHS["default"]))
+    if len(line) < 2:
+        return {"x": float(x or 0), "y": float(y or 0), "progress": 0.0, "distance": 0.0}
+    total = _line_distance(line, closed=True)
+    best: dict[str, float] | None = None
+    walked = 0.0
+    for index, start in enumerate(line):
+        end = line[(index + 1) % len(line)]
+        segment = _distance(start, end)
+        if segment <= 0:
+            continue
+        projection = _project_on_segment(float(x), float(y), start, end)
+        progress = (walked + segment * projection["t"]) / max(total, 1.0)
+        candidate = {"x": projection["x"], "y": projection["y"], "progress": progress % 1.0, "distance": projection["distance"]}
+        if best is None or candidate["distance"] < best["distance"]:
+            best = candidate
+        walked += segment
+    return best or {"x": float(x or 0), "y": float(y or 0), "progress": 0.0, "distance": 0.0}
+
+
+def offset_for_position(position: int, field_size: int = 20) -> float:
+    lane = ((max(1, int(position or 1)) - 1) % 5) - 2
+    pack = min(1.0, max(0.55, 20 / max(8, int(field_size or 20))))
+    return round(lane * 3.2 * pack, 2)
+
+
+def _geometry_confidence(source: str, track: dict[str, Any], key: str) -> float:
+    if source == "openf1" and track.get("sample_count"):
+        return 0.92
+    if source == "wikimedia_svg":
+        return 0.88
+    if key in ESTIMATED_TRACK_PATHS:
+        return 0.72
+    return 0.38
+
+
+def _geometry_markers(meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start_finish": meta.get("start_finish", 0.0),
+        "sectors": meta.get("sectors", []),
+        "drs_zones": meta.get("drs_zones", []),
+        "pit_entry": meta.get("pit_entry"),
+        "pit_exit": meta.get("pit_exit"),
+    }
+
+
+def _trace_from_svg(svg: str, key: str, reason: str, url: str) -> dict[str, Any]:
+    path = _main_course_path(svg)
+    if not path:
+        return _unavailable("svg_course_path_unavailable")
+    try:
+        points = _points_from_path(path)
+    except ValueError as exc:
+        unavailable = _unavailable("svg_course_path_parse_failed")
+        unavailable["parse_error"] = str(exc)
+        return unavailable
+    if len(points) < 24:
+        unavailable = _unavailable("svg_course_path_too_sparse")
+        unavailable["svg_points"] = len(points)
+        return unavailable
+    normalized, bounds = _normalize_points(points)
+    simplified = _simplify_points(normalized, max_points=640, min_distance=1.0)
+    return _with_track_geometry({
+        "ok": True,
+        "source": "wikimedia_svg",
+        "integration_version": "wikimedia-svg-track-v1",
+        "mode": "static_vector",
+        "reason": reason,
+        "track_key": key,
+        "points": simplified,
+        "path": _path_from_points(simplified),
+        "bounds": bounds or _bounds_for_points(points),
+        "source_bounds": _bounds_for_points(points),
+        "sample_count": len(points),
+        "svg_source_url": url,
+        "live_positions": [],
+    }, None)
+
+
+def _main_course_path(svg: str) -> str:
+    path_matches = re.findall(r"<path\b[^>]*\bd=\"([^\"]+)\"[^>]*>", svg or "", flags=re.IGNORECASE | re.DOTALL)
+    if not path_matches:
+        return ""
+    class_matches = re.findall(r"<path\b(?=[^>]*\bclass=\"st0\")[^>]*\bd=\"([^\"]+)\"[^>]*>", svg or "", flags=re.IGNORECASE | re.DOTALL)
+    candidates = class_matches or path_matches
+    return max(candidates, key=len).replace("\n", " ").replace("\t", " ").strip()
+
+
+def _bounds_for_points(points: list[dict[str, float]]) -> dict[str, float]:
+    if not points:
+        return {}
+    xs = [point["x"] for point in points]
+    ys = [point["y"] for point in points]
+    return {"min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)}
+
+
+def _coerce_points(value: Any) -> list[dict[str, float]]:
+    if not isinstance(value, list):
+        return []
+    points: list[dict[str, float]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            points.append({"x": round(x, 2), "y": round(y, 2)})
+    return points
+
+
+def _points_from_path(path: str) -> list[dict[str, float]]:
+    tokens = re.findall(r"[MLHVCSQTAZmlhvcsqtaz]|-?(?:\d+(?:\.\d+)?|\.\d+)", path or "")
+    points: list[dict[str, float]] = []
+    cursor = {"x": 0.0, "y": 0.0}
+    start = {"x": 0.0, "y": 0.0}
+    i = 0
+    command = ""
+    relative = False
+    previous_c2: dict[str, float] | None = None
+    previous_q1: dict[str, float] | None = None
+    command_re = re.compile(r"^[MLHVCSQTAZmlhvcsqtaz]$")
+    while i < len(tokens):
+        if command_re.match(tokens[i]):
+            raw_command = tokens[i]
+            relative = raw_command.islower()
+            command = raw_command.upper()
+            i += 1
+        if command == "M" and i + 1 < len(tokens) and not command_re.match(tokens[i]) and not command_re.match(tokens[i + 1]):
+            cursor = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            start = dict(cursor)
+            points.append(dict(cursor))
+            i += 2
+            command = "L"
+            previous_c2 = None
+            previous_q1 = None
+        elif command == "L" and i + 1 < len(tokens) and not command_re.match(tokens[i]) and not command_re.match(tokens[i + 1]):
+            cursor = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            points.append(dict(cursor))
+            i += 2
+            previous_c2 = None
+            previous_q1 = None
+        elif command == "H" and i < len(tokens) and not command_re.match(tokens[i]):
+            x = cursor["x"] + float(tokens[i]) if relative else float(tokens[i])
+            cursor = {"x": round(x, 2), "y": cursor["y"]}
+            points.append(dict(cursor))
+            i += 1
+            previous_c2 = None
+            previous_q1 = None
+        elif command == "V" and i < len(tokens) and not command_re.match(tokens[i]):
+            y = cursor["y"] + float(tokens[i]) if relative else float(tokens[i])
+            cursor = {"x": cursor["x"], "y": round(y, 2)}
+            points.append(dict(cursor))
+            i += 1
+            previous_c2 = None
+            previous_q1 = None
+        elif command == "C" and i + 5 < len(tokens):
+            if any(command_re.match(tokens[i + offset]) for offset in range(6)):
+                i += 1
+                continue
+            p0 = dict(cursor)
+            p1 = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            p2 = _path_point(float(tokens[i + 2]), float(tokens[i + 3]), cursor, relative)
+            p3 = _path_point(float(tokens[i + 4]), float(tokens[i + 5]), cursor, relative)
+            for step in range(1, 15):
+                t = step / 14
+                points.append(_cubic(p0, p1, p2, p3, t))
+            cursor = p3
+            previous_c2 = p2
+            previous_q1 = None
+            i += 6
+        elif command == "S" and i + 3 < len(tokens):
+            if any(command_re.match(tokens[i + offset]) for offset in range(4)):
+                i += 1
+                continue
+            p0 = dict(cursor)
+            p1 = {"x": round(cursor["x"] * 2 - previous_c2["x"], 2), "y": round(cursor["y"] * 2 - previous_c2["y"], 2)} if previous_c2 else dict(cursor)
+            p2 = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            p3 = _path_point(float(tokens[i + 2]), float(tokens[i + 3]), cursor, relative)
+            for step in range(1, 15):
+                t = step / 14
+                points.append(_cubic(p0, p1, p2, p3, t))
+            cursor = p3
+            previous_c2 = p2
+            previous_q1 = None
+            i += 4
+        elif command == "Q" and i + 3 < len(tokens):
+            if any(command_re.match(tokens[i + offset]) for offset in range(4)):
+                i += 1
+                continue
+            p0 = dict(cursor)
+            p1 = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            p2 = _path_point(float(tokens[i + 2]), float(tokens[i + 3]), cursor, relative)
+            for step in range(1, 13):
+                t = step / 12
+                points.append(_quadratic(p0, p1, p2, t))
+            cursor = p2
+            previous_q1 = p1
+            previous_c2 = None
+            i += 4
+        elif command == "T" and i + 1 < len(tokens):
+            if any(command_re.match(tokens[i + offset]) for offset in range(2)):
+                i += 1
+                continue
+            p0 = dict(cursor)
+            p1 = {"x": round(cursor["x"] * 2 - previous_q1["x"], 2), "y": round(cursor["y"] * 2 - previous_q1["y"], 2)} if previous_q1 else dict(cursor)
+            p2 = _path_point(float(tokens[i]), float(tokens[i + 1]), cursor, relative)
+            for step in range(1, 13):
+                t = step / 12
+                points.append(_quadratic(p0, p1, p2, t))
+            cursor = p2
+            previous_q1 = p1
+            previous_c2 = None
+            i += 2
+        elif command == "A" and i + 6 < len(tokens):
+            if any(command_re.match(tokens[i + offset]) for offset in range(7)):
+                i += 1
+                continue
+            cursor = _path_point(float(tokens[i + 5]), float(tokens[i + 6]), cursor, relative)
+            points.append(dict(cursor))
+            previous_c2 = None
+            previous_q1 = None
+            i += 7
+        elif command == "Z":
+            if points and _distance(points[-1], start) > 0:
+                points.append(dict(start))
+            i += 1
+            previous_c2 = None
+            previous_q1 = None
+        else:
+            i += 1
+    return _dedupe_points(points)
+
+
+def _path_point(x: float, y: float, cursor: dict[str, float], relative: bool) -> dict[str, float]:
+    return {"x": round((cursor["x"] + x) if relative else x, 2), "y": round((cursor["y"] + y) if relative else y, 2)}
+
+
+def _cubic(p0: dict[str, float], p1: dict[str, float], p2: dict[str, float], p3: dict[str, float], t: float) -> dict[str, float]:
+    mt = 1 - t
+    return {
+        "x": round(mt**3 * p0["x"] + 3 * mt**2 * t * p1["x"] + 3 * mt * t**2 * p2["x"] + t**3 * p3["x"], 2),
+        "y": round(mt**3 * p0["y"] + 3 * mt**2 * t * p1["y"] + 3 * mt * t**2 * p2["y"] + t**3 * p3["y"], 2),
+    }
+
+
+def _quadratic(p0: dict[str, float], p1: dict[str, float], p2: dict[str, float], t: float) -> dict[str, float]:
+    mt = 1 - t
+    return {
+        "x": round(mt**2 * p0["x"] + 2 * mt * t * p1["x"] + t**2 * p2["x"], 2),
+        "y": round(mt**2 * p0["y"] + 2 * mt * t * p1["y"] + t**2 * p2["y"], 2),
+    }
+
+
+def _dedupe_points(points: list[dict[str, float]]) -> list[dict[str, float]]:
+    result: list[dict[str, float]] = []
+    for point in points:
+        if not result or _distance(result[-1], point) > 0.25:
+            result.append({"x": round(point["x"], 2), "y": round(point["y"], 2)})
+    return result
+
+
+def _resample_closed_line(points: list[dict[str, float]], samples: int) -> list[dict[str, float]]:
+    if len(points) < 2:
+        return points
+    total = _line_distance(points, closed=True)
+    return [point_at_progress({"racing_line": points}, index / samples) for index in range(samples)]
+
+
+def _line_distance(points: list[dict[str, float]], closed: bool = False) -> float:
+    if len(points) < 2:
+        return 0.0
+    count = len(points) if closed else len(points) - 1
+    return sum(_distance(points[index], points[(index + 1) % len(points)]) for index in range(count))
+
+
+def _distance(a: dict[str, float], b: dict[str, float]) -> float:
+    return math.dist((float(a["x"]), float(a["y"])), (float(b["x"]), float(b["y"])))
+
+
+def _project_on_segment(x: float, y: float, start: dict[str, float], end: dict[str, float]) -> dict[str, float]:
+    dx = end["x"] - start["x"]
+    dy = end["y"] - start["y"]
+    length_sq = max(dx * dx + dy * dy, 1e-9)
+    t = max(0.0, min(1.0, ((x - start["x"]) * dx + (y - start["y"]) * dy) / length_sq))
+    px = start["x"] + dx * t
+    py = start["y"] + dy * t
+    return {"x": round(px, 2), "y": round(py, 2), "t": t, "distance": math.dist((x, y), (px, py))}
+
+
 def _unavailable(reason: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -709,17 +1221,89 @@ ESTIMATED_TRACK_PATHS = {
     "cota": "M126 269 C165 126 311 94 445 120 C549 140 593 207 690 201 C786 195 858 152 888 214 C923 289 827 351 714 332 C623 316 578 261 493 278 C384 300 300 365 204 331 C151 312 115 292 126 269 Z",
     "mexico": "M140 267 L140 144 L324 144 C403 144 456 205 530 205 L812 205 C872 205 894 271 850 310 C806 349 720 335 632 302 L507 254 L430 319 L242 319 C173 319 140 301 140 267 Z",
     "interlagos": "M133 253 C183 139 318 101 428 155 C514 197 568 125 690 125 C811 125 884 214 835 291 C788 365 669 349 575 294 C479 238 439 309 341 330 C245 351 160 326 133 253 Z",
-    "lasvegas": "M111 274 L180 153 L403 153 L461 98 L788 98 C873 98 918 154 886 216 L827 331 L617 331 L549 279 L345 279 L282 331 L169 331 C125 331 94 310 111 274 Z",
+    "lasvegas": "M500 386 L812 386 C840 386 854 370 854 343 L854 139 C854 110 833 86 804 85 C781 84 766 99 773 119 C780 139 770 155 747 162 L642 194 C610 204 585 190 568 163 C553 140 530 126 503 126 L451 126 C429 126 414 142 414 164 L414 259 C414 295 386 321 350 322 L285 322 C255 322 235 303 237 276 C239 254 255 239 280 234 L346 221 L346 127 C346 104 329 89 305 89 L133 89 C111 89 95 106 95 129 L95 228 C95 258 79 279 51 289 C33 296 30 318 49 331 L181 382 C211 395 247 400 287 398 L500 386",
     "losail": "M134 260 C161 146 267 101 388 118 C496 133 548 212 650 202 C748 193 836 160 875 221 C922 294 839 361 719 349 C617 339 570 280 484 286 C371 293 291 363 198 330 C151 313 124 291 134 260 Z",
     "yasmarina": "M137 267 C167 150 281 108 408 128 C515 146 549 204 645 194 C747 184 851 161 882 230 C915 305 821 354 703 328 L571 299 L509 342 L294 342 C198 342 119 319 137 267 Z",
     "default": "M105 260 C170 92 365 58 548 84 C690 104 872 82 905 178 C938 274 804 345 646 323 C520 305 471 229 352 253 C241 275 169 337 105 260 Z",
 }
 
 
+SVG_TRACK_FILES = {
+    "albertpark": "2022 F1 CourseLayout Australia.svg",
+    "shanghai": "Circuit Shanghai.svg",
+    "suzuka": "2022 F1 CourseLayout Japan.svg",
+    "miami": "2022 F1 CourseLayout Miami.svg",
+    "gilles": "2022 F1 CourseLayout Canada.svg",
+    "monaco": "2022 F1 CourseLayout Monaco.svg",
+    "barcelona": "2022 F1 CourseLayout Spain.svg",
+    "redbullring": "2022 F1 CourseLayout Austria.svg",
+    "silverstone": "2022 F1 CourseLayout Britain.svg",
+    "spa": "2022 F1 CourseLayout Belgium.svg",
+    "hungaroring": "2022 F1 CourseLayout Hungary.svg",
+    "zandvoort": "2022 F1 CourseLayout Netherlands.svg",
+    "monza": "2022 F1 CourseLayout Italia.svg",
+    "madring": "Madring (2026).svg",
+    "baku": "2022 F1 CourseLayout Azerbaijan.svg",
+    "marinabay": "2022 F1 CourseLayout Singapore.svg",
+    "cota": "2022 F1 CourseLayout COTA.svg",
+    "mexico": "2022 F1 CourseLayout Mexico.svg",
+    "interlagos": "2022 F1 CourseLayout São Paulo.svg",
+    "lasvegas": "2023 Las Vegas street circuit.svg",
+    "losail": "Losail.svg",
+    "yasmarina": "2022 F1 CourseLayout Abu Dhabi.svg",
+}
+
+
+SVG_PREFERRED_TRACKS = set(SVG_TRACK_FILES) - {"lasvegas"}
+CURATED_PREFERRED_TRACKS = {"lasvegas"}
+
+
+TRACK_GEOMETRY_MARKERS = {
+    key: {
+        "start_finish": start,
+        "start_finish_index": 0,
+        "direction": direction,
+        "sectors": [
+            {"name": "sector_1", "start": 0.0, "end": 0.333},
+            {"name": "sector_2", "start": 0.333, "end": 0.666},
+            {"name": "sector_3", "start": 0.666, "end": 1.0},
+        ],
+        "drs_zones": [{"name": f"DRS {index + 1}", "start": start_at, "end": end_at} for index, (start_at, end_at) in enumerate(drs)],
+        "pit_entry": pit[0],
+        "pit_exit": pit[1],
+    }
+    for key, start, direction, drs, pit in [
+        ("albertpark", 0.02, "clockwise", [(0.10, 0.18), (0.44, 0.51), (0.73, 0.80), (0.89, 0.96)], (0.92, 0.05)),
+        ("shanghai", 0.03, "clockwise", [(0.14, 0.23), (0.67, 0.77)], (0.88, 0.04)),
+        ("suzuka", 0.55, "clockwise", [(0.58, 0.67)], (0.48, 0.58)),
+        ("miami", 0.01, "clockwise", [(0.10, 0.18), (0.43, 0.51), (0.78, 0.87)], (0.90, 0.04)),
+        ("gilles", 0.02, "clockwise", [(0.18, 0.28), (0.62, 0.70), (0.82, 0.94)], (0.91, 0.05)),
+        ("monaco", 0.03, "clockwise", [(0.07, 0.15)], (0.78, 0.88)),
+        ("barcelona", 0.02, "clockwise", [(0.10, 0.20), (0.72, 0.82)], (0.89, 0.04)),
+        ("redbullring", 0.02, "clockwise", [(0.08, 0.20), (0.30, 0.42), (0.74, 0.86)], (0.87, 0.04)),
+        ("silverstone", 0.03, "clockwise", [(0.16, 0.27), (0.60, 0.71)], (0.88, 0.04)),
+        ("spa", 0.02, "clockwise", [(0.14, 0.25), (0.63, 0.75)], (0.89, 0.04)),
+        ("hungaroring", 0.02, "clockwise", [(0.12, 0.21), (0.76, 0.86)], (0.88, 0.04)),
+        ("zandvoort", 0.02, "clockwise", [(0.11, 0.20), (0.70, 0.80)], (0.88, 0.04)),
+        ("monza", 0.02, "clockwise", [(0.10, 0.22), (0.56, 0.67)], (0.88, 0.04)),
+        ("madring", 0.02, "clockwise", [(0.13, 0.23), (0.58, 0.68)], (0.88, 0.04)),
+        ("baku", 0.01, "counter_clockwise", [(0.08, 0.20), (0.78, 0.92)], (0.90, 0.04)),
+        ("marinabay", 0.02, "counter_clockwise", [(0.11, 0.18), (0.35, 0.43), (0.60, 0.68), (0.79, 0.88)], (0.88, 0.04)),
+        ("cota", 0.02, "counter_clockwise", [(0.13, 0.25), (0.62, 0.75)], (0.88, 0.04)),
+        ("mexico", 0.02, "clockwise", [(0.11, 0.24), (0.56, 0.66), (0.77, 0.88)], (0.88, 0.04)),
+        ("interlagos", 0.02, "counter_clockwise", [(0.13, 0.25), (0.70, 0.84)], (0.88, 0.04)),
+        ("lasvegas", 0.01, "counter_clockwise", [(0.14, 0.31), (0.63, 0.78)], (0.88, 0.04)),
+        ("losail", 0.02, "clockwise", [(0.11, 0.23)], (0.88, 0.04)),
+        ("yasmarina", 0.02, "counter_clockwise", [(0.14, 0.25), (0.62, 0.74)], (0.88, 0.04)),
+        ("default", 0.0, "clockwise", [(0.18, 0.30), (0.62, 0.74)], (0.88, 0.04)),
+    ]
+}
+
+
 def _estimated_trace(race: Race, reason: str) -> dict[str, Any]:
     key = _track_key(race)
     path = ESTIMATED_TRACK_PATHS.get(key) or ESTIMATED_TRACK_PATHS["default"]
-    return {
+    return _with_track_geometry({
         "ok": True,
         "source": "estimated",
         "integration_version": "estimated-track-v1",
@@ -731,4 +1315,4 @@ def _estimated_trace(race: Race, reason: str) -> dict[str, Any]:
         "bounds": {},
         "sample_count": 0,
         "live_positions": [],
-    }
+    }, race)

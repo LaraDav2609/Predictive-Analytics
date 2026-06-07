@@ -42,6 +42,7 @@ class BaselineRaceModel:
         completed_races = num(features.get("completed_races"), 0.0)
         total_races = num(features.get("total_races"), DEFAULT_TOTAL_RACES) or DEFAULT_TOTAL_RACES
         season_progress = max(0.0, min(1.0, completed_races / total_races))
+        race_standings_influence = min(0.32, 0.08 + 0.34 * season_progress)
         performance_by_driver = build_performance_table(drivers, constructors, driver_features, constructor_features)
         track = snapshot.track or {}
         weather = snapshot.weather or {}
@@ -60,7 +61,8 @@ class BaselineRaceModel:
         for driver in drivers:
             points_strength = driver.points / max_points
             position_strength = max(0.0, 1.0 - (driver.position - 1) * 0.08) if driver.position else 0.3
-            standing_score = 0.7 * points_strength + 0.3 * position_strength
+            raw_standing_score = 0.7 * points_strength + 0.3 * position_strength
+            standing_score = clamp01(0.50 + (raw_standing_score - 0.50) * race_standings_influence)
 
             feature = driver_features.get(driver.id) or {}
             form_score = float(feature.get("form_score", standing_score))
@@ -135,6 +137,8 @@ class BaselineRaceModel:
             )
             components[driver.id] = {
                 "standing_score": standing_score,
+                "raw_standing_score": raw_standing_score,
+                "standing_influence": race_standings_influence,
                 "form_score": form_score,
                 "team_score": team_score,
                 "driver_skill_score": num(performance.get("driver_skill_score"), form_score),
@@ -190,6 +194,11 @@ class BaselineRaceModel:
                 team_news_mentions=component["team_news_mentions"],
                 overall_news_score=round(component["overall_news_score"], 4),
                 news_win_modifier=round(component["news_win_modifier"], 4),
+                race_sentiment_impact_score=round(component.get("race_sentiment_impact_score", 0.0), 4),
+                race_sentiment_delta=round(component.get("race_sentiment_delta", 0.0), 4),
+                race_sentiment_confidence=round(component.get("race_sentiment_confidence", 0.0), 4),
+                race_sentiment_articles=int(component.get("race_sentiment_articles") or 0),
+                race_sentiment_explanations=component.get("race_sentiment_explanations") or [],
                 wdc_prob=round(wdc_strengths[driver.id] / wdc_total, 4),
                 wdc_modifier=round(component["wdc_modifier"], 4),
                 reliability_score=round(component["reliability_score"], 4),
