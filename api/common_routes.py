@@ -13,33 +13,15 @@ async def health():
 
 @router.get("/sports")
 async def list_sports() -> list[SportInfo]:
+    # F1 and baseball are the supported sports. Add a SportInfo entry here
+    # (plus a sports/<sport>/ package) to surface a new sport in the UI.
     return [
-        SportInfo(
-            sport=Sport.SOCCER, label="Soccer", icon="fa-futbol",
-            available=True, description="FIFA World Cup 2026 predictions",
-        ),
         SportInfo(
             sport=Sport.FORMULA_ONE, label="Formula 1", icon="fa-flag-checkered",
             available=True, description="F1 World Championship 2026",
         ),
         SportInfo(
-            sport=Sport.BASKETBALL, label="Basketball", icon="fa-basketball",
-            available=False, description="NBA predictions — coming soon",
-        ),
-        SportInfo(
             sport=Sport.BASEBALL, label="Baseball", icon="fa-baseball",
             available=True, href="/Sports#baseball", description="MLB 2026 season predictions",
-        ),
-        SportInfo(
-            sport=Sport.TENNIS, label="Tennis", icon="fa-table-tennis-paddle-ball",
-            available=False, description="ATP/WTA predictions — coming soon",
-        ),
-        SportInfo(
-            sport=Sport.AMERICAN_FOOTBALL, label="NFL", icon="fa-football",
-            available=False, description="NFL predictions — coming soon",
-        ),
-        SportInfo(
-            sport=Sport.CRICKET, label="Cricket", icon="fa-cricket-bat-ball",
-            available=False, description="ICC predictions — coming soon",
         ),
     ]

@@ -5,13 +5,10 @@ from pydantic import BaseModel
 
 
 class Sport(str, Enum):
-    SOCCER = "soccer"
+    # Only the actively-supported sports are listed. Add new members here
+    # (and a matching sports/<sport>/ package) to extend the platform.
     FORMULA_ONE = "f1"
-    BASKETBALL = "basketball"
     BASEBALL = "baseball"
-    TENNIS = "tennis"
-    AMERICAN_FOOTBALL = "nfl"
-    CRICKET = "cricket"
 
 
 class Competition(BaseModel):
