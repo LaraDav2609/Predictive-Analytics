@@ -4,11 +4,19 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+class Category(str, Enum):
+    """Top-level grouping a prediction domain belongs to."""
+    SPORT = "sport"
+    GAME = "game"
+
+
 class Sport(str, Enum):
-    # Only the actively-supported sports are listed. Add new members here
-    # (and a matching sports/<sport>/ package) to extend the platform.
+    # Identifies a prediction domain (sport or game). Add a member here plus a
+    # matching sports/<sport>/ or games/<game>/ package to extend the platform.
+    # (Name kept as `Sport` for back-compat; it really means "domain".)
     FORMULA_ONE = "f1"
     BASEBALL = "baseball"
+    CSGO = "csgo"
 
 
 class Competition(BaseModel):
@@ -25,6 +33,7 @@ class SportInfo(BaseModel):
     label: str
     icon: str
     available: bool
+    category: Category = Category.SPORT
     href: str = ""
     competitions: list[Competition] = []
     description: str = ""

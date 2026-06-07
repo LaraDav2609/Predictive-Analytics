@@ -17,6 +17,9 @@ from sports.f1.data.f1_sentiment import refresh_f1_sentiment
 from common.api import common_routes
 from sports.f1.api import f1_routes
 from sports.baseball.api import baseball_routes, baseball_history_routes
+from games.csgo.data.csgo_client import StubCsgoClient
+from games.csgo.analytics.csgo_predictor import CsgoPredictor
+from games.csgo.api import csgo_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -94,6 +97,12 @@ async def lifespan(app: FastAPI):
     baseball_routes.init(_mlb_client, baseball_pred)
     baseball_history_routes.init(_mlb_historical_client, pybaseball_client)
 
+    # CSGO (game category) — stubbed data source; team ratings load synchronously.
+    csgo_client = StubCsgoClient()
+    csgo_pred = CsgoPredictor()
+    csgo_routes.init(csgo_client, csgo_pred)
+    csgo_pred.load_teams(csgo_client.get_teams())
+
     # Initial data loads are intentionally non-blocking. Some upstream sports/F1
     # APIs can be slow or unavailable, and the dashboard should still boot.
     _track_startup_task("F1", _load_f1_data(_f1_client, f1_pred))
@@ -133,3 +142,4 @@ app.include_router(common_routes.router, prefix="/api")
 app.include_router(f1_routes.router, prefix="/api")
 app.include_router(baseball_routes.router, prefix="/api")
 app.include_router(baseball_history_routes.router, prefix="/api")
+app.include_router(csgo_routes.router, prefix="/api")
