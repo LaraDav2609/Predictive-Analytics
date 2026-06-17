@@ -5,7 +5,10 @@ from sports.f1.predictor.features.builder import F1FeatureBuilder
 from sports.f1.predictor.features.performance import build_performance_table
 from sports.f1.predictor.backtesting.replay import _constructor_feature, _driver_feature
 from sports.f1.predictor.service import F1PredictionService
-from sports.f1.data.openf1_client import _summarize_laps
+from sports.f1.predictor.models.baseline import BaselineRaceModel
+from sports.f1.predictor.models.ml_simulator import MLSimulatorRaceModel
+from sports.f1.predictor.models.registry import F1ModelRegistry
+from sports.f1.data.openf1_client import _summarize_laps, _summarize_stints
 from sports.f1.models.f1 import Constructor, Driver, Race
 
 
@@ -94,6 +97,7 @@ class F1PredictorModuleTests(unittest.TestCase):
                             "representative_sector_2": 25.0,
                             "representative_sector_3": 24.9,
                             "track_evolution_delta": 0.4,
+                            "lap_distribution": {"sample_size": 18, "p10": 72.4, "median": 73.0, "p90": 73.6, "spread_p90_p10": 1.2},
                             "compounds": ["MEDIUM"],
                         },
                         "63": {
@@ -105,6 +109,7 @@ class F1PredictorModuleTests(unittest.TestCase):
                             "representative_sector_2": 25.8,
                             "representative_sector_3": 25.2,
                             "track_evolution_delta": 0.4,
+                            "lap_distribution": {"sample_size": 16, "p10": 74.4, "median": 75.0, "p90": 76.2, "spread_p90_p10": 1.8},
                             "compounds": ["HARD"],
                         },
                     }
@@ -131,6 +136,8 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertGreater(antonelli["practice_sector_score"], russell["practice_sector_score"])
         self.assertGreater(antonelli["practice_long_run_score"], russell["practice_long_run_score"])
         self.assertLess(antonelli["practice_fuel_uncertainty"], 0.35)
+        self.assertGreater(antonelli["practice_distribution_stability"], 0.0)
+        self.assertEqual(18, antonelli["practice_lap_distribution"]["sample_size"])
         self.assertEqual(["MEDIUM"], antonelli["practice_compounds"])
         self.assertGreater(antonelli["qualifying_pace_score"], russell["qualifying_pace_score"])
 
@@ -154,6 +161,24 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertIn("representative_sector_1", antonelli)
         self.assertIsNotNone(antonelli["long_run_lap"])
         self.assertGreater(antonelli["track_evolution_delta"], 0)
+        self.assertIn("lap_distribution", antonelli)
+        self.assertEqual(8, antonelli["lap_distribution"]["sample_size"])
+        self.assertGreater(antonelli["pace_stability"], 0)
+
+    def test_openf1_stint_summary_keeps_compound_sequence_and_distribution(self):
+        rows = [
+            {"driver_number": 12, "stint_number": 1, "lap_start": 1, "lap_end": 15, "compound": "SOFT"},
+            {"driver_number": 12, "stint_number": 2, "lap_start": 16, "lap_end": 42, "compound": "HARD"},
+            {"driver_number": 63, "stint_number": 1, "lap_start": 1, "lap_end": 20, "compound": "MEDIUM"},
+        ]
+
+        summary = _summarize_stints(rows, self.drivers)
+        antonelli = summary["drivers"]["12"]
+
+        self.assertEqual(["SOFT", "HARD"], antonelli["compound_sequence"])
+        self.assertEqual(27, antonelli["max_stint_laps"])
+        self.assertEqual(27, antonelli["final_stint_laps"])
+        self.assertEqual(2, antonelli["stint_lap_distribution"]["sample_size"])
 
     def test_prediction_service_works_without_sentiment(self):
         service = F1PredictionService()
@@ -168,6 +193,182 @@ class F1PredictorModuleTests(unittest.TestCase):
         self.assertIsNotNone(antonelli.track_fit_score)
         self.assertIsNotNone(antonelli.dnf_prob)
         self.assertEqual("Neutral", antonelli.sentiment_label)
+
+    def test_model_registry_dispatches_only_ml_simulator_to_ml_adapter(self):
+        self.assertIsInstance(F1ModelRegistry(model_id="production_v1")._model, BaselineRaceModel)
+        self.assertIsInstance(F1ModelRegistry(model_id="calibrated_candidate_v1")._model, BaselineRaceModel)
+        self.assertIsInstance(F1ModelRegistry(model_id="conservative_v1")._model, BaselineRaceModel)
+        self.assertIsInstance(F1ModelRegistry(model_id="ml_simulator_v1")._model, MLSimulatorRaceModel)
+
+    def test_ml_simulator_model_uses_existing_prediction_shape(self):
+        features = {
+            **self.features,
+            "ml_simulator_iterations": 300,
+            "weekend_evidence": {
+                "ok": True,
+                "session": "race",
+                "source_mode": "historical",
+                "confidence": 0.72,
+                "coverage_counts": {"practice_drivers": 2, "grid_drivers": 2, "race_input_drivers": 0},
+                "drivers": {
+                    "antonelli": {
+                        "practice": {
+                            "representative_lap": 72.8,
+                            "long_run_lap": 73.2,
+                            "best_lap": 72.2,
+                            "race_evidence_score": 0.88,
+                            "qualifying_evidence_score": 0.90,
+                            "pace_stability": 0.82,
+                            "fuel_uncertainty": 0.18,
+                            "confidence": 0.82,
+                            "compounds": ["MEDIUM"],
+                        },
+                        "grid": {"grid_position": 1, "qualifying_position": 1, "confidence": 0.86},
+                    },
+                    "russell": {
+                        "practice": {
+                            "representative_lap": 74.2,
+                            "long_run_lap": 74.6,
+                            "best_lap": 73.8,
+                            "race_evidence_score": 0.50,
+                            "qualifying_evidence_score": 0.52,
+                            "pace_stability": 0.62,
+                            "fuel_uncertainty": 0.28,
+                            "confidence": 0.72,
+                            "compounds": ["HARD"],
+                        },
+                        "grid": {"grid_position": 2, "qualifying_position": 2, "confidence": 0.86},
+                    },
+                },
+            },
+        }
+        service = F1PredictionService(model_id="ml_simulator_v1")
+        service.load(self.drivers, self.constructors, features, sentiment={})
+
+        prediction = service.predict_race(self.race)
+        antonelli = prediction.driver_predictions["antonelli"]
+        russell = prediction.driver_predictions["russell"]
+        total_win = sum(item.win_prob for item in prediction.driver_predictions.values())
+
+        self.assertIn("ml-simulator-v1", prediction.model_version)
+        self.assertIn("sports.f1.ml Monte Carlo simulator", prediction.data_sources)
+        self.assertEqual("ml_simulator_v1", prediction.model_id)
+        self.assertEqual("evidence_fallback", prediction.ml_input_source)
+        self.assertEqual("trained_ml_artifacts_unavailable", prediction.ml_fallback_reason)
+        self.assertFalse(prediction.trained_artifacts_used)
+        self.assertIn("practice", prediction.evidence_groups_used)
+        self.assertEqual(300, prediction.simulator_iterations)
+        self.assertAlmostEqual(1.0, total_win, places=2)
+        self.assertGreater(antonelli.win_prob, russell.win_prob)
+        self.assertGreaterEqual(antonelli.podium_prob, antonelli.win_prob)
+        self.assertIsNotNone(antonelli.expected_finish)
+        self.assertIsNotNone(antonelli.dnf_prob)
+
+    def test_ml_simulator_uses_trained_artifact_overlay_when_supplied(self):
+        features = {
+            **self.features,
+            "ml_simulator_iterations": 300,
+            "ml_trained_inputs": {
+                "drivers": {
+                    "antonelli": {
+                        "pace_mean_seconds": 74.5,
+                        "pace_sigma_seconds": 0.35,
+                        "dnf_hazard_per_lap": 0.001,
+                        "sources": ["trained_gbm_pace", "trained_gbm_dnf"],
+                        "confidence": 0.82,
+                    },
+                    "russell": {
+                        "pace_mean_seconds": 71.5,
+                        "pace_sigma_seconds": 0.28,
+                        "dnf_hazard_per_lap": 0.0004,
+                        "sources": ["trained_gbm_pace", "trained_gbm_dnf"],
+                        "confidence": 0.84,
+                    },
+                }
+            },
+        }
+        service = F1PredictionService(model_id="ml_simulator_v1")
+        service.load(self.drivers, self.constructors, features, sentiment={})
+
+        prediction = service.predict_race(self.race)
+
+        self.assertEqual("trained_artifacts", prediction.ml_input_source)
+        self.assertTrue(prediction.trained_artifacts_used)
+        self.assertIsNone(prediction.ml_fallback_reason)
+        self.assertIn("trained_gbm_pace", prediction.ml_provider_sources)
+        self.assertGreater(
+            prediction.driver_predictions["russell"].win_prob,
+            prediction.driver_predictions["antonelli"].win_prob,
+        )
+
+    def test_ml_simulator_uses_fitted_model_artifacts_when_supplied(self):
+        class FakePaceModel:
+            def predict(self, frame):
+                return [74.5, 71.5][:len(frame)]
+
+        class FakeDNFModel:
+            def hazard_per_lap(self, frame):
+                return [0.0002, 0.004][:len(frame)]
+
+        features = {
+            **self.features,
+            "ml_simulator_iterations": 300,
+            "ml_trained_inputs": {
+                "pace_model": FakePaceModel(),
+                "dnf_model": FakeDNFModel(),
+                "pace_model_confidence": 0.83,
+                "dnf_model_confidence": 0.79,
+            },
+        }
+        service = F1PredictionService(model_id="ml_simulator_v1")
+        service.load(self.drivers, self.constructors, features, sentiment={})
+
+        prediction = service.predict_race(self.race)
+
+        self.assertEqual("trained_artifacts", prediction.ml_input_source)
+        self.assertTrue(prediction.trained_artifacts_used)
+        self.assertIn("trained_gbm_pace", prediction.ml_provider_sources)
+        self.assertIn("trained_gbm_dnf", prediction.ml_provider_sources)
+        self.assertGreater(
+            prediction.driver_predictions["russell"].win_prob,
+            prediction.driver_predictions["antonelli"].win_prob,
+        )
+
+    def test_ml_simulator_trained_dnf_overlay_changes_dnf_probability(self):
+        features = {
+            **self.features,
+            "ml_simulator_iterations": 500,
+            "ml_trained_inputs": {
+                "drivers": {
+                    "antonelli": {"dnf_hazard_per_lap": 0.0002, "sources": ["trained_gbm_dnf"], "confidence": 0.80},
+                    "russell": {"dnf_hazard_per_lap": 0.04, "sources": ["trained_gbm_dnf"], "confidence": 0.80},
+                }
+            },
+        }
+        service = F1PredictionService(model_id="ml_simulator_v1")
+        service.load(self.drivers, self.constructors, features, sentiment={})
+
+        prediction = service.predict_race(self.race)
+
+        self.assertGreater(
+            prediction.driver_predictions["russell"].dnf_prob,
+            prediction.driver_predictions["antonelli"].dnf_prob,
+        )
+
+    def test_ml_simulator_seed_is_stable_for_same_inputs(self):
+        features = {**self.features, "ml_simulator_iterations": 300}
+        service_a = F1PredictionService(model_id="ml_simulator_v1")
+        service_b = F1PredictionService(model_id="ml_simulator_v1")
+        service_a.load(self.drivers, self.constructors, features, sentiment={})
+        service_b.load(self.drivers, self.constructors, features, sentiment={})
+
+        first = service_a.predict_race(self.race)
+        second = service_b.predict_race(self.race)
+
+        self.assertEqual(
+            {k: v.win_prob for k, v in first.driver_predictions.items()},
+            {k: v.win_prob for k, v in second.driver_predictions.items()},
+        )
 
     def test_championship_leader_does_not_override_race_evidence(self):
         drivers = [

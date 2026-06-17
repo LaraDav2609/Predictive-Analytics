@@ -465,10 +465,7 @@ class F1Client(SportsDataClient):
         if season in self._season_results_cache:
             return self._season_results_cache[season]
         try:
-            resp = await self._client.get(f"/{season}/results.json?limit=2000")
-            resp.raise_for_status()
-            data = resp.json()
-            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+            races = await self._fetch_paginated_races(f"/{season}/results.json")
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch F1 season results for %s: %s", season, e)
             races = []
@@ -489,10 +486,7 @@ class F1Client(SportsDataClient):
         if season in self._season_qualifying_cache:
             return self._season_qualifying_cache[season]
         try:
-            resp = await self._client.get(f"/{season}/qualifying.json?limit=2000")
-            resp.raise_for_status()
-            data = resp.json()
-            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+            races = await self._fetch_paginated_races(f"/{season}/qualifying.json")
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch F1 season qualifying for %s: %s", season, e)
             races = []

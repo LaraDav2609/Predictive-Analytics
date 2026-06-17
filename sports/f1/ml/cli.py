@@ -17,79 +17,68 @@ app = typer.Typer(help="Formula 1 race prediction & trading ML CLI.")
 def backtest(
     season: int = typer.Option(..., help="Season to test on; trains on all earlier seasons."),
     provider: str = typer.Option("synthetic", help="TelemetryProvider name. 'synthetic' or 'fastf1'."),
+    model: str = typer.Option("uniform", help="Model to evaluate: uniform, production_v1, ml_simulator_v1, or all."),
     training_seasons: str = typer.Option(
         "",
         help="Comma-separated training seasons (e.g. '2022,2023'). Default: all seasons before --season.",
     ),
     min_training_races: int = typer.Option(20, help="Skip a test race if fewer training races available."),
+    refit_every_n_races: int = typer.Option(1, help="Refit cadence for walk-forward harness metadata."),
     output_dir: str = typer.Option("artifacts/backtest", help="Directory to write per-race + aggregate CSVs."),
+    artifact_dir: str = typer.Option("artifacts/backtest/ml_simulator_v1", help="Directory for generated ML simulator artifact bundles."),
+    n_iterations: int = typer.Option(400, help="Monte Carlo iterations per race for ml_simulator_v1."),
+    physical: bool = typer.Option(False, "--physical/--no-physical", help="Enable physical simulator mode for ml_simulator_v1."),
+    fastf1_cache: str = typer.Option(".fastf1_cache", help="FastF1 cache directory."),
 ) -> None:
     """Walk-forward backtest over a full season.
 
     Default uses a synthetic provider — quick smoke run without network. Pass
     `--provider fastf1` to use historical telemetry (slow first time).
     """
-    import json
-    import os
-    from datetime import datetime, timezone
-
-    from common.ml.backtest.walk_forward import RaceData, WalkForwardConfig, run as run_walk_forward
+    from sports.f1.ml.backtest.walk_forward import MLBacktestConfig, expand_model_choice, run_backtest
 
     if training_seasons:
         train_seasons = tuple(int(s.strip()) for s in training_seasons.split(",") if s.strip())
     else:
-        train_seasons = tuple(range(season - 3, season + 1))
+        train_seasons = tuple(range(season - 3, season))
 
-    if provider == "synthetic":
-        # Smoke-test path: synthesize a few races so the harness exercises end-to-end
-        # without any external dependencies.
-        races: list[RaceData] = []
-        all_drivers = ["VER", "HAM", "LEC", "NOR", "PIA", "RUS", "ALO", "SAI"]
-        for s in (*train_seasons, season):
-            for r in range(1, 11):
-                races.append(RaceData(
-                    race_id=f"{s}-{r:02d}-SYN",
-                    season=s, round=r,
-                    decision_time=datetime(s, max(1, min(12, r)), 1, 12, 0, tzinfo=timezone.utc),
-                    finish_order=all_drivers.copy(),
-                ))
+    try:
+        models = expand_model_choice(model)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-        class _UniformPredictor:
-            """Equal-probability baseline; useful as a calibration floor."""
-            def predict(self, race: RaceData) -> dict[str, dict[str, float]]:
-                n = len(race.finish_order)
-                return {
-                    "winner": {d: 1.0 / n for d in race.finish_order},
-                    "podium": {d: 3.0 / n for d in race.finish_order},
-                }
-
-        result = run_walk_forward(
-            WalkForwardConfig(
-                test_season=season,
+    try:
+        result = run_backtest(
+            MLBacktestConfig(
+                season=season,
+                provider=provider,
+                models=models,
                 training_seasons=train_seasons,
                 min_training_races=min_training_races,
-            ),
-            races,
-            model_factory=lambda _train: _UniformPredictor(),
+                refit_every_n_races=refit_every_n_races,
+                output_dir=output_dir,
+                artifact_dir=artifact_dir,
+                n_iterations=n_iterations,
+                physical=physical,
+                fastf1_cache=fastf1_cache,
+            )
         )
-    else:
-        raise typer.BadParameter(
-            f"provider '{provider}' is not yet wired into backtest; only 'synthetic' is supported"
-        )
-
-    os.makedirs(output_dir, exist_ok=True)
-    metrics_path = os.path.join(output_dir, f"per_race_metrics_{season}.csv")
-    aggregate_path = os.path.join(output_dir, f"aggregate_metrics_{season}.json")
-    result.per_race_metrics.to_csv(metrics_path, index=False)
-    with open(aggregate_path, "w") as f:
-        json.dump(result.aggregate_metrics, f, indent=2)
+    except Exception as exc:
+        if provider == "fastf1":
+            raise typer.BadParameter(f"fastf1 backtest unavailable: {exc}") from exc
+        raise
 
     typer.echo(f"\nWalk-forward backtest done.")
-    typer.echo(f"  per-race metrics: {metrics_path}")
-    typer.echo(f"  aggregate:        {aggregate_path}")
-    if result.aggregate_metrics:
-        for k, v in result.aggregate_metrics.items():
-            typer.echo(f"    {k:35s} {v:.4f}")
+    for label, path in result.output_paths.items():
+        typer.echo(f"  {label:22s} {path}")
+    typer.echo(f"  best model: {result.model_comparison.get('best_model') or '(none)'}")
+    for model_id, metrics in (result.aggregate_metrics.get("models") or {}).items():
+        typer.echo(
+            f"    {model_id:18s} "
+            f"winner_acc={metrics.get('winner_accuracy', 0.0):.3f} "
+            f"brier={metrics.get('winner_brier', 0.0):.4f} "
+            f"log_loss={metrics.get('winner_log_loss', 0.0):.4f}"
+        )
 
 
 @app.command()
@@ -105,6 +94,8 @@ def predict(
     physical: bool = typer.Option(False, "--physical/--no-physical", help="Enable physical mode (fuel + tire deg + dirty air + pit)"),
     pit_lap: int = typer.Option(0, help="When --physical: pit lap (0 = no pit)"),
     fastf1_cache: str = typer.Option(".fastf1_cache", help="FastF1 cache directory."),
+    artifact_path: str = typer.Option("", help="Optional F1 ML artifact bundle path."),
+    no_models: bool = typer.Option(False, "--no-models", help="Use raw initial-state tables and ignore artifacts."),
 ) -> None:
     """One-shot prediction for a single race.
 
@@ -122,9 +113,13 @@ def predict(
         podium_probabilities,
         winner_probabilities,
     )
+    from sports.f1.ml.artifacts.loader import apply_ml_trained_inputs_to_initial_state, load_ml_trained_inputs, load_simulator_model_bundle
     from sports.f1.ml.simulator.race_sim import PhysicalParams, SimConfig, simulate_race
 
     sim_config_kwargs = {"n_iterations": n_iterations, "seed": 42}
+    artifact_mode = "raw_initial_state"
+    artifact_meta = {"applied_rows": 0, "artifact_id": None, "artifact_version": None, "fallback_reason": None}
+    simulator_models = {}
 
     if provider == "synthetic":
         from sports.f1.ml.providers.synthetic_provider import SyntheticProvider, SyntheticRaceConfig
@@ -214,13 +209,45 @@ def predict(
         sim_config_kwargs.setdefault("physical", PhysicalParams())
         typer.echo(f"physical mode: pit_lap={pit_lap or 'none'}, fuel + tire deg + dirty air enabled")
 
+    if no_models:
+        artifact_mode = "no_models"
+        typer.echo("artifact mode: no-models; using raw initial-state tables")
+    elif artifact_path:
+        trained_inputs = load_ml_trained_inputs(artifact_path, target_race=race)
+        initial_state, artifact_meta = apply_ml_trained_inputs_to_initial_state(initial_state, trained_inputs)
+        model_bundle = load_simulator_model_bundle(artifact_path, target_race=race)
+        simulator_models = {"simulator_model_bundle": model_bundle}
+        if artifact_meta["applied_rows"]:
+            artifact_mode = "artifact"
+            typer.echo(
+                f"artifact mode: {artifact_meta['artifact_id'] or 'artifact'} "
+                f"applied rows={artifact_meta['applied_rows']}"
+            )
+        else:
+            artifact_mode = "artifact_fallback"
+            typer.echo(f"artifact mode: fallback ({artifact_meta.get('fallback_reason') or 'no usable rows'})")
+        model_summary = model_bundle.source_summary()
+        typer.echo(
+            "model contract: "
+            f"{'used' if model_summary.get('ml_model_contract_used') else 'fallback'}; "
+            f"adapters={','.join(model_summary.get('ml_model_adapters_used') or []) or 'none'}; "
+            f"pace={model_summary.get('pace_adapter_source') or '-'}; "
+            f"dnf={model_summary.get('dnf_adapter_source') or '-'}; "
+            f"rating={model_summary.get('rating_adapter_source') or '-'}; "
+            f"fallback={model_summary.get('ml_model_fallback_reason') or '-'}"
+        )
+    else:
+        typer.echo("artifact mode: raw initial-state tables")
+
     typer.echo(f"running {n_iterations:,} MC iterations × {initial_state['total_laps']} laps × {len(drivers)} drivers")
     sim_result = simulate_race(
         race=race_obj,
         initial_state=initial_state,
-        models={},
+        models=simulator_models,
         config=SimConfig(**sim_config_kwargs),
     )
+    if sim_result.metadata.get("ml_model_contract_used"):
+        typer.echo(f"model contract runtime: {sim_result.metadata.get('model_contract_adapter_counts')}")
 
     winner = winner_probabilities(sim_result)
     podium = podium_probabilities(sim_result)
@@ -244,7 +271,7 @@ def predict(
                 market=market,
                 probability=prob,
                 knowable_as_of=now,
-                model_version="thin-slice-v0",
+                model_version=f"thin-slice-v0+{artifact_mode}",
             ))
 
     if publish:
@@ -258,14 +285,123 @@ def predict(
         typer.echo(f"\nemitted {len(records)} records (in-memory; pass --publish to push to redis)")
 
 
+@app.command("train-artifacts")
+def train_artifacts(
+    season_start: int = typer.Option(2026, help="First season included in artifact metadata."),
+    season_end: int = typer.Option(2026, help="Last season included in artifact metadata."),
+    output: str = typer.Option("artifacts/f1_ml/synthetic_artifact.json", help="Artifact JSON output path."),
+    provider: str = typer.Option("synthetic", help="Training data source. Default path is synthetic."),
+    fastf1_cache: str = typer.Option(".fastf1_cache", help="FastF1 cache directory."),
+) -> None:
+    """Build a lightweight F1 ML artifact bundle."""
+    from sports.f1.ml.artifacts.builder import build_fastf1_artifact_bundle, build_synthetic_artifact_bundle
+    from sports.f1.ml.artifacts.store import save_artifact_bundle, validate_artifact_bundle
+
+    provider_key = provider.strip().lower()
+    if provider_key == "synthetic":
+        from sports.f1.ml.providers.synthetic_provider import SyntheticProvider, SyntheticRaceConfig
+
+        synthetic = SyntheticProvider(SyntheticRaceConfig(season=season_end))
+        bundle = build_synthetic_artifact_bundle(
+            synthetic,
+            artifact_id=f"synthetic-{season_start}-{season_end}-ml-simulator",
+            season_start=season_start,
+            season_end=season_end,
+        )
+    elif provider_key == "fastf1":
+        from sports.f1.ml.providers.fastf1_provider import FastF1Provider
+
+        typer.echo("provider: fastf1 (network/cache-backed; first run may be slow)")
+        ff1 = FastF1Provider(cache_dir=fastf1_cache)
+        races = []
+        for season in range(season_start, season_end + 1):
+            races.extend(ff1.list_races(season))
+        if not races:
+            raise typer.BadParameter("FastF1 returned no races for the requested season window")
+        bundle = build_fastf1_artifact_bundle(
+            ff1,
+            training_races=races,
+            artifact_id=f"fastf1-{season_start}-{season_end}-ml-simulator",
+            season_start=season_start,
+            season_end=season_end,
+        )
+    else:
+        raise typer.BadParameter("provider must be 'synthetic' or 'fastf1'")
+
+    validation = validate_artifact_bundle(bundle)
+    result = save_artifact_bundle(output, bundle)
+    typer.echo(f"artifact written: {result['path']}")
+    typer.echo(f"artifact id: {result['artifact_id']}")
+    typer.echo(f"validation: {'ok' if validation.ok else validation.reason}")
+    typer.echo(f"provider: {bundle.source_metadata.get('provider')}")
+    typer.echo(f"coverage: {bundle.source_metadata.get('coverage_counts') or bundle.validation_metrics.get('coverage') or {}}")
+    typer.echo(f"fallback groups: {bundle.source_metadata.get('fallback_groups') or []}")
+
+
 @app.command()
 def live(
-    race: str = typer.Option(..., help="Race id"),
-    redis_host: str = typer.Option("localhost"),
+    race: str = typer.Option(..., help="Race id. Synthetic smoke accepts SYN-2026-01 or synthetic_2026_r01."),
+    season: int | None = typer.Option(None, help="Season override for synthetic/estimated live runs."),
+    round_num: int | None = typer.Option(None, "--round", help="Round override for synthetic/estimated live runs."),
+    session: str = typer.Option("race", help="Session: race, qualifying, sprint."),
+    model_id: str = typer.Option("ml_simulator_v1", help="Model id to label and run."),
+    artifact_path: str = typer.Option("", help="Optional F1 ML artifact bundle path."),
+    source: str = typer.Option("auto", help="auto, openf1, fastf1-recorded, replay, or estimated."),
+    recording_path: str = typer.Option("", help="Optional local FastF1 recording file."),
+    poll_seconds: float = typer.Option(10.0, help="Polling interval for loop mode."),
+    once: bool = typer.Option(False, "--once", help="Run one update and exit."),
+    publish: bool = typer.Option(False, "--publish", help="Publish common OutcomeProbability records to Redis."),
+    redis_url: str = typer.Option("redis://localhost:6379/0", help="Redis URL for --publish."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Use in-memory publisher and print payload."),
+    n_iterations: int = typer.Option(800, help="Monte Carlo iterations per live refresh."),
+    physical: bool = typer.Option(True, "--physical/--no-physical", help="Enable physical simulator layer."),
+    lap: int | None = typer.Option(None, help="Replay lap override for deterministic smoke tests."),
 ) -> None:
     """v2 live mode — stream lap-by-lap updates to Redis."""
-    typer.echo(f"[stub] live race={race}")
-    raise NotImplementedError
+    from sports.f1.ml.live_runner import LiveRunnerConfig, payload_to_json, run_live_loop
+
+    config = LiveRunnerConfig(
+        race=race,
+        season=season,
+        round_num=round_num,
+        session=session,
+        model_id=model_id,
+        artifact_path=artifact_path or None,
+        source=source,
+        recording_path=recording_path or None,
+        poll_seconds=poll_seconds,
+        once=once or dry_run,
+        publish=publish,
+        redis_url=redis_url,
+        dry_run=dry_run,
+        n_iterations=n_iterations,
+        physical=physical,
+        lap=lap,
+    )
+    def _print_tick(result) -> None:
+        payload = result.payload
+        top = (payload.get("probabilities") or [{}])[0]
+        typer.echo(
+            f"{payload.get('generated_at')} "
+            f"race={payload.get('race_id')} source={payload.get('source_mode')} "
+            f"conf={payload.get('confidence')} lap={payload.get('lap')} "
+            f"top={top.get('driver_code')} {float(top.get('win_probability') or 0.0) * 100:.1f}% "
+            f"records={(payload.get('publish_status') or {}).get('records', 0)}"
+        )
+
+    try:
+        results = run_live_loop(config, on_result=None if config.once else _print_tick)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    latest = results[-1].payload if results else {}
+    typer.echo(
+        f"live runner: race={latest.get('race_id') or race} "
+        f"source={latest.get('source_mode')} confidence={latest.get('confidence')} "
+        f"records={(latest.get('publish_status') or {}).get('records', 0)}"
+    )
+    if dry_run or once:
+        typer.echo(payload_to_json(latest))
 
 
 @app.command()

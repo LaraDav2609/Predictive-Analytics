@@ -157,6 +157,28 @@ class F1SessionProjectionTests(unittest.TestCase):
         self.assertGreater(high["components"]["car_trait_modifier"], low["components"]["car_trait_modifier"])
         self.assertIn("high-speed", " ".join(high["components"]["car_trait_explanations"]))
 
+    def test_track_position_tracks_shift_race_projection_toward_grid(self):
+        race, drivers, constructors, features, prediction = self._two_driver_context()
+        qualifying = [
+            {"driver_id": "low", "position": 1, "grid": 1},
+            {"driver_id": "high", "position": 8, "grid": 8},
+        ]
+
+        monaco = build_session_projection(race, drivers, constructors, prediction, features, qualifying, [], [], session="race")
+        monza_race, monza_drivers, monza_constructors, monza_features, monza_prediction = self._two_driver_context(
+            race_name="Italian Grand Prix",
+            circuit="Autodromo Nazionale Monza",
+            country="Italy",
+        )
+        monza = build_session_projection(monza_race, monza_drivers, monza_constructors, monza_prediction, monza_features, qualifying, [], [], session="race")
+        monaco_low = next(row for row in monaco["simulations"] if row["driver_id"] == "low")
+        monza_low = next(row for row in monza["simulations"] if row["driver_id"] == "low")
+        monaco_weights = {row["factor"]: row["weight"] for row in monaco["calculation"]}
+
+        self.assertGreater(monaco_low["components"]["track_position_bias"], 0.9)
+        self.assertEqual(0.0, monza_low["components"]["track_position_bias"])
+        self.assertGreater(monaco_weights["grid_start"], monaco_weights["race_pace"])
+
     def test_projection_exposes_practice_evidence_components_for_dashboard(self):
         race, drivers, constructors, features, prediction = self._two_driver_context()
         features["drivers"]["low"].update({

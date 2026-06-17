@@ -1,7 +1,7 @@
 import unittest
 
 from sports.f1.predictor.probability import build_probability_audit, enrich_probability_payload
-from sports.f1.predictor.probability.calibration import apply_temperature
+from sports.f1.predictor.probability.calibration import apply_temperature, build_calibration_profile
 from sports.f1.predictor.probability.stage import detect_stage
 from sports.f1.predictor.scoring.normalization import prior_score
 from sports.f1.predictor.simulation.monte_carlo import MonteCarloSimulator
@@ -11,17 +11,37 @@ class F1ProbabilityEngineTests(unittest.TestCase):
     def test_stage_detection(self):
         self.assertEqual("pre_weekend", detect_stage({"ok": True}, {}))
         self.assertEqual(
-            "practice_available",
+            "pre_weekend",
             detect_stage({"sessions": [{"name": "Practice 1", "status": "completed"}]}, {}),
         )
         self.assertEqual("post_qualifying", detect_stage({"qualifying": [{"driver_id": "max", "position": 1}]}, {}))
         self.assertEqual(
-            "practice_available",
+            "pre_weekend",
             detect_stage({"context": {"has_qualifying": True, "completed_sessions": 3}}, {}),
         )
         self.assertEqual(
-            "live",
+            "practice_available",
+            detect_stage({}, {"weekend_evidence": {"practice": {"available": True, "coverage_count": 18}}}),
+        )
+        self.assertEqual(
+            "post_qualifying",
+            detect_stage({}, {"weekend_evidence": {"grid": {"available": True, "coverage_count": 20}}}),
+        )
+        self.assertEqual(
+            "pre_weekend",
             detect_stage({"qualifying": []}, {"source_mode": "live", "drivers": [{"driver_id": "max"}]}, live=True),
+        )
+        self.assertEqual(
+            "live",
+            detect_stage(
+                {"qualifying": []},
+                {
+                    "source_mode": "live",
+                    "drivers": [{"driver_id": f"d{i}", "position": i, "lap": 12} for i in range(1, 11)],
+                    "weekend_evidence": {"race_inputs": {"available": True, "coverage_count": 10}},
+                },
+                live=True,
+            ),
         )
         self.assertEqual("completed", detect_stage({"results": [{"driver_id": "max", "position": 1}]}, {}))
 
@@ -55,6 +75,16 @@ class F1ProbabilityEngineTests(unittest.TestCase):
         self.assertIn("calibration_profile", audit)
         self.assertEqual(2, len(audit["probabilities"]))
         self.assertIn("finish_distribution", audit["probabilities"][0])
+
+    def test_tyre_stress_calibration_depends_on_stage(self):
+        track = {"tire_stress": 0.82, "qualifying_importance": 0.62, "overtaking_difficulty": 0.52}
+
+        pre = build_calibration_profile("pre_weekend", track=track, truth={"confidence": 0.6})
+        post = build_calibration_profile("post_qualifying", track=track, truth={"confidence": 0.6})
+
+        self.assertGreater(pre.temperature, 1.18)
+        self.assertLess(post.temperature, 0.95)
+        self.assertTrue(any(item["target"] == "tires" and item["magnitude"] == "-0.03" for item in post.adjustments))
 
     def test_low_evidence_governance_caps_overconfident_top_pick(self):
         simulation = {

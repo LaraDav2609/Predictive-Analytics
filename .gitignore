@@ -24,6 +24,8 @@ data/track_geometry/
 .ruff_cache/
 .mypy_cache/
 artifacts/
+!sports/f1/ml/artifacts/
+!sports/f1/ml/artifacts/*.py
 *.pkl
 *.pt
 *.onnx

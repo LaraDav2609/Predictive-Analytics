@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from sports.f1.predictor.features.practice import apply_practice_pace_adjustments
+from sports.f1.predictor.features.weekend import build_weekend_evidence
 from sports.f1.models.f1 import Constructor, Driver, Race
 
 
@@ -110,6 +112,24 @@ class RaceReplayBuilder:
             qualifying_rows = _qualifying_rows(target)
             _apply_qualifying_features(driver_features, qualifying_rows, drivers)
 
+        race_input_session = _race_input_session_payload(target, drivers) if stage in {"live", "completed"} else {}
+        weekend_evidence = (
+            build_weekend_evidence(
+                race=_race_model(target),
+                drivers=drivers,
+                profile={"ok": True, "qualifying": qualifying_rows, "results": []},
+                openf1_sessions={
+                    **({"fp1": openf1_session} if openf1_session else {}),
+                    **({"race": race_input_session} if race_input_session else {}),
+                },
+                live_state={},
+                session="race",
+                live=stage == "live",
+            )
+            if race_input_session
+            else {}
+        )
+
         constructor_features = {}
         for constructor in constructors:
             key = constructor.name.lower()
@@ -126,9 +146,11 @@ class RaceReplayBuilder:
             "constructors": constructor_features,
             "track_history": _track_history_features(track_results),
             "openf1_session": openf1_session,
+            "weekend_evidence": weekend_evidence,
             "replay_profile": {
                 "qualifying": qualifying_rows,
                 "practice_available": bool(openf1_session),
+                "race_inputs_available": bool(race_input_session),
             },
             "source_coverage": {
                 "current_season_races": len(previous_races),
@@ -136,6 +158,7 @@ class RaceReplayBuilder:
                 "weather_races": 0,
                 "practice_sessions": 1 if openf1_session else 0,
                 "qualifying_sessions": 1 if qualifying_rows else 0,
+                "race_input_sessions": 1 if race_input_session else 0,
             },
             "backtest": {
                 "replay_mode": True,
@@ -144,6 +167,7 @@ class RaceReplayBuilder:
                 "target_race_results_removed": True,
                 "target_qualifying_used": bool(qualifying_rows),
                 "target_practice_used": bool(openf1_session),
+                "target_race_inputs_used": bool(race_input_session),
             },
         }
 
@@ -294,7 +318,7 @@ def _practice_session_payload(raw: dict[str, Any], drivers: list[Driver]) -> dic
     if not rows:
         return {}
     driver_lookup = {driver.id: driver for driver in drivers}
-    laps_by_number = {}
+    rows_by_driver: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         driver_id = row.get("driver_id")
         driver = driver_lookup.get(str(driver_id))
@@ -302,16 +326,36 @@ def _practice_session_payload(raw: dict[str, Any], drivers: list[Driver]) -> dic
             continue
         representative = _lap_seconds(row.get("representative_lap") or row.get("median_lap") or row.get("best_lap"))
         best = _lap_seconds(row.get("best_lap") or row.get("representative_lap"))
-        if not representative:
+        if not representative and not best:
             continue
-        laps_by_number[str(driver.number)] = {
+        rows_by_driver.setdefault(str(driver.number), []).append({
             "driver_number": driver.number,
             "driver_code": driver.code,
             "laps": _safe_int(row.get("laps")) or _safe_int(row.get("lap_count")) or 0,
             "best_lap": best,
             "median_lap": representative,
-            "representative_lap": representative,
-        }
+            "representative_lap": representative or best,
+            "long_run_lap": _lap_seconds(row.get("long_run_lap")),
+            "best_sector_1": _lap_seconds(row.get("best_sector_1")),
+            "best_sector_2": _lap_seconds(row.get("best_sector_2")),
+            "best_sector_3": _lap_seconds(row.get("best_sector_3")),
+            "representative_sector_1": _lap_seconds(row.get("representative_sector_1")),
+            "representative_sector_2": _lap_seconds(row.get("representative_sector_2")),
+            "representative_sector_3": _lap_seconds(row.get("representative_sector_3")),
+            "sector_coverage": _safe_float(row.get("sector_coverage")),
+            "track_evolution_delta": _safe_float(row.get("track_evolution_delta")),
+            "lap_time_stddev": _safe_float(row.get("lap_time_stddev")),
+            "pace_stability": _safe_float(row.get("pace_stability")),
+            "telemetry_quality": _safe_float(row.get("telemetry_quality")),
+            "lap_distribution": row.get("lap_distribution") if isinstance(row.get("lap_distribution"), dict) else {},
+            "raw_laps": _safe_int(row.get("raw_laps")),
+            "usable_laps": _safe_int(row.get("usable_laps")),
+            "compounds": row.get("compounds") or [],
+        })
+    laps_by_number = {
+        number: _aggregate_practice_driver_rows(number, driver_rows)
+        for number, driver_rows in rows_by_driver.items()
+    }
     if not laps_by_number:
         return {}
     return {
@@ -321,6 +365,164 @@ def _practice_session_payload(raw: dict[str, Any], drivers: list[Driver]) -> dic
         "laps": {"drivers": laps_by_number, "missing_data": False},
         "raw_counts": {"laps": sum(1 for _ in laps_by_number)},
     }
+
+
+def _race_input_session_payload(raw: dict[str, Any], drivers: list[Driver]) -> dict[str, Any]:
+    race_inputs = raw.get("RaceInputs") or raw.get("race_inputs") or {}
+    driver_rows = race_inputs.get("drivers") if isinstance(race_inputs, dict) else {}
+    if not isinstance(driver_rows, dict) or not driver_rows:
+        return {}
+    by_number = {
+        str(driver.number): driver
+        for driver in drivers
+        if driver.number is not None
+    }
+    lap_rows = {}
+    position_rows = {}
+    interval_rows = {}
+    stint_rows = {}
+    pit_rows = {}
+    for row in driver_rows.values():
+        if not isinstance(row, dict):
+            continue
+        number = row.get("driver_number")
+        if number is None:
+            driver_id = str(row.get("driver_id") or "")
+            driver = next((item for item in drivers if item.id == driver_id), None)
+            number = driver.number if driver else None
+        if number is None or str(number) not in by_number:
+            continue
+        number_key = str(number)
+        lap_rows[number_key] = {
+            "driver_number": number,
+            "lap": _safe_int(row.get("lap")),
+            "laps": _safe_int(row.get("laps")),
+            "best_lap": _lap_seconds(row.get("best_lap")),
+            "representative_lap": _lap_seconds(row.get("representative_lap")),
+        }
+        position_rows[number_key] = {
+            "driver_number": number,
+            "position": _safe_int(row.get("position")),
+        }
+        interval_rows[number_key] = {
+            "driver_number": number,
+            "gap_to_leader": row.get("gap_to_leader"),
+            "interval": row.get("interval"),
+        }
+        sequence = row.get("compound_sequence") or ([row.get("compound")] if row.get("compound") else [])
+        stint_rows[number_key] = {
+            "driver_number": number,
+            "compound": row.get("compound"),
+            "compounds": sorted({str(item).upper() for item in sequence if item}),
+            "compound_sequence": [str(item).upper() for item in sequence if item],
+            "tyre_age": _safe_int(row.get("tyre_age") or row.get("estimated_tyre_age")),
+            "estimated_tyre_age": _safe_int(row.get("estimated_tyre_age") or row.get("tyre_age")),
+            "stints": _safe_int(row.get("stints")),
+            "avg_stint_laps": _safe_float(row.get("avg_stint_laps")),
+            "max_stint_laps": _safe_int(row.get("max_stint_laps")),
+            "final_stint_laps": _safe_int(row.get("final_stint_laps")),
+            "stint_lap_distribution": row.get("stint_lap_distribution") if isinstance(row.get("stint_lap_distribution"), dict) else {},
+        }
+        pit_rows[number_key] = {
+            "driver_number": number,
+            "pit_stops": _safe_int(row.get("pit_stops")),
+        }
+    if not any([lap_rows, position_rows, interval_rows, stint_rows, pit_rows]):
+        return {}
+    return {
+        "ok": True,
+        "source": race_inputs.get("source") or "backtest_target_race_inputs",
+        "session": "race",
+        "laps": {"drivers": lap_rows, "missing_data": not bool(lap_rows)},
+        "positions": {"drivers": position_rows, "missing_data": not bool(position_rows)},
+        "intervals": {"drivers": interval_rows, "missing_data": not bool(interval_rows)},
+        "stints": {"drivers": stint_rows, "missing_data": not bool(stint_rows)},
+        "pits": {"drivers": pit_rows, "missing_data": not bool(pit_rows)},
+        "weather": race_inputs.get("weather") or {"missing_data": True},
+        "race_control": race_inputs.get("race_control") or {"missing_data": True},
+        "raw_counts": {
+            "laps": len(lap_rows),
+            "positions": len(position_rows),
+            "intervals": len(interval_rows),
+            "stints": len(stint_rows),
+            "pits": len(pit_rows),
+        },
+    }
+
+
+def _aggregate_practice_driver_rows(number: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    first = rows[0]
+    best_values = [_safe_float(row.get("best_lap")) for row in rows if _safe_float(row.get("best_lap")) is not None]
+    representative_values = [
+        _safe_float(row.get("representative_lap") or row.get("median_lap"))
+        for row in rows
+        if _safe_float(row.get("representative_lap") or row.get("median_lap")) is not None
+    ]
+    long_values = [_safe_float(row.get("long_run_lap")) for row in rows if _safe_float(row.get("long_run_lap")) is not None]
+    stability_values = [_safe_float(row.get("pace_stability")) for row in rows if _safe_float(row.get("pace_stability")) is not None]
+    stddev_values = [_safe_float(row.get("lap_time_stddev")) for row in rows if _safe_float(row.get("lap_time_stddev")) is not None]
+    quality_values = [_safe_float(row.get("telemetry_quality")) for row in rows if _safe_float(row.get("telemetry_quality")) is not None]
+    distribution_values = _merge_lap_distributions([row.get("lap_distribution") or {} for row in rows])
+    compounds = sorted({compound for row in rows for compound in (row.get("compounds") or []) if compound})
+    payload = {
+        "driver_number": first.get("driver_number") or _safe_int(number),
+        "driver_code": first.get("driver_code"),
+        "laps": sum(_safe_int(row.get("laps")) or 0 for row in rows),
+        "raw_laps": sum(_safe_int(row.get("raw_laps")) or _safe_int(row.get("laps")) or 0 for row in rows),
+        "usable_laps": sum(_safe_int(row.get("usable_laps")) or _safe_int(row.get("laps")) or 0 for row in rows),
+        "best_lap": min(best_values) if best_values else None,
+        "median_lap": statistics.median(representative_values) if representative_values else (min(best_values) if best_values else None),
+        "representative_lap": statistics.median(representative_values) if representative_values else (min(best_values) if best_values else None),
+        "long_run_lap": statistics.median(long_values) if long_values else None,
+        "lap_time_stddev": statistics.median(stddev_values) if stddev_values else None,
+        "pace_stability": statistics.median(stability_values) if stability_values else None,
+        "telemetry_quality": statistics.median(quality_values) if quality_values else None,
+        "lap_distribution": distribution_values,
+        "compounds": compounds,
+    }
+    for index in (1, 2, 3):
+        best_sector_values = [
+            _safe_float(row.get(f"best_sector_{index}") or row.get(f"representative_sector_{index}"))
+            for row in rows
+            if _safe_float(row.get(f"best_sector_{index}") or row.get(f"representative_sector_{index}")) is not None
+        ]
+        representative_sector_values = [
+            _safe_float(row.get(f"representative_sector_{index}") or row.get(f"best_sector_{index}"))
+            for row in rows
+            if _safe_float(row.get(f"representative_sector_{index}") or row.get(f"best_sector_{index}")) is not None
+        ]
+        payload[f"best_sector_{index}"] = min(best_sector_values) if best_sector_values else None
+        payload[f"representative_sector_{index}"] = (
+            statistics.median(representative_sector_values)
+            if representative_sector_values else payload[f"best_sector_{index}"]
+        )
+    payload["sector_coverage"] = round(
+        sum(1 for index in (1, 2, 3) if payload.get(f"representative_sector_{index}") is not None) / 3.0,
+        4,
+    )
+    return payload
+
+
+def _merge_lap_distributions(distributions: list[dict[str, Any]]) -> dict[str, Any]:
+    clean = [item for item in distributions if isinstance(item, dict) and item.get("sample_size")]
+    if not clean:
+        return {}
+    weighted_keys = ["p10", "p25", "median", "p75", "p90", "spread_p90_p10"]
+    total = sum(_safe_int(item.get("sample_size")) or 0 for item in clean) or len(clean)
+    merged = {"sample_size": total}
+    for key in weighted_keys:
+        pairs = [
+            (float(item.get(key)), _safe_int(item.get("sample_size")) or 1)
+            for item in clean
+            if _safe_float(item.get(key)) is not None
+        ]
+        if pairs:
+            weight_total = sum(weight for _, weight in pairs) or 1
+            merged[key] = round(sum(value * weight for value, weight in pairs) / weight_total, 3)
+    best_values = [_safe_float(item.get("best")) for item in clean if _safe_float(item.get("best")) is not None]
+    if best_values:
+        merged["best"] = round(min(best_values), 3)
+    return merged
 
 
 def _practice_rows(raw: dict[str, Any]) -> list[dict[str, Any]]:

@@ -15,6 +15,7 @@ from sports.f1.predictor.features.sentiment import SentimentFeatureProvider
 from sports.f1.predictor.features.tires import TireFeatureProvider
 from sports.f1.predictor.features.track import TrackFeatureProvider
 from sports.f1.predictor.features.weather import WeatherFeatureProvider
+from sports.f1.predictor.features.weekend import apply_weekend_evidence_adjustments
 from sports.f1.predictor.schemas import FeatureSnapshot
 
 
@@ -41,6 +42,13 @@ class F1FeatureBuilder:
             self._drivers,
             driver_features,
             openf1_session,
+            session_stage=session_stage,
+        )
+        weekend_evidence = self._features.get("weekend_evidence") or {}
+        driver_features = apply_weekend_evidence_adjustments(
+            self._drivers,
+            driver_features,
+            weekend_evidence,
             session_stage=session_stage,
         )
         performance = PerformanceFeatureProvider(
@@ -98,6 +106,7 @@ class F1FeatureBuilder:
             track=track,
             weather=weather,
             tires=tires,
+            weekend_evidence=weekend_evidence,
             car_model=car_model,
             reliability=reliability,
             sentiment=sentiment.get("drivers") or {},

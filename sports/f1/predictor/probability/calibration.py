@@ -75,8 +75,12 @@ def build_calibration_profile(
         temperature -= 0.04
         adjustments.append(_adjustment("overtaking", "-0.04", "High overtaking difficulty reduces late-race volatility."))
     if tire_stress >= 0.70:
-        temperature += 0.04
-        adjustments.append(_adjustment("tires", "+0.04", "High tire stress widens race uncertainty."))
+        if stage in {"post_qualifying", "live"}:
+            temperature -= 0.03
+            adjustments.append(_adjustment("tires", "-0.03", "Backtested tyre-stress races sharpen once grid evidence is available."))
+        else:
+            temperature += 0.03
+            adjustments.append(_adjustment("tires", "+0.03", "High tire stress widens early-weekend uncertainty."))
     if chaos > 0.25:
         temperature += 0.06
         adjustments.append(_adjustment("weather_control", "+0.06", "Weather or race-control chaos increases volatility."))

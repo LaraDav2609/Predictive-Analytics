@@ -35,6 +35,22 @@ class RacePrediction(BaseModel):
     generated_at: datetime | None = None
     data_sources: list[str] = Field(default_factory=list)
     confidence: float | None = None
+    model_id: str | None = None
+    ml_input_source: str | None = None
+    ml_provider_sources: list[str] = Field(default_factory=list)
+    ml_fallback_reason: str | None = None
+    ml_confidence: float | None = None
+    simulator_iterations: int | None = None
+    trained_artifacts_used: bool | None = None
+    evidence_groups_used: list[str] = Field(default_factory=list)
+    ml_artifact_id: str | None = None
+    ml_artifact_version: str | None = None
+    ml_model_contract_used: bool | None = None
+    ml_model_adapters_used: list[str] = Field(default_factory=list)
+    ml_model_fallback_reason: str | None = None
+    pace_adapter_source: str | None = None
+    dnf_adapter_source: str | None = None
+    rating_adapter_source: str | None = None
 
 
 class DriverRacePrediction(BaseModel):

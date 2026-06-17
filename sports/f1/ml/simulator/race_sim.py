@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from sports.f1.ml.common.types import Race
+from sports.f1.ml.simulator.model_contract import coerce_simulator_model_bundle
 
 
 # --- Compound deg defaults (s/lap). Track-tunable; override in PhysicalParams.
@@ -73,6 +74,7 @@ class SimResult:
     safety_car_counts: np.ndarray # shape (n_iterations,); int
     fastest_lap_driver: np.ndarray  # shape (n_iterations,); driver_idx
     driver_codes: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 def simulate_race(
@@ -110,6 +112,10 @@ def simulate_race(
         if config.enable_dnfs
         else np.zeros(n)
     )
+    model_bundle = coerce_simulator_model_bundle(models)
+    model_runtime = model_bundle.runtime if model_bundle is not None else None
+    if model_runtime is not None:
+        pace_means, pace_sigmas = model_runtime.apply_rating_priors(driver_codes, pace_means, pace_sigmas)
 
     # Cumulative race time, best-lap-so-far, active mask per (iteration, driver).
     cum_time = np.zeros((n_iter, n))
@@ -122,28 +128,38 @@ def simulate_race(
             rng, driver_codes, n, n_laps, n_iter,
             pace_means, pace_sigmas, dnf_per_lap,
             cum_time, best_lap, active, sc_counts,
-            initial_state, config,
+            initial_state, config, model_runtime,
         )
 
     # ----- Thin-slice fast path -----
-    for _lap in range(n_laps):
-        lap_times = rng.normal(pace_means, pace_sigmas, size=(n_iter, n))
+    for lap in range(1, n_laps + 1):
+        lap_means = pace_means
+        lap_sigmas = pace_sigmas
+        lap_dnf = dnf_per_lap
+        if model_runtime is not None:
+            state = {"cum_time": cum_time, "active": active, "best_lap": best_lap}
+            features = {"initial_state": initial_state, "race": race, "mode": "thin_slice"}
+            lap_means, lap_sigmas = model_runtime.pace_arrays(driver_codes, lap, pace_means, pace_sigmas, state, features)
+            if config.enable_dnfs:
+                lap_dnf = model_runtime.dnf_array(driver_codes, lap, dnf_per_lap, state, features)
 
-        if config.enable_dnfs and dnf_per_lap.max() > 0:
-            dnf_now = rng.random(size=(n_iter, n)) < dnf_per_lap
+        lap_times = rng.normal(lap_means, lap_sigmas, size=(n_iter, n))
+
+        if config.enable_dnfs and lap_dnf.max() > 0:
+            dnf_now = rng.random(size=(n_iter, n)) < lap_dnf
             active &= ~dnf_now
 
         cum_time = np.where(active, cum_time + lap_times, cum_time)
         best_lap = np.where(active & (lap_times < best_lap), lap_times, best_lap)
 
-    return _build_result(cum_time, best_lap, active, sc_counts, driver_codes)
+    return _build_result(cum_time, best_lap, active, sc_counts, driver_codes, _model_metadata(model_runtime))
 
 
 def _simulate_physical(
     rng, driver_codes, n, n_laps, n_iter,
     pace_means, pace_sigmas, dnf_per_lap,
     cum_time, best_lap, active, sc_counts,
-    initial_state, config,
+    initial_state, config, model_runtime=None,
 ) -> SimResult:
     p = config.physical
 
@@ -188,8 +204,25 @@ def _simulate_physical(
     pace_means_2d = np.broadcast_to(pace_means, (n_iter, n))
 
     for lap in range(1, n_laps + 1):
+        lap_means = pace_means
+        lap_sigmas = pace_sigmas
+        lap_dnf = dnf_per_lap
+        if model_runtime is not None:
+            state = {
+                "cum_time": cum_time,
+                "active": active,
+                "best_lap": best_lap,
+                "tire_age": tire_age,
+                "has_pitted": has_pitted,
+            }
+            features = {"initial_state": initial_state, "race_mode": "physical", "lap": lap}
+            lap_means, lap_sigmas = model_runtime.pace_arrays(driver_codes, lap, pace_means, pace_sigmas, state, features)
+            if config.enable_dnfs:
+                lap_dnf = model_runtime.dnf_array(driver_codes, lap, dnf_per_lap, state, features)
+
         # 1. Sample raw clean-air pace.
-        lap_times = rng.normal(pace_means_2d, pace_sigmas, size=(n_iter, n))
+        pace_means_2d = np.broadcast_to(lap_means, (n_iter, n))
+        lap_times = rng.normal(pace_means_2d, lap_sigmas, size=(n_iter, n))
 
         # 2. Fuel: lap-time inflation from remaining fuel mass.
         fuel_remaining = max(0.0, p.fuel_start_kg - (lap - 1) * p.fuel_burn_per_lap_kg)
@@ -209,8 +242,8 @@ def _simulate_physical(
             has_pitted |= pitting_2d
 
         # 5. DNFs (Bernoulli per iter,driver).
-        if config.enable_dnfs and dnf_per_lap.max() > 0:
-            dnf_now = rng.random(size=(n_iter, n)) < dnf_per_lap
+        if config.enable_dnfs and lap_dnf.max() > 0:
+            dnf_now = rng.random(size=(n_iter, n)) < lap_dnf
             active &= ~dnf_now
 
         # 6. Tentative cum_time (before dirty air; gaps computed against this).
@@ -237,7 +270,7 @@ def _simulate_physical(
         best_lap = np.where(active & (lap_times < best_lap), lap_times, best_lap)
         tire_age = np.where(active, tire_age + 1, tire_age)
 
-    return _build_result(cum_time, best_lap, active, sc_counts, driver_codes)
+    return _build_result(cum_time, best_lap, active, sc_counts, driver_codes, _model_metadata(model_runtime))
 
 
 def _opposite_deg(starting: str, p: PhysicalParams) -> float:
@@ -258,6 +291,7 @@ def _build_result(
     active: np.ndarray,
     sc_counts: np.ndarray,
     driver_codes: list[str],
+    metadata: dict | None = None,
 ) -> SimResult:
     n_iter, n = cum_time.shape
 
@@ -275,4 +309,11 @@ def _build_result(
         safety_car_counts=sc_counts,
         fastest_lap_driver=fastest_lap_driver,
         driver_codes=driver_codes,
+        metadata=metadata or {},
     )
+
+
+def _model_metadata(model_runtime) -> dict:
+    if model_runtime is None:
+        return {"ml_model_contract_used": False}
+    return model_runtime.metadata()

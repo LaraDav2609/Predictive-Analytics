@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -33,6 +34,7 @@ class OpenF1Client:
         self._session_cache: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
         self._trace_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._svg_trace_cache: dict[str, dict[str, Any]] = {}
+        self._last_error: dict[str, Any] | None = None
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -41,11 +43,27 @@ class OpenF1Client:
         session_kind = _session_kind(session)
         session_rows = await self._find_session_candidates(race, session_kind, live)
         if not session_rows:
-            return {"ok": False, "source": "openf1", "reason": "openf1_session_unavailable", "session": session_kind}
+            reason = "openf1_session_unavailable"
+            if self._last_error and self._last_error.get("status_code") == 429:
+                reason = "openf1_rate_limited"
+            return {
+                "ok": False,
+                "source": "openf1",
+                "reason": reason,
+                "session": session_kind,
+                "last_error": self._last_error,
+            }
         row = session_rows[0]
         return {"ok": True, "source": "openf1", "session": session_kind, **row}
 
-    async def get_session_features(self, race: Race, session: str = "race", drivers: list[Driver] | None = None, live: bool = False) -> dict[str, Any]:
+    async def get_session_features(
+        self,
+        race: Race,
+        session: str = "race",
+        drivers: list[Driver] | None = None,
+        live: bool = False,
+        endpoints: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, Any]:
         session_info = await self.get_session_data(race, session, live)
         if not session_info.get("ok"):
             return session_info
@@ -53,19 +71,21 @@ class OpenF1Client:
         if not session_key:
             return {"ok": False, "source": "openf1", "reason": "openf1_session_key_missing"}
 
-        lap_rows = await self.get_laps(int(session_key))
-        position_rows = await self.get_positions(int(session_key))
-        interval_rows = await self.get_intervals(int(session_key))
-        stint_rows = await self.get_stints(int(session_key))
-        pit_rows = await self.get_pits(int(session_key))
-        weather_rows = await self.get_weather(int(session_key))
-        race_control_rows = await self.get_race_control(int(session_key))
+        selected = _feature_endpoints(endpoints)
+        lap_rows = await self.get_laps(int(session_key)) if "laps" in selected else []
+        position_rows = await self.get_positions(int(session_key)) if "positions" in selected else []
+        interval_rows = await self.get_intervals(int(session_key)) if "intervals" in selected else []
+        stint_rows = await self.get_stints(int(session_key)) if "stints" in selected else []
+        pit_rows = await self.get_pits(int(session_key)) if "pits" in selected else []
+        weather_rows = await self.get_weather(int(session_key)) if "weather" in selected else []
+        race_control_rows = await self.get_race_control(int(session_key)) if "race_control" in selected else []
         return {
             "ok": True,
             "source": "openf1",
             "session": session_info.get("session"),
             "session_key": session_key,
             "meeting_key": session_info.get("meeting_key"),
+            "requested_endpoints": sorted(selected),
             "laps": _summarize_laps(lap_rows, drivers or []),
             "positions": _summarize_positions(position_rows, drivers or []),
             "intervals": _summarize_intervals(interval_rows, drivers or []),
@@ -281,18 +301,35 @@ class OpenF1Client:
             return self._session_cache[cache_key]
 
         candidates: list[dict[str, Any]] = []
+        rate_limited = False
         for year in _candidate_years(race.date.year):
+            year_sessions = await self._get_list("/sessions", {"year": year})
+            if self._last_error and self._last_error.get("status_code") == 429:
+                rate_limited = True
+            else:
+                session = _best_year_session_match(year_sessions, race, session_kind, year == race.date.year)
+                if session:
+                    candidates.append(session)
+                    continue
+
             meetings = await self._get_list("/meetings", {"year": year})
+            if self._last_error and self._last_error.get("status_code") == 429:
+                rate_limited = True
+                continue
             meeting = _best_meeting_match(meetings, race, year == race.date.year)
             if not meeting:
                 continue
 
             sessions = await self._get_list("/sessions", {"meeting_key": meeting.get("meeting_key")})
+            if self._last_error and self._last_error.get("status_code") == 429:
+                rate_limited = True
+                continue
             session = _best_session_match(sessions, session_kind)
             if session:
                 candidates.append(session)
 
-        self._session_cache[cache_key] = candidates
+        if candidates or not rate_limited:
+            self._session_cache[cache_key] = candidates
         return candidates
 
     async def _build_trace(self, session_key: int, drivers: list[Driver]) -> dict[str, Any]:
@@ -377,14 +414,48 @@ class OpenF1Client:
         return rows[0] if rows else None
 
     async def _get_list(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        try:
-            response = await self._client.get(path, params=params)
-            response.raise_for_status()
-            data = response.json()
-            return data if isinstance(data, list) else []
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
-            return []
+        for attempt in range(3):
+            try:
+                self._last_error = None
+                response = await self._client.get(path, params=params)
+                response.raise_for_status()
+                data = response.json()
+                return data if isinstance(data, list) else []
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response else None
+                self._last_error = {
+                    "path": path,
+                    "params": params,
+                    "status_code": status_code,
+                    "error": exc.__class__.__name__,
+                }
+                if status_code == 429 and attempt < 2:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+                logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
+                return []
+            except (httpx.HTTPError, ValueError) as exc:
+                self._last_error = {
+                    "path": path,
+                    "params": params,
+                    "status_code": None,
+                    "error": exc.__class__.__name__,
+                }
+                logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
+                return []
+        return []
+
+
+def _feature_endpoints(endpoints: list[str] | tuple[str, ...] | set[str] | None) -> set[str]:
+    allowed = {"laps", "positions", "intervals", "stints", "pits", "weather", "race_control"}
+    if endpoints is None:
+        return set(allowed)
+    selected = {
+        str(item or "").strip().lower().replace("-", "_").replace(" ", "_")
+        for item in endpoints
+    }
+    selected = {item for item in selected if item in allowed}
+    return selected or set(allowed)
 
 
 def _driver_code_by_number(drivers: list[Driver]) -> dict[int, str]:
@@ -413,6 +484,7 @@ def _summarize_laps(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[s
         sector_summary = _sector_summary(laps)
         compounds = sorted({str(row.get("compound")).upper() for row in laps if row.get("compound")})
         long_run_lap = _median(durations) if len(durations) >= 8 else None
+        lap_stddev = _stddev(durations)
         driver_rows[str(number)] = {
             "driver_number": number,
             "driver_code": codes.get(number),
@@ -422,6 +494,9 @@ def _summarize_laps(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[s
             "representative_lap": round(sum(clean) / len(clean), 3),
             "long_run_lap": round(long_run_lap, 3) if long_run_lap else None,
             "track_evolution_delta": round(min(early_laps) - min(late_laps), 3) if early_laps and late_laps else None,
+            "lap_time_stddev": round(lap_stddev, 3),
+            "pace_stability": round(_pace_stability(lap_stddev), 4),
+            "lap_distribution": _lap_distribution(durations),
             "compounds": compounds,
             **sector_summary,
         }
@@ -457,6 +532,52 @@ def _median(values: list[float]) -> float:
     if len(ordered) % 2:
         return ordered[mid]
     return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return math.sqrt(max(0.0, variance))
+
+
+def _pace_stability(lap_stddev: float | None) -> float:
+    if lap_stddev is None:
+        return 0.5
+    return max(0.0, min(1.0, 1.0 - (float(lap_stddev) / 3.0)))
+
+
+def _lap_distribution(values: list[float]) -> dict[str, Any]:
+    clean = sorted(float(value) for value in values if value is not None and value > 0)
+    if not clean:
+        return {}
+    p10 = _percentile(clean, 0.10)
+    p90 = _percentile(clean, 0.90)
+    return {
+        "sample_size": len(clean),
+        "p10": round(p10, 3),
+        "p25": round(_percentile(clean, 0.25), 3),
+        "median": round(_median(clean), 3),
+        "p75": round(_percentile(clean, 0.75), 3),
+        "p90": round(p90, 3),
+        "best": round(clean[0], 3),
+        "spread_p90_p10": round(p90 - p10, 3),
+    }
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    position = max(0.0, min(1.0, quantile)) * (len(values) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return values[lower]
+    weight = position - lower
+    return values[lower] * (1.0 - weight) + values[upper] * weight
 
 
 def _summarize_positions(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict[str, Any]:
@@ -519,17 +640,42 @@ def _summarize_stints(rows: list[dict[str, Any]], drivers: list[Driver]) -> dict
     codes = _driver_code_by_number(drivers)
     return {
         "drivers": {
-            str(number): {
-                "driver_number": number,
-                "driver_code": codes.get(number),
-                "stints": len(stints),
-                "compounds": sorted({str(item.get("compound")) for item in stints if item.get("compound")}),
-                "avg_stint_laps": round(sum(_stint_laps(item) for item in stints) / len(stints), 2) if stints else None,
-            }
+            str(number): _stint_summary(number, codes.get(number), stints)
             for number, stints in by_number.items()
         },
         "source": "openf1_stints",
         "missing_data": not bool(by_number),
+    }
+
+
+def _stint_summary(number: int, code: str | None, stints: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        stints,
+        key=lambda item: (
+            _int_or_none(item.get("stint_number")) or 999,
+            _int_or_none(item.get("lap_start")) or _int_or_none(item.get("lap_starting")) or 999,
+        ),
+    )
+    lengths = [_stint_laps(item) for item in ordered if _stint_laps(item) > 0]
+    compounds = [str(item.get("compound")).upper() for item in ordered if item.get("compound")]
+    tyre_ages = [
+        _int_or_none(item.get("tyre_age_at_start"))
+        or _int_or_none(item.get("tyre_age"))
+        or _int_or_none(item.get("lap_start"))
+        for item in ordered
+    ]
+    tyre_ages = [value for value in tyre_ages if value is not None]
+    return {
+        "driver_number": number,
+        "driver_code": code,
+        "stints": len(ordered),
+        "compounds": sorted(set(compounds)),
+        "compound_sequence": compounds,
+        "avg_stint_laps": round(sum(lengths) / len(lengths), 2) if lengths else None,
+        "max_stint_laps": max(lengths) if lengths else None,
+        "final_stint_laps": lengths[-1] if lengths else None,
+        "stint_lap_distribution": _lap_distribution([float(value) for value in lengths]) if lengths else {},
+        "estimated_tyre_age": max(tyre_ages) if tyre_ages else (lengths[-1] if lengths else None),
     }
 
 
@@ -609,6 +755,13 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _session_kind(session: str) -> str:
     value = (session or "race").lower()
     normalized = value.replace("_", " ").replace("-", " ")
@@ -628,6 +781,28 @@ def _session_kind(session: str) -> str:
 
 
 def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> dict[str, Any] | None:
+    ranked = [item for item in sessions if _session_matches_kind(item, session_kind)]
+    if not ranked and session_kind == "sprint":
+        ranked = [item for item in sessions if "sprint" in str(item.get("session_name") or "").lower()]
+    if ranked and session_kind == "practice":
+        ranked = [item for item in ranked if "practice" in str(item.get("session_name") or "").lower() or str(item.get("session_type") or "").lower() == "practice"]
+    return ranked[-1] if ranked else None
+
+
+def _best_year_session_match(sessions: list[dict[str, Any]], race: Race, session_kind: str, same_year: bool) -> dict[str, Any] | None:
+    if not sessions:
+        return None
+    best: tuple[int, dict[str, Any]] | None = None
+    for session in sessions:
+        if not _session_matches_kind(session, session_kind):
+            continue
+        score = _meeting_like_score(session, race, same_year)
+        if best is None or score > best[0]:
+            best = (score, session)
+    return best[1] if best and best[0] > 0 else None
+
+
+def _session_matches_kind(item: dict[str, Any], session_kind: str) -> bool:
     names = {
         "race": ["race"],
         "qualifying": ["qualifying"],
@@ -637,17 +812,13 @@ def _best_session_match(sessions: list[dict[str, Any]], session_kind: str) -> di
         "practice2": ["practice 2", "free practice 2", "fp2"],
         "practice3": ["practice 3", "free practice 3", "fp3"],
     }.get(session_kind, ["race"])
-    ranked = []
-    for item in sessions:
-        name = str(item.get("session_name") or "").lower()
-        session_type = str(item.get("session_type") or "").lower()
-        if any(token in name or token in session_type for token in names):
-            ranked.append(item)
-    if not ranked and session_kind == "sprint":
-        ranked = [item for item in sessions if "sprint" in str(item.get("session_name") or "").lower()]
-    if ranked and session_kind == "practice":
-        ranked = [item for item in ranked if "practice" in str(item.get("session_name") or "").lower() or str(item.get("session_type") or "").lower() == "practice"]
-    return ranked[-1] if ranked else None
+    name = str(item.get("session_name") or "").lower()
+    session_type = str(item.get("session_type") or "").lower()
+    if session_kind == "race":
+        return session_type == "race" or name == "race"
+    if session_kind == "sprint":
+        return "sprint" in name or "sprint" in session_type
+    return any(token in name or token in session_type for token in names)
 
 
 def _candidate_years(current_year: int) -> list[int]:
@@ -661,23 +832,36 @@ def _best_meeting_match(meetings: list[dict[str, Any]], race: Race, same_year: b
         return None
     track_key = _track_key(race)
     aliases = TRACK_ALIASES.get(track_key, [])
-    race_tokens = _tokens(f"{race.name} {race.circuit} {race.country} {' '.join(aliases)}")
     best: tuple[int, dict[str, Any]] | None = None
     for meeting in meetings:
-        text = f"{meeting.get('meeting_name', '')} {meeting.get('circuit_short_name', '')} {meeting.get('country_name', '')} {meeting.get('location', '')}"
-        normalized_text = _plain(text)
-        score = len(race_tokens.intersection(_tokens(text)))
-        if aliases and any(alias in normalized_text for alias in aliases):
-            score += 30
-        try:
-            meeting_date = datetime.fromisoformat(str(meeting.get("date_start")).replace("Z", "+00:00"))
-            if same_year:
-                score += max(0, 12 - abs((meeting_date.date() - race.date.date()).days))
-        except (TypeError, ValueError):
-            pass
+        score = _meeting_like_score(meeting, race, same_year)
         if best is None or score > best[0]:
             best = (score, meeting)
     return best[1] if best and best[0] > 0 else None
+
+
+def _meeting_like_score(item: dict[str, Any], race: Race, same_year: bool) -> int:
+    track_key = _track_key(race)
+    aliases = TRACK_ALIASES.get(track_key, [])
+    race_tokens = _tokens(f"{race.name} {race.circuit} {race.country} {' '.join(aliases)}")
+    text = " ".join(str(item.get(key) or "") for key in (
+        "meeting_name",
+        "meeting_official_name",
+        "circuit_short_name",
+        "country_name",
+        "location",
+    ))
+    normalized_text = _plain(text)
+    score = len(race_tokens.intersection(_tokens(text)))
+    if aliases and any(alias in normalized_text for alias in aliases):
+        score += 30
+    try:
+        item_date = datetime.fromisoformat(str(item.get("date_start")).replace("Z", "+00:00"))
+        if same_year:
+            score += max(0, 14 - abs((item_date.date() - race.date.date()).days))
+    except (TypeError, ValueError):
+        pass
+    return score
 
 
 def _tokens(value: str) -> set[str]:

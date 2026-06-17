@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sports.f1.predictor.features.weekend import has_real_grid_evidence, has_real_live_evidence, has_real_practice_evidence
+
 VALID_STAGES = {"pre_weekend", "practice_available", "post_qualifying", "live", "completed"}
 
 
@@ -25,14 +27,20 @@ def detect_stage(
     context = profile.get("context") or {}
     status = str((profile.get("race") or {}).get("status") or truth.get("status") or "").lower()
     source_mode = str(truth.get("source_mode") or truth.get("mode") or "").lower()
+    weekend_evidence = truth.get("weekend_evidence") or profile.get("weekend_evidence") or {}
 
     if _has_final_classification(profile, truth) or status in {"completed", "final", "classified"}:
         return "completed"
-    if live and source_mode in {"live", "recent", "recorded", "recorded_confident"} and bool(truth.get("drivers") or truth.get("by_driver_id")):
+    if (
+        live
+        and source_mode in {"live", "recent", "recorded", "recorded_confident"}
+        and bool(truth.get("drivers") or truth.get("by_driver_id"))
+        and (has_real_live_evidence(weekend_evidence) or _usable_live_truth(truth))
+    ):
         return "live"
-    if _has_rows(profile.get("qualifying")) or _has_grid(profile):
+    if has_real_grid_evidence(weekend_evidence) or _has_rows(profile.get("qualifying")) or _has_grid(profile):
         return "post_qualifying"
-    if _has_completed_practice(profile) or int(context.get("completed_sessions") or 0) > 0:
+    if has_real_practice_evidence(weekend_evidence) or bool(context.get("practice_timing_available")):
         return "practice_available"
     return "pre_weekend"
 
@@ -63,3 +71,16 @@ def _has_completed_practice(profile: dict[str, Any]) -> bool:
         if ("practice" in name or name in {"fp1", "fp2", "fp3"}) and status in {"completed", "done", "final"}:
             return True
     return False
+
+
+def _usable_live_truth(truth: dict[str, Any]) -> bool:
+    rows = truth.get("drivers") or []
+    if not isinstance(rows, list) or len(rows) < 10:
+        return False
+    usable = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("position") is not None and (row.get("gap_to_leader") is not None or row.get("interval") is not None or row.get("lap") is not None):
+            usable += 1
+    return usable >= 10

@@ -64,6 +64,9 @@ def apply_practice_pace_adjustments(
             "compounds": compounds,
             "avg_stint_laps": _float(stint.get("avg_stint_laps")),
             "track_evolution_delta": _float(lap_summary.get("track_evolution_delta")),
+            "lap_time_stddev": _float(lap_summary.get("lap_time_stddev")),
+            "pace_stability": _float(lap_summary.get("pace_stability")),
+            "lap_distribution": lap_summary.get("lap_distribution") if isinstance(lap_summary.get("lap_distribution"), dict) else {},
             "sectors": {
                 index: _float(lap_summary.get(f"representative_sector_{index}") or lap_summary.get(f"best_sector_{index}"))
                 for index in (1, 2, 3)
@@ -110,6 +113,16 @@ def apply_practice_pace_adjustments(
         fuel_uncertainty = _fuel_uncertainty(row, session_evolution)
         teammate_delta = row["representative_lap"] - teammate_reference.get(str(row.get("team", "")).lower(), row["representative_lap"])
         teammate_adjustment = clamp01(0.50 - teammate_delta / 3.0)
+        stability = _float(row.get("pace_stability"))
+        if stability is None:
+            stability = _stability_from_stddev(row.get("lap_time_stddev"))
+        distribution_stability = _distribution_stability(row.get("lap_distribution") or {})
+        if distribution_stability is not None:
+            stability = (
+                distribution_stability
+                if stability is None
+                else clamp01(stability * 0.62 + distribution_stability * 0.38)
+            )
         quali_evidence = clamp01(
             0.46 * best_score
             + 0.28 * pace_score
@@ -117,10 +130,11 @@ def apply_practice_pace_adjustments(
             + 0.08 * teammate_adjustment
         )
         race_evidence = clamp01(
-            0.44 * pace_score
-            + 0.34 * long_run_score
+            0.40 * pace_score
+            + 0.32 * long_run_score
             + 0.12 * teammate_adjustment
-            + 0.10 * (1.0 - fuel_uncertainty)
+            + 0.08 * (stability if stability is not None else pace_score)
+            + 0.08 * (1.0 - fuel_uncertainty)
         )
         confidence = clamp01(
             0.20
@@ -128,6 +142,7 @@ def apply_practice_pace_adjustments(
             + min(row["lap_count"], 20) / 20 * 0.24
             + (0.10 if sector_score is not None else 0.0)
             + (0.08 if row.get("long_run_lap") else 0.0)
+            + (0.06 if stability is not None else 0.0)
             + (0.05 if row.get("compounds") else 0.0)
             - fuel_uncertainty * 0.12
         )
@@ -144,6 +159,10 @@ def apply_practice_pace_adjustments(
         feature["practice_sector_scores"] = {str(key): round(value, 4) for key, value in sector_scores.items()}
         feature["practice_teammate_delta"] = round(teammate_delta, 3)
         feature["practice_teammate_score"] = round(teammate_adjustment, 4)
+        feature["practice_pace_stability"] = round(stability, 4) if stability is not None else None
+        feature["practice_lap_time_stddev"] = row.get("lap_time_stddev")
+        feature["practice_lap_distribution"] = row.get("lap_distribution") or {}
+        feature["practice_distribution_stability"] = round(distribution_stability, 4) if distribution_stability is not None else None
         feature["practice_fuel_uncertainty"] = round(fuel_uncertainty, 4)
         feature["practice_track_evolution_delta"] = round(session_evolution, 3) if session_evolution is not None else None
         feature["practice_compounds"] = row.get("compounds") or []
@@ -214,10 +233,35 @@ def _fuel_uncertainty(row: dict[str, Any], session_evolution: float | None) -> f
         uncertainty -= 0.05
     if row.get("long_run_lap"):
         uncertainty -= 0.05
+    stability = _float(row.get("pace_stability"))
+    if stability is None:
+        stability = _stability_from_stddev(row.get("lap_time_stddev"))
+    if stability is not None:
+        uncertainty -= min(0.05, stability * 0.05)
+    distribution_stability = _distribution_stability(row.get("lap_distribution") or {})
+    if distribution_stability is not None:
+        uncertainty -= min(0.04, distribution_stability * 0.04)
     uncertainty += min(0.12, best_gap / 12.0)
     if session_evolution is not None and abs(session_evolution) >= 0.75:
         uncertainty += min(0.10, abs(session_evolution) / 12.0)
     return clamp01(uncertainty)
+
+
+def _distribution_stability(distribution: dict[str, Any]) -> float | None:
+    if not isinstance(distribution, dict):
+        return None
+    sample_size = int(_float(distribution.get("sample_size")) or 0)
+    spread = _float(distribution.get("spread_p90_p10"))
+    if sample_size < 4 or spread is None:
+        return None
+    return clamp01(1.0 - spread / 4.0)
+
+
+def _stability_from_stddev(value: Any) -> float | None:
+    stddev = _float(value)
+    if stddev is None:
+        return None
+    return clamp01(1.0 - stddev / 3.0)
 
 
 def _average(values) -> float | None:

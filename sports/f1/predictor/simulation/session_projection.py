@@ -13,6 +13,7 @@ from sports.f1.predictor.features.reliability import ReliabilityFeatureProvider
 from sports.f1.predictor.features.tires import TireFeatureProvider
 from sports.f1.predictor.features.track import TrackFeatureProvider
 from sports.f1.predictor.features.weather import WeatherFeatureProvider
+from sports.f1.predictor.features.weekend import apply_weekend_evidence_adjustments
 from sports.f1.predictor.live.dynamics import build_live_dynamics
 from sports.f1.predictor.scoring.explanations import sentiment_label, simulation_signals
 from sports.f1.predictor.scoring.normalization import position_score, prior_score, sentiment_factor
@@ -43,6 +44,13 @@ def build_session_projection(
         drivers,
         driver_features,
         openf1_session,
+        session_stage=session,
+    )
+    weekend_evidence = (features or {}).get("weekend_evidence") or {}
+    driver_features = apply_weekend_evidence_adjustments(
+        drivers,
+        driver_features,
+        weekend_evidence,
         session_stage=session,
     )
     race_truth = (features or {}).get("race_truth") or {}
@@ -87,6 +95,7 @@ def build_session_projection(
     constructors_by_name = {constructor.name.lower(): constructor for constructor in constructors}
     max_points = max((driver.points for driver in drivers), default=1.0) or 1.0
     max_constructor_points = max((constructor.points for constructor in constructors), default=1.0) or 1.0
+    track_position_bias = _track_position_bias(track_features)
 
     quali_by_driver = {item.get("driver_id"): item for item in qualifying if item.get("driver_id")}
     sprint_by_driver = {item.get("driver_id"): item for item in sprint if item.get("driver_id")}
@@ -165,27 +174,35 @@ def build_session_projection(
                 + 0.03 * sentiment_factor(sentiment)
             )
         elif live and (results or live_positions):
+            live_grid_weight = 0.10 + 0.04 * track_position_bias
+            live_race_pace_weight = max(0.01, 0.02 - 0.01 * track_position_bias)
             strength = (
                 0.08 * prior_score(prior, drivers)
                 + 0.12 * form
                 + 0.12 * team
-                + 0.10 * race_start_score
+                + live_grid_weight * race_start_score
                 + 0.34 * live_weighted_score
                 + 0.12 * strategy
                 + 0.08 * reliability
-                + 0.02 * race_pace
+                + live_race_pace_weight * race_pace
                 + 0.02 * sentiment_factor(sentiment)
             )
         else:
+            race_grid_weight = 0.13 + 0.09 * track_position_bias
+            race_pace_weight = max(0.10, 0.18 - 0.06 * track_position_bias)
+            strategy_weight = max(0.06, 0.09 - 0.02 * track_position_bias)
+            qualifying_pace_weight = 0.02 * track_position_bias
+            form_weight = max(0.15, 0.18 - 0.03 * track_position_bias)
             strength = (
                 0.10 * prior_score(prior, drivers)
-                + 0.18 * form
+                + form_weight * form
                 + 0.17 * team
-                + 0.13 * race_start_score
+                + race_grid_weight * race_start_score
                 + 0.05 * sprint_score
                 + 0.08 * reliability
-                + 0.18 * race_pace
-                + 0.09 * strategy
+                + race_pace_weight * race_pace
+                + qualifying_pace_weight * qualifying_pace
+                + strategy_weight * strategy
                 + 0.02 * sentiment_factor(sentiment)
             )
         live_strength_multiplier = float(live_dynamic.get("strength_multiplier") or 1.0)
@@ -247,6 +264,7 @@ def build_session_projection(
                 "pit_lane_start": grid_context.get("pit_lane_start"),
                 "grid_modifier": round(float(grid_context.get("modifier") or 1.0), 4),
                 "grid_source": grid_context.get("source"),
+                "track_position_bias": round(track_position_bias, 4),
                 "sprint": round(sprint_score, 4),
                 "live_track_position": round(live_score, 4),
                 "live_confidence": round(source_confidence, 4),
@@ -366,6 +384,7 @@ def build_session_projection(
         "car_model": car_model,
         "car_model_confidence": car_model.get("confidence"),
         "car_model_missing_data": car_model.get("missing_data") or [],
+        "weekend_evidence": weekend_evidence,
         "live_state": _compact_live_state(live_state),
         "live_dynamics": live_dynamics,
         "strategy_state": strategy_state,
@@ -376,7 +395,7 @@ def build_session_projection(
         "fallback_reason": race_truth.get("fallback_reason") if race_truth else (live_state.get("fallback_reason") if live_state else None),
         "missing_groups": race_truth.get("missing_groups") or [],
         "status": _status(session, live, qualifying, sprint, results, bool(live_positions)),
-        "calculation": _calculation_notes(session, live, bool(results or live_positions)),
+        "calculation": _calculation_notes(session, live, bool(results or live_positions), track_position_bias),
         "simulations": rows,
     }
 
@@ -537,6 +556,16 @@ def _grid_context(
     }
 
 
+def _track_position_bias(track: dict[str, Any]) -> float:
+    qualifying = _float_or_default(track.get("qualifying_importance"), 0.58)
+    overtaking = _float_or_default(track.get("overtaking_difficulty"), 0.48)
+    street_bonus = 0.10 if track.get("street_circuit") else 0.0
+    raw = max(qualifying, overtaking) + street_bonus
+    # 0.66 is roughly the point where grid/track-position starts to matter
+    # more than generic race pace; 0.96 maps Monaco-like tracks near 1.0.
+    return max(0.0, min(1.0, (raw - 0.66) / 0.30))
+
+
 def _strategy_state(track: dict[str, Any], tires: dict[str, Any], weather: dict[str, Any], live_dynamics: dict[str, Any]) -> dict[str, Any]:
     tire_stress = float(track.get("tire_stress") or tires.get("degradation_rate") or 0.50)
     pit_loss = float(track.get("pit_loss") or 23.0)
@@ -630,13 +659,46 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-def _calculation_notes(session: str, live: bool, has_results: bool) -> list[dict[str, Any]]:
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value) if value is not None and value != "" else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _calculation_notes(
+    session: str,
+    live: bool,
+    has_results: bool,
+    track_position_bias: float = 0.0,
+) -> list[dict[str, Any]]:
     if session == "qualifying":
         weights = {"prior": 14, "recent_form": 22, "team_pace": 22, "qualifying_if_available": 12, "reliability": 3, "qualifying_pace": 24, "news_sentiment": 3}
     elif session == "sprint":
         weights = {"prior": 12, "recent_form": 20, "team_pace": 18, "grid_start": 15, "reliability": 11, "strategy": 8, "race_pace": 13, "news_sentiment": 3}
     elif live and has_results:
-        weights = {"prior": 8, "recent_form": 12, "team_pace": 12, "grid_start": 10, "live_position": 34, "strategy": 12, "reliability": 8, "race_pace": 2, "news_sentiment": 2}
+        weights = {
+            "prior": 8,
+            "recent_form": 12,
+            "team_pace": 12,
+            "grid_start": round(10 + 4 * track_position_bias, 1),
+            "live_position": 34,
+            "strategy": 12,
+            "reliability": 8,
+            "race_pace": round(max(1, 2 - 1 * track_position_bias), 1),
+            "news_sentiment": 2,
+        }
     else:
-        weights = {"prior": 10, "recent_form": 18, "team_pace": 17, "grid_start": 13, "sprint": 5, "reliability": 8, "race_pace": 18, "strategy": 9, "news_sentiment": 2}
+        weights = {
+            "prior": 10,
+            "recent_form": round(max(15, 18 - 3 * track_position_bias), 1),
+            "team_pace": 17,
+            "grid_start": round(13 + 9 * track_position_bias, 1),
+            "sprint": 5,
+            "reliability": 8,
+            "race_pace": round(max(10, 18 - 6 * track_position_bias), 1),
+            "qualifying_pace": round(2 * track_position_bias, 1),
+            "strategy": round(max(6, 9 - 2 * track_position_bias), 1),
+            "news_sentiment": 2,
+        }
     return [{"factor": key, "weight": value} for key, value in weights.items()]
