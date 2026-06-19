@@ -48,3 +48,18 @@ async def refresh():
     if predictor:
         predictor.load_teams(client.get_teams())
     return {"ok": True, "teams": len(client.get_teams()), "matches": len(client.get_matches())}
+
+
+@router.get("/backtest")
+async def backtest():
+    """Walk-forward, leak-free backtest of the pre-game model over finished matches.
+
+    Returns the dashboard Backtest-tab contract (matches/brier/log_loss/rows) plus
+    richer calibration metrics (reliability buckets, favorite/underdog + BO splits).
+    """
+    from games.csgo.analytics.backtest import run_backtest
+
+    past = client.get_past_matches()
+    teams_by_id = {t.id: t for t in client.get_teams()}
+    result = run_backtest(past, teams_by_id=teams_by_id)
+    return {"ok": True, **result}

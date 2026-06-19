@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 
 from games.csgo.identity import build_aliases
-from games.csgo.models.csgo import CsgoMatch, CsgoTeam
+from games.csgo.models.csgo import CsgoMatch, CsgoTeam, MapScore
 
 
 class CsgoDataClient(ABC):
@@ -31,6 +31,10 @@ class CsgoDataClient(ABC):
 
     @abstractmethod
     def is_available(self) -> bool: ...
+
+    def get_past_matches(self) -> list[CsgoMatch]:
+        """Finished matches with results, for backtesting. Default: none."""
+        return []
 
 
 _SAMPLE_TEAMS = [
@@ -55,6 +59,7 @@ class StubCsgoClient(CsgoDataClient):
             for t in _SAMPLE_TEAMS
         ]
         self._matches = self._build_matches()
+        self._history = self._build_history()
 
     def _build_matches(self) -> list[CsgoMatch]:
         by_id = {t.id: t for t in self._teams}
@@ -75,6 +80,48 @@ class StubCsgoClient(CsgoDataClient):
                 source_ids={"stub": f"{ta.id}-{tb.id}"},
             ))
         return matches
+
+    def _build_history(self) -> list[CsgoMatch]:
+        """Synthetic finished-match history so the backtest endpoint returns real
+        (deterministic) metrics without an external feed. Higher-rated teams win
+        ~2/3 of the time; periodic upsets keep it non-trivial."""
+        teams = list(self._teams)
+        pool = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis"]
+        base = datetime(2026, 2, 1, 17, 0, tzinfo=timezone.utc)
+        out: list[CsgoMatch] = []
+        idx = 0
+        for rnd in range(6):
+            for i in range(len(teams)):
+                for j in range(i + 1, len(teams)):
+                    ta, tb = teams[i], teams[j]
+                    higher, lower = (ta, tb) if ta.rating >= tb.rating else (tb, ta)
+                    upset = (rnd + ta.id + tb.id) % 3 == 0
+                    winner, loser = (lower, higher) if upset else (higher, lower)
+                    ws, ls = 2, idx % 2  # 2-0 or 2-1
+                    maps: list[MapScore] = []
+                    order = 1
+                    for _ in range(ws):
+                        maps.append(MapScore(order=order, map_name=pool[order % len(pool)], winner_id=winner.id)); order += 1
+                    for _ in range(ls):
+                        maps.append(MapScore(order=order, map_name=pool[order % len(pool)], winner_id=loser.id)); order += 1
+                    out.append(CsgoMatch(
+                        id=f"hist-{idx}", team1=ta.name, team2=tb.name,
+                        team1_id=ta.id, team2_id=tb.id,
+                        team1_abbrev=ta.abbreviation, team2_abbrev=tb.abbreviation,
+                        team1_aliases=build_aliases(ta.name, ta.abbreviation),
+                        team2_aliases=build_aliases(tb.name, tb.abbreviation),
+                        date=base + timedelta(days=idx),
+                        event="Stub League", event_slug="stub-league", best_of=3, status="FINAL",
+                        team1_score=ws if winner.id == ta.id else ls,
+                        team2_score=ws if winner.id == tb.id else ls,
+                        winner_id=winner.id, winner_code=winner.abbreviation,
+                        map_scores=maps, source_ids={"stub": f"hist-{idx}"},
+                    ))
+                    idx += 1
+        return out
+
+    def get_past_matches(self) -> list[CsgoMatch]:
+        return list(self._history)
 
     def get_teams(self) -> list[CsgoTeam]:
         return list(self._teams)
