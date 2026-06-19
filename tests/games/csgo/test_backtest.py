@@ -39,3 +39,16 @@ def test_backtest_insufficient_data_is_graceful():
     assert res.get("scored") == 0
     assert res.get("insufficient_data") is True
     assert "matches" not in res                # falsy → tab shows the friendly message
+
+
+def test_backtest_calibration_block():
+    res = run_backtest(StubCsgoClient().get_past_matches(), min_history=10, calibrate=True)
+    cal = res.get("calibration")
+    assert cal is not None
+    # Robust to whether sklearn is installed in the env.
+    if cal.get("available"):
+        assert "raw" in cal and "calibrated" in cal
+        assert cal["holdout_n"] > 0
+        assert cal["raw"]["brier"] >= 0 and cal["calibrated"]["brier"] >= 0
+    else:
+        assert "reason" in cal

@@ -78,17 +78,19 @@ async def refresh():
 
 
 @router.get("/backtest")
-async def backtest():
+async def backtest(calibrate: bool = False):
     """Walk-forward, leak-free backtest of the pre-game model over finished matches.
 
     Returns the dashboard Backtest-tab contract (matches/brier/log_loss/rows) plus
     richer calibration metrics (reliability buckets, favorite/underdog + BO splits).
+    Pass ?calibrate=true to also fit a Platt scaler on an earlier window and report
+    raw-vs-calibrated Brier/log-loss on the held-out remainder.
     """
     from games.csgo.analytics.backtest import run_backtest
 
     past = client.get_past_matches()
     teams_by_id = {t.id: t for t in client.get_teams()}
-    result = run_backtest(past, teams_by_id=teams_by_id)
+    result = run_backtest(past, teams_by_id=teams_by_id, calibrate=calibrate)
     return {"ok": True, **result}
 
 

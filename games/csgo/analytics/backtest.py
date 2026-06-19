@@ -91,6 +91,8 @@ def run_backtest(
     market_prob_for: Callable[[CsgoMatch], Optional[float]] | None = None,
     min_edge_bps: float = 200.0,
     bankroll: float = 1000.0,
+    calibrate: bool = False,
+    calibration_fraction: float = 0.4,
 ) -> dict:
     model = model or CsgoEnsembleModel()
     finished = sorted([m for m in matches if _winner(m) is not None], key=lambda x: x.date)
@@ -139,7 +141,43 @@ def run_backtest(
             map_ratings[k2] = engine.update(mr2, mr1, 1.0 - ms1)
         history.append(m)
 
-    return _metrics(records, bets)
+    result = _metrics(records, bets)
+    if calibrate:
+        result["calibration"] = _calibration_report(records, calibration_fraction)
+    return result
+
+
+def _calibration_report(records: list[BacktestRecord], fraction: float) -> dict:
+    """Fit a Platt scaler on an EARLIER window and score it on the later holdout —
+    leak-free in time. Reports raw vs calibrated Brier/log-loss on the holdout."""
+    n = len(records)
+    if n < 30:
+        return {"available": False, "reason": "need >=30 scored matches"}
+    split = max(10, int(n * fraction))
+    if split >= n - 5:
+        return {"available": False, "reason": "insufficient holdout"}
+    try:
+        from common.ml.calibration import PlattScaler
+    except Exception as exc:  # sklearn not installed
+        return {"available": False, "reason": f"calibrator unavailable: {exc}"}
+
+    train, holdout = records[:split], records[split:]
+    tp = np.array([r.prob for r in train]); ty = np.array([r.actual for r in train])
+    hp = np.array([r.prob for r in holdout]); hy = np.array([r.actual for r in holdout])
+    try:
+        calibrated = PlattScaler().fit(tp, ty).transform(hp)
+    except Exception as exc:
+        return {"available": False, "reason": f"fit failed: {exc}"}
+
+    return {
+        "available": True,
+        "method": "platt",
+        "train_n": len(train),
+        "holdout_n": len(holdout),
+        "raw": {"brier": round(brier_score(hp, hy), 4), "log_loss": round(log_loss(hp, hy), 4)},
+        "calibrated": {"brier": round(brier_score(calibrated, hy), 4),
+                       "log_loss": round(log_loss(calibrated, hy), 4)},
+    }
 
 
 def _metrics(records: list[BacktestRecord], bets: list[dict]) -> dict:
