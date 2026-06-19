@@ -7,6 +7,8 @@
     CSGO_LOOKBACK_DAYS   recent-results window for provisional ratings (default 180)
     CSGO_MAX_TEAMS       cap on teams loaded (default 100)
     CSGO_HISTORY_FILE    path to a CSV/JSON results export (required for localfile)
+    LIQUIPEDIA_API_KEY   free Liquipedia v3 API key (required for liquipedia)
+    LIQUIPEDIA_USER_AGENT  descriptive UA w/ contact, per Liquipedia's terms
 
 Falls back to the in-memory stub when the provider is unset/unknown or when
 ``pandascore`` is selected without a token, so the service always boots.
@@ -61,6 +63,27 @@ def build_csgo_client() -> CsgoDataClient:
 
         logger.info("CSGO data provider: local history file (%s)", path)
         return LocalHistoryCsgoClient(path)
+
+    if provider == "liquipedia":
+        key = os.getenv("LIQUIPEDIA_API_KEY", "").strip()
+        if not key:
+            logger.warning("CSGO_DATA_PROVIDER=liquipedia but LIQUIPEDIA_API_KEY is unset — using stub.")
+            return StubCsgoClient()
+        from games.csgo.data.liquipedia_client import LiquipediaCsgoClient
+
+        try:
+            lookback = int(os.getenv("CSGO_LOOKBACK_DAYS", "180"))
+        except ValueError:
+            lookback = 180
+        logger.info("CSGO data provider: Liquipedia")
+        return LiquipediaCsgoClient(
+            key,
+            user_agent=os.getenv("LIQUIPEDIA_USER_AGENT",
+                                 "PredictiveAnalytics-CSGO/1.0 (set LIQUIPEDIA_USER_AGENT with contact)"),
+            base_url=os.getenv("LIQUIPEDIA_BASE_URL", "https://api.liquipedia.net/api/v3"),
+            wiki=os.getenv("CSGO_LIQUIPEDIA_WIKI", "counterstrike"),
+            lookback_days=lookback,
+        )
 
     if provider not in ("stub", ""):
         logger.warning("Unknown CSGO_DATA_PROVIDER=%r — using stub.", provider)
