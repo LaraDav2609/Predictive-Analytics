@@ -1,0 +1,232 @@
+"""PandaScore-backed CSGO/CS2 data client.
+
+Implements the :class:`CsgoDataClient` contract against the PandaScore esports
+API (https://developers.pandascore.co). One ``refresh()`` pulls real teams plus
+upcoming / running / recent matches, and derives a provisional global Elo rating
+for every team by replaying recent results — so the baseline predictor produces
+real probabilities immediately. Phase 1 refines these into per-map ratings.
+
+Auth: a PandaScore bearer token (``PANDASCORE_TOKEN``). Without it, the factory
+falls back to the in-memory stub so the dashboard still boots.
+
+The HTTP client is injectable so tests can drive it with an ``httpx.MockTransport``
+and stay off the network.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+import httpx
+
+from games.csgo.data.csgo_client import CsgoDataClient
+from games.csgo.models.csgo import CsgoMatch, CsgoTeam
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BASE_URL = "https://api.pandascore.co"
+
+# PandaScore match.status -> our CsgoMatch.status
+_STATUS_MAP = {
+    "not_started": "SCHEDULED",
+    "running": "LIVE",
+    "finished": "FINAL",
+    "canceled": "FINAL",
+    "postponed": "SCHEDULED",
+}
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        # PandaScore returns ISO-8601 like "2026-06-08T17:00:00Z".
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _acronym(name: str, acronym: str | None) -> str:
+    if acronym:
+        return acronym.upper()
+    return (name or "")[:4].upper()
+
+
+class PandaScoreCsgoClient(CsgoDataClient):
+    """Live CSGO/CS2 data from PandaScore."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        game: str = "csgo",
+        client: httpx.AsyncClient | None = None,
+        lookback_days: int = 180,
+        max_teams: int = 100,
+        k_factor: float = 30.0,
+        page_size: int = 100,
+        max_pages: int = 10,
+        timeout: float = 15.0,
+    ) -> None:
+        self._token = token
+        self._base_url = base_url.rstrip("/")
+        self._game = game.strip("/")
+        self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        self._owns_client = client is None
+        self._lookback_days = lookback_days
+        self._max_teams = max_teams
+        self._k = k_factor
+        self._page_size = page_size
+        self._max_pages = max_pages
+
+        self._teams: list[CsgoTeam] = []
+        self._matches: list[CsgoMatch] = []
+        self._past: list[CsgoMatch] = []
+        self._loaded = False
+
+    # ── HTTP plumbing ────────────────────────────────────────────────────────
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
+
+    async def _get(self, path: str, params: dict | None = None) -> list[dict]:
+        resp = await self._client.get(self._base_url + path, params=params or {}, headers=self._headers())
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def _paged(self, path: str, params: dict | None = None) -> list[dict]:
+        out: list[dict] = []
+        base = dict(params or {})
+        for page in range(1, self._max_pages + 1):
+            chunk = await self._get(path, {**base, "page[size]": self._page_size, "page[number]": page})
+            if not chunk:
+                break
+            out.extend(chunk)
+            if len(chunk) < self._page_size or len(out) >= self._max_teams * 50:
+                break
+        return out
+
+    # ── Mapping ──────────────────────────────────────────────────────────────
+    def _map_team(self, raw: dict) -> CsgoTeam | None:
+        tid = raw.get("id")
+        name = raw.get("name")
+        if tid is None or not name:
+            return None
+        return CsgoTeam(
+            id=int(tid),
+            name=name,
+            abbreviation=_acronym(name, raw.get("acronym")),
+            region=raw.get("location") or "",
+            world_rank=None,
+            rating=1500.0,
+        )
+
+    def _map_match(self, raw: dict) -> CsgoMatch | None:
+        opponents = [o.get("opponent") or {} for o in (raw.get("opponents") or [])]
+        opponents = [o for o in opponents if o.get("id") is not None]
+        if len(opponents) < 2:
+            return None  # TBD / single-side entries are not predictable
+        o1, o2 = opponents[0], opponents[1]
+
+        results = {r.get("team_id"): r.get("score") for r in (raw.get("results") or [])}
+        s1, s2 = results.get(o1.get("id")), results.get(o2.get("id"))
+
+        when = _parse_dt(raw.get("begin_at")) or _parse_dt(raw.get("scheduled_at"))
+        if when is None:
+            return None
+
+        n_games = raw.get("number_of_games")
+        best_of = int(n_games) if isinstance(n_games, int) and n_games > 0 else 3
+
+        serie = raw.get("serie") or {}
+        tournament = raw.get("tournament") or {}
+        league = raw.get("league") or {}
+        event = serie.get("full_name") or tournament.get("name") or league.get("name")
+
+        return CsgoMatch(
+            id=str(raw.get("id")),
+            team1=o1.get("name") or "TBD",
+            team2=o2.get("name") or "TBD",
+            team1_id=int(o1.get("id")),
+            team2_id=int(o2.get("id")),
+            team1_abbrev=_acronym(o1.get("name") or "", o1.get("acronym")),
+            team2_abbrev=_acronym(o2.get("name") or "", o2.get("acronym")),
+            date=when,
+            event=event,
+            best_of=best_of,
+            status=_STATUS_MAP.get(str(raw.get("status")), "SCHEDULED"),
+            team1_score=int(s1) if isinstance(s1, int) else None,
+            team2_score=int(s2) if isinstance(s2, int) else None,
+        )
+
+    # ── Provisional Elo from recent results (refined per-map in Phase 1) ──────
+    def _compute_ratings(self, past: list[CsgoMatch]) -> dict[int, float]:
+        ratings: dict[int, float] = {}
+        for m in sorted(past, key=lambda x: x.date):
+            if m.team1_score is None or m.team2_score is None:
+                continue
+            ra = ratings.get(m.team1_id, 1500.0)
+            rb = ratings.get(m.team2_id, 1500.0)
+            ea = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
+            if m.team1_score > m.team2_score:
+                sa = 1.0
+            elif m.team1_score < m.team2_score:
+                sa = 0.0
+            else:
+                sa = 0.5
+            ratings[m.team1_id] = ra + self._k * (sa - ea)
+            ratings[m.team2_id] = rb + self._k * ((1.0 - sa) - (1.0 - ea))
+        return ratings
+
+    # ── CsgoDataClient contract ──────────────────────────────────────────────
+    async def refresh(self) -> None:
+        try:
+            teams_raw = await self._paged(f"/{self._game}/teams", {"sort": "name"})
+            upcoming_raw = await self._paged(f"/{self._game}/matches/upcoming", {"sort": "begin_at"})
+            running_raw = await self._get(f"/{self._game}/matches/running", {"page[size]": self._page_size})
+            past_raw = await self._paged(f"/{self._game}/matches/past", {"sort": "-begin_at"})
+
+            teams = [t for t in (self._map_team(r) for r in teams_raw) if t][: self._max_teams]
+            upcoming = [m for m in (self._map_match(r) for r in upcoming_raw) if m]
+            running = [m for m in (self._map_match(r) for r in running_raw) if m]
+            past = [m for m in (self._map_match(r) for r in past_raw) if m]
+
+            # Derive provisional ratings from results and stamp them onto teams.
+            ratings = self._compute_ratings(past)
+            by_id = {t.id: t for t in teams}
+            for tid, rating in ratings.items():
+                if tid in by_id:
+                    by_id[tid].rating = round(rating, 1)
+
+            self._teams = teams
+            self._matches = running + upcoming  # live first, then scheduled
+            self._past = past
+            self._loaded = True
+            logger.info(
+                "PandaScore CSGO: %d teams, %d upcoming, %d live, %d past results",
+                len(teams), len(upcoming), len(running), len(past),
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("PandaScore CSGO refresh failed (keeping prior data): %s", exc)
+
+    def get_teams(self) -> list[CsgoTeam]:
+        return list(self._teams)
+
+    def get_matches(self) -> list[CsgoMatch]:
+        return list(self._matches)
+
+    def get_match(self, match_id: str) -> CsgoMatch | None:
+        return next((m for m in (self._matches + self._past) if m.id == match_id), None)
+
+    def get_past_matches(self) -> list[CsgoMatch]:
+        """Recent finished matches with scores — training data for Phase 1."""
+        return list(self._past)
+
+    def is_available(self) -> bool:
+        return bool(self._token) and (self._loaded or not self._teams)
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
