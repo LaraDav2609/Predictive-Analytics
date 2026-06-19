@@ -24,6 +24,20 @@ class CsgoTeam(BaseModel):
     roster: list[int] = []           # current player ids (stand-in detection later)
 
 
+class CsgoPlayer(BaseModel):
+    id: int
+    name: str                        # in-game nickname (e.g. "s1mple")
+    real_name: str = ""
+    nationality: str = ""
+    role: str = ""                   # rifler / awper / igl / support / entry
+    team_id: Optional[int] = None
+    rating: Optional[float] = None   # HLTV 2.x rating, when available
+    kd: Optional[float] = None
+    adr: Optional[float] = None
+    kast: Optional[float] = None
+    maps_played: Optional[int] = None
+
+
 class CsgoPrediction(BaseModel):
     team1_win_prob: float
     team2_win_prob: float

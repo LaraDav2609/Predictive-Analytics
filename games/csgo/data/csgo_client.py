@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 
 from games.csgo.identity import build_aliases
-from games.csgo.models.csgo import CsgoMatch, CsgoTeam, MapScore
+from games.csgo.models.csgo import CsgoMatch, CsgoPlayer, CsgoTeam, MapScore
 
 
 class CsgoDataClient(ABC):
@@ -36,6 +36,15 @@ class CsgoDataClient(ABC):
         """Finished matches with results, for backtesting. Default: none."""
         return []
 
+    def get_team(self, team_id: int) -> CsgoTeam | None:
+        return next((t for t in self.get_teams() if t.id == team_id), None)
+
+    def get_players(self, team_id: int) -> list[CsgoPlayer]:
+        return []
+
+    def get_player(self, player_id: int) -> CsgoPlayer | None:
+        return None
+
 
 _SAMPLE_TEAMS = [
     CsgoTeam(id=1, name="Natus Vincere", abbreviation="NAVI", region="EU", world_rank=1, rating=1920.0),
@@ -58,8 +67,37 @@ class StubCsgoClient(CsgoDataClient):
             })
             for t in _SAMPLE_TEAMS
         ]
+        self._players, self._team_players = self._build_players()
         self._matches = self._build_matches()
         self._history = self._build_history()
+
+    def _build_players(self) -> tuple[dict[int, CsgoPlayer], dict[int, list[int]]]:
+        roles = ["awper", "igl", "rifler", "entry", "support"]
+        players: dict[int, CsgoPlayer] = {}
+        team_players: dict[int, list[int]] = {}
+        new_teams: list[CsgoTeam] = []
+        for t in self._teams:
+            ids: list[int] = []
+            for i, role in enumerate(roles, start=1):
+                pid = t.id * 100 + i
+                ids.append(pid)
+                players[pid] = CsgoPlayer(
+                    id=pid, name=f"{t.abbreviation.lower()}_p{i}", real_name=f"Player {i}",
+                    nationality=t.region, role=role, team_id=t.id,
+                    rating=round(1.20 - 0.02 * i + (t.rating - 1850) / 1000.0, 2),
+                    kd=round(1.15 - 0.03 * i, 2), adr=round(85.0 - 2 * i, 1),
+                    kast=round(74.0 - i, 1), maps_played=200 - 5 * i,
+                )
+            team_players[t.id] = ids
+            new_teams.append(t.model_copy(update={"roster": ids}))
+        self._teams = new_teams
+        return players, team_players
+
+    def get_players(self, team_id: int) -> list[CsgoPlayer]:
+        return [self._players[pid] for pid in self._team_players.get(team_id, []) if pid in self._players]
+
+    def get_player(self, player_id: int) -> CsgoPlayer | None:
+        return self._players.get(player_id)
 
     def _build_matches(self) -> list[CsgoMatch]:
         by_id = {t.id: t for t in self._teams}

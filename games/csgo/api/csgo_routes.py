@@ -44,6 +44,28 @@ async def get_match(match_id: str):
     return {"ok": True, "match": matches[0].model_dump(mode="json")}
 
 
+@router.get("/teams/{team_id}")
+async def get_team(team_id: int):
+    team = client.get_team(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail=f"Team {team_id} not found")
+    return {"ok": True, "team": team.model_dump(),
+            "players": [p.model_dump() for p in client.get_players(team_id)]}
+
+
+@router.get("/teams/{team_id}/players")
+async def get_team_players(team_id: int):
+    return {"ok": True, "players": [p.model_dump() for p in client.get_players(team_id)]}
+
+
+@router.get("/players/{player_id}")
+async def get_player(player_id: int):
+    player = client.get_player(player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail=f"Player {player_id} not found")
+    return {"ok": True, "player": player.model_dump()}
+
+
 @router.post("/refresh")
 async def refresh():
     await client.refresh()

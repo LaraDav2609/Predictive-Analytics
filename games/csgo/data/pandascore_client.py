@@ -23,7 +23,7 @@ import httpx
 from games.csgo.analytics.ratings import rate_matches
 from games.csgo.data.csgo_client import CsgoDataClient
 from games.csgo.identity import build_aliases
-from games.csgo.models.csgo import CsgoMatch, CsgoTeam, MapScore
+from games.csgo.models.csgo import CsgoMatch, CsgoPlayer, CsgoTeam, MapScore
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,17 @@ def _roster_ids(players) -> list[int]:
         if pid is not None:
             out.append(int(pid))
     return out
+
+
+def _map_player(raw: dict, team_id: int) -> CsgoPlayer | None:
+    pid = raw.get("id")
+    if pid is None:
+        return None
+    real = " ".join(x for x in (raw.get("first_name"), raw.get("last_name")) if x)
+    return CsgoPlayer(
+        id=int(pid), name=raw.get("name") or "", real_name=real,
+        nationality=raw.get("nationality") or "", role=raw.get("role") or "", team_id=team_id,
+    )
 
 
 def _map_games(games, team1_id, team2_id) -> list[MapScore]:
@@ -120,6 +131,8 @@ class PandaScoreCsgoClient(CsgoDataClient):
         self._teams: list[CsgoTeam] = []
         self._matches: list[CsgoMatch] = []
         self._past: list[CsgoMatch] = []
+        self._players: dict[int, CsgoPlayer] = {}
+        self._team_players: dict[int, list[int]] = {}
         self._loaded = False
 
     # ── HTTP plumbing ────────────────────────────────────────────────────────
@@ -245,9 +258,26 @@ class PandaScoreCsgoClient(CsgoDataClient):
                     by_id[tid].rating = round(rating.rating, 1)
                     by_id[tid].rating_deviation = round(rating.rd, 1)
 
+            players: dict[int, CsgoPlayer] = {}
+            team_players: dict[int, list[int]] = {}
+            for raw in teams_raw:
+                tid = raw.get("id")
+                if tid is None:
+                    continue
+                ids: list[int] = []
+                for p in raw.get("players") or []:
+                    cp = _map_player(p, int(tid))
+                    if cp:
+                        players[cp.id] = cp
+                        ids.append(cp.id)
+                if ids:
+                    team_players[int(tid)] = ids
+
             self._teams = teams
             self._matches = running + upcoming  # live first, then scheduled
             self._past = past
+            self._players = players
+            self._team_players = team_players
             self._loaded = True
             logger.info(
                 "PandaScore CSGO: %d teams, %d upcoming, %d live, %d past results",
@@ -268,6 +298,12 @@ class PandaScoreCsgoClient(CsgoDataClient):
     def get_past_matches(self) -> list[CsgoMatch]:
         """Recent finished matches with scores — training data for Phase 1."""
         return list(self._past)
+
+    def get_players(self, team_id: int) -> list[CsgoPlayer]:
+        return [self._players[pid] for pid in self._team_players.get(team_id, []) if pid in self._players]
+
+    def get_player(self, player_id: int) -> CsgoPlayer | None:
+        return self._players.get(player_id)
 
     def is_available(self) -> bool:
         return bool(self._token) and (self._loaded or not self._teams)
