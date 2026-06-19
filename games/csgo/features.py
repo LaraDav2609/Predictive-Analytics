@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from math import comb
 from typing import Optional
 
-from games.csgo.analytics.ratings import Rating
+from games.csgo.analytics.ratings import Rating, get_map_rating, win_probability
 from games.csgo.models.csgo import CsgoMatch, CsgoTeam
 
 ACTIVE_DUTY_MAPS = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Vertigo"]
@@ -47,6 +47,7 @@ class MatchFeatures:
     best_of: int = 3
     format_amplification: float = 0.6        # how a 60%/map team scores in this format
     likely_maps: list[str] = field(default_factory=list)
+    map_edge: float = 0.0                    # Glicko per-map advantage over likely maps (team1)
     event_tier: str = "B"
     event_tier_weight: float = 0.65
     h2h_team1_winrate: Optional[float] = None
@@ -85,10 +86,23 @@ class FeatureExtractor:
         past_matches: list[CsgoMatch],
         ratings: dict[int, Rating] | None = None,
         teams_by_id: dict[int, CsgoTeam] | None = None,
+        map_ratings: dict | None = None,
     ) -> None:
         self._past = past_matches or []
         self._ratings = ratings or {}
         self._teams = teams_by_id or {}
+        self._map_ratings = map_ratings or {}
+
+    def _map_edge(self, t1: int, t2: int, maps: list[str], fb1: float, fb2: float) -> float:
+        """Mean Glicko per-map win-prob edge for team1 over the likely map pool, in [-0.5, 0.5]."""
+        if not self._map_ratings or not maps:
+            return 0.0
+        edges = []
+        for mp in maps:
+            r1, rd1 = get_map_rating(self._map_ratings, t1, mp, fb1)
+            r2, rd2 = get_map_rating(self._map_ratings, t2, mp, fb2)
+            edges.append(win_probability(r1, rd1, r2, rd2) - 0.5)
+        return round(sum(edges) / len(edges), 4) if edges else 0.0
 
     # ── per-team features ────────────────────────────────────────────────────
     def _recent_form(self, team_id: int, n: int = 10) -> float:
@@ -172,6 +186,7 @@ class FeatureExtractor:
         f2 = self._team_features(match.team2_id, match.team2_roster)
         tier, tier_w = classify_event_tier(match.event)
         h2h_wr, h2h_n = self._h2h(match.team1_id, match.team2_id)
+        likely = self._likely_maps(f1, f2, match.best_of)
         return MatchFeatures(
             match_id=match.id,
             team1=f1,
@@ -180,7 +195,8 @@ class FeatureExtractor:
             form_diff=round(f1.recent_form - f2.recent_form, 4),
             best_of=match.best_of,
             format_amplification=round(_series_win_prob(0.6, match.best_of), 4),
-            likely_maps=self._likely_maps(f1, f2, match.best_of),
+            likely_maps=likely,
+            map_edge=self._map_edge(match.team1_id, match.team2_id, likely, f1.rating, f2.rating),
             event_tier=tier,
             event_tier_weight=tier_w,
             h2h_team1_winrate=h2h_wr,

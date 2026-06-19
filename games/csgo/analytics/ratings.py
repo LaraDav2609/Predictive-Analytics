@@ -140,3 +140,35 @@ def confidence_from_rd(rd1: float, rd2: float, rd_max: float = _DEFAULT_RD) -> f
     mean_rd = (rd1 + rd2) / 2.0
     certainty = 1.0 - max(0.0, min(1.0, mean_rd / rd_max))
     return round(0.5 + 0.45 * certainty, 3)
+
+
+def rate_maps(matches) -> dict[tuple[int, str], Rating]:
+    """Per-(team, map) Glicko ratings from per-map results, in chronological order.
+
+    CS2 strength is highly map-dependent, so a team carries a separate rating for
+    each active-duty map. Replays every finished map (from each match's map_scores).
+    """
+    engine = Glicko2()
+    ratings: dict[tuple[int, str], Rating] = {}
+    events: list[tuple] = []
+    for m in matches:
+        for ms in getattr(m, "map_scores", None) or []:
+            if ms.winner_id is None or not ms.map_name:
+                continue
+            events.append((m.date, m.team1_id, m.team2_id, ms.map_name, ms.winner_id))
+    events.sort(key=lambda e: e[0])
+
+    for _, t1, t2, map_name, winner in events:
+        k1, k2 = (t1, map_name), (t2, map_name)
+        r1 = ratings.get(k1, Rating())
+        r2 = ratings.get(k2, Rating())
+        s1 = 1.0 if winner == t1 else 0.0
+        ratings[k1] = engine.update(r1, r2, s1)
+        ratings[k2] = engine.update(r2, r1, 1.0 - s1)
+    return ratings
+
+
+def get_map_rating(map_ratings, team_id: int, map_name: str, fallback: float) -> tuple[float, float]:
+    """A team's (rating, rd) on a map; falls back to its global rating with high RD."""
+    r = map_ratings.get((team_id, map_name)) if map_ratings else None
+    return (r.rating, r.rd) if r else (fallback, _DEFAULT_RD)

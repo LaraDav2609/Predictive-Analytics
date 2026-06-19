@@ -97,6 +97,7 @@ def run_backtest(
 
     engine = Glicko2()
     ratings: dict[int, Rating] = {}
+    map_ratings: dict[tuple[int, str], Rating] = {}
     history: list[CsgoMatch] = []
     records: list[BacktestRecord] = []
     bets: list[dict] = []
@@ -104,7 +105,8 @@ def run_backtest(
     for m in finished:
         # Predict using ONLY prior information.
         if len(history) >= min_history and m.team1_id in ratings and m.team2_id in ratings:
-            feats = FeatureExtractor(history, dict(ratings), teams_by_id or {}).extract(m)
+            feats = FeatureExtractor(history, dict(ratings), teams_by_id or {},
+                                     map_ratings=dict(map_ratings)).extract(m)
             out = model.predict(feats)
             actual = 1.0 if _winner(m) == m.team1_id else 0.0
             records.append(BacktestRecord(
@@ -126,6 +128,15 @@ def run_backtest(
         s1 = 1.0 if _winner(m) == m.team1_id else 0.0
         ratings[m.team1_id] = engine.update(r1, r2, s1)
         ratings[m.team2_id] = engine.update(r2, r1, 1.0 - s1)
+        for ms in m.map_scores:
+            if ms.winner_id is None or not ms.map_name:
+                continue
+            k1, k2 = (m.team1_id, ms.map_name), (m.team2_id, ms.map_name)
+            mr1 = map_ratings.get(k1, Rating())
+            mr2 = map_ratings.get(k2, Rating())
+            ms1 = 1.0 if ms.winner_id == m.team1_id else 0.0
+            map_ratings[k1] = engine.update(mr1, mr2, ms1)
+            map_ratings[k2] = engine.update(mr2, mr1, 1.0 - ms1)
         history.append(m)
 
     return _metrics(records, bets)

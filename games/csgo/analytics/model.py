@@ -28,6 +28,7 @@ class EnsembleWeights:
     """Contributions in logit units (modest, hand-set v1; tune/fit later)."""
     form: float = 0.8
     map_adv: float = 1.0
+    map_glicko: float = 1.2
     roster: float = 1.2
     h2h: float = 0.3
 
@@ -76,6 +77,7 @@ class CsgoEnsembleModel:
             "rating_diff": f.rating_diff,
             "form_diff": f.form_diff,
             "map_adv": _avg_map_adv(f),
+            "map_edge": f.map_edge,
             "roster_diff": f.team1.roster_stability - f.team2.roster_stability,
             "stand_ins": float(f.team1.stand_in_count + f.team2.stand_in_count),
             "h2h_centered": (0.0 if f.h2h_team1_winrate is None else (f.h2h_team1_winrate - 0.5)),
@@ -90,6 +92,7 @@ class CsgoEnsembleModel:
         logit = _logit(v["base_per_map"])
         logit += w.form * v["form_diff"]
         logit += w.map_adv * v["map_adv"]
+        logit += w.map_glicko * v["map_edge"]
         logit += w.roster * v["roster_diff"]
         logit += w.h2h * v["h2h_centered"] * v["h2h_shrink"]
         p = _sigmoid(logit)
