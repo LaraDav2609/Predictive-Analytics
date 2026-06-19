@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from games.csgo.analytics.ratings import rate_matches
 from games.csgo.data.csgo_client import CsgoDataClient
 from games.csgo.identity import build_aliases
 from games.csgo.models.csgo import CsgoMatch, CsgoTeam, MapScore
@@ -223,25 +224,6 @@ class PandaScoreCsgoClient(CsgoDataClient):
             source_ids={"pandascore": str(raw.get("id"))},
         )
 
-    # ── Provisional Elo from recent results (refined per-map in Phase 1) ──────
-    def _compute_ratings(self, past: list[CsgoMatch]) -> dict[int, float]:
-        ratings: dict[int, float] = {}
-        for m in sorted(past, key=lambda x: x.date):
-            if m.team1_score is None or m.team2_score is None:
-                continue
-            ra = ratings.get(m.team1_id, 1500.0)
-            rb = ratings.get(m.team2_id, 1500.0)
-            ea = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
-            if m.team1_score > m.team2_score:
-                sa = 1.0
-            elif m.team1_score < m.team2_score:
-                sa = 0.0
-            else:
-                sa = 0.5
-            ratings[m.team1_id] = ra + self._k * (sa - ea)
-            ratings[m.team2_id] = rb + self._k * ((1.0 - sa) - (1.0 - ea))
-        return ratings
-
     # ── CsgoDataClient contract ──────────────────────────────────────────────
     async def refresh(self) -> None:
         try:
@@ -255,12 +237,13 @@ class PandaScoreCsgoClient(CsgoDataClient):
             running = [m for m in (self._map_match(r) for r in running_raw) if m]
             past = [m for m in (self._map_match(r) for r in past_raw) if m]
 
-            # Derive provisional ratings from results and stamp them onto teams.
-            ratings = self._compute_ratings(past)
+            # Fit Glicko-2 ratings from recent results and stamp them onto teams.
+            ratings = rate_matches(past)
             by_id = {t.id: t for t in teams}
             for tid, rating in ratings.items():
                 if tid in by_id:
-                    by_id[tid].rating = round(rating, 1)
+                    by_id[tid].rating = round(rating.rating, 1)
+                    by_id[tid].rating_deviation = round(rating.rd, 1)
 
             self._teams = teams
             self._matches = running + upcoming  # live first, then scheduled

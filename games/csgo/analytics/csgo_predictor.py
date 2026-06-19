@@ -16,6 +16,7 @@ from math import comb
 from common.ml.markets.edge import EdgeOpportunity, MarketQuote, compute_edge
 from common.ml.markets.kelly import KellySize, size_position
 from common.ml.types import OutcomeProbability
+from games.csgo.analytics.ratings import confidence_from_rd, win_probability
 from games.csgo.models.csgo import CsgoMatch, CsgoPrediction, CsgoTeam
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ class CsgoPredictor:
 
     def __init__(self) -> None:
         self._teams: dict[int, CsgoTeam] = {}
-        self._version = "csgo-elo-v1"
+        self._version = "csgo-glicko-v1"
 
     def load_teams(self, teams: list[CsgoTeam]) -> None:
         self._teams = {t.id: t for t in teams}
@@ -38,14 +39,17 @@ class CsgoPredictor:
         team = self._teams.get(team_id)
         return team.rating if team else 1500.0
 
+    def _rd(self, team_id: int) -> float:
+        team = self._teams.get(team_id)
+        return team.rating_deviation if team else 350.0
+
     def predict(self, match: CsgoMatch) -> CsgoPrediction:
-        r1 = self._rating(match.team1_id)
-        r2 = self._rating(match.team2_id)
-        # Per-map Elo expected score, then lift to the series via best-of math.
-        p_map = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
+        r1, rd1 = self._rating(match.team1_id), self._rd(match.team1_id)
+        r2, rd2 = self._rating(match.team2_id), self._rd(match.team2_id)
+        # Glicko-2 per-map win prob (opponent + uncertainty adjusted), lifted to series.
+        p_map = win_probability(r1, rd1, r2, rd2)
         p1 = self._best_of_win_prob(p_map, match.best_of)
-        gap = abs(r1 - r2)
-        confidence = round(0.4 + min(0.4, gap / 1000.0), 3)
+        confidence = confidence_from_rd(rd1, rd2)
         return CsgoPrediction(
             team1_win_prob=round(p1, 4),
             team2_win_prob=round(1.0 - p1, 4),
