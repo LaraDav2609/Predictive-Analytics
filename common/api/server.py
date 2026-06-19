@@ -20,6 +20,7 @@ from sports.baseball.api import baseball_routes, baseball_history_routes
 from games.csgo.data.csgo_client import CsgoDataClient
 from games.csgo.data.factory import build_csgo_client
 from games.csgo.analytics.csgo_predictor import CsgoPredictor
+from games.csgo.analytics.pipeline import CsgoModelPipeline
 from games.csgo.api import csgo_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -79,9 +80,9 @@ async def _load_mlb_data(client: MLBClient, predictor: BaseballPredictor) -> Non
     logger.info("MLB data loaded successfully")
 
 
-async def _load_csgo_data(client: CsgoDataClient, predictor: CsgoPredictor) -> None:
+async def _load_csgo_data(client: CsgoDataClient, model: CsgoModelPipeline) -> None:
     await client.refresh()
-    predictor.load_teams(client.get_teams())
+    model.fit(client.get_past_matches(), client.get_teams())
     logger.info(
         "CSGO data loaded: %d teams, %d matches",
         len(client.get_teams()), len(client.get_matches()),
@@ -109,16 +110,17 @@ async def lifespan(app: FastAPI):
     baseball_history_routes.init(_mlb_historical_client, pybaseball_client)
 
     # CSGO (game category) — provider selected from env (PandaScore or stub).
+    # The pipeline (ratings → features → ensemble) drives /matches predictions.
     _csgo_client = build_csgo_client()
-    csgo_pred = CsgoPredictor()
-    csgo_routes.init(_csgo_client, csgo_pred)
-    csgo_pred.load_teams(_csgo_client.get_teams())  # immediate (stub data, or empty until refresh)
+    csgo_model = CsgoModelPipeline()
+    csgo_routes.init(_csgo_client, csgo_model)
+    csgo_model.load_teams(_csgo_client.get_teams())  # immediate (stub data, or empty until fit)
 
     # Initial data loads are intentionally non-blocking. Some upstream sports/F1
     # APIs can be slow or unavailable, and the dashboard should still boot.
     _track_startup_task("F1", _load_f1_data(_f1_client, f1_pred))
     _track_startup_task("MLB", _load_mlb_data(_mlb_client, baseball_pred))
-    _track_startup_task("CSGO", _load_csgo_data(_csgo_client, csgo_pred))
+    _track_startup_task("CSGO", _load_csgo_data(_csgo_client, csgo_model))
 
     yield
 

@@ -48,7 +48,10 @@ async def get_match(match_id: str):
 async def refresh():
     await client.refresh()
     if predictor:
-        predictor.load_teams(client.get_teams())
+        if hasattr(predictor, "fit"):
+            predictor.fit(client.get_past_matches(), client.get_teams())   # full ensemble pipeline
+        else:
+            predictor.load_teams(client.get_teams())
     return {"ok": True, "teams": len(client.get_teams()), "matches": len(client.get_matches())}
 
 
