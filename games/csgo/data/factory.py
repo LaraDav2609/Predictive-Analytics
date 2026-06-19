@@ -1,11 +1,12 @@
 """Selects the CSGO data client from environment configuration.
 
-    CSGO_DATA_PROVIDER   "pandascore" | "stub"  (default: "stub")
+    CSGO_DATA_PROVIDER   "pandascore" | "localfile" | "stub"  (default: "stub")
     PANDASCORE_TOKEN     bearer token for PandaScore (required for pandascore)
     PANDASCORE_BASE_URL  override API base (default https://api.pandascore.co)
     CSGO_PANDASCORE_GAME PandaScore videogame slug (default "csgo")
     CSGO_LOOKBACK_DAYS   recent-results window for provisional ratings (default 180)
     CSGO_MAX_TEAMS       cap on teams loaded (default 100)
+    CSGO_HISTORY_FILE    path to a CSV/JSON results export (required for localfile)
 
 Falls back to the in-memory stub when the provider is unset/unknown or when
 ``pandascore`` is selected without a token, so the service always boots.
@@ -50,6 +51,16 @@ def build_csgo_client() -> CsgoDataClient:
             lookback_days=_int_env("CSGO_LOOKBACK_DAYS", 180),
             max_teams=_int_env("CSGO_MAX_TEAMS", 100),
         )
+
+    if provider == "localfile":
+        path = os.getenv("CSGO_HISTORY_FILE", "").strip()
+        if not path:
+            logger.warning("CSGO_DATA_PROVIDER=localfile but CSGO_HISTORY_FILE is unset — using stub.")
+            return StubCsgoClient()
+        from games.csgo.data.localfile_client import LocalHistoryCsgoClient
+
+        logger.info("CSGO data provider: local history file (%s)", path)
+        return LocalHistoryCsgoClient(path)
 
     if provider not in ("stub", ""):
         logger.warning("Unknown CSGO_DATA_PROVIDER=%r — using stub.", provider)
