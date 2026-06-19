@@ -3,9 +3,11 @@
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from games.csgo.data.csgo_client import CsgoDataClient
 from games.csgo.analytics.csgo_predictor import CsgoPredictor
+from games.csgo.live import LiveMatchState, update_live_probability
 
 router = APIRouter(prefix="/csgo", tags=["csgo"])
 
@@ -63,3 +65,17 @@ async def backtest():
     teams_by_id = {t.id: t for t in client.get_teams()}
     result = run_backtest(past, teams_by_id=teams_by_id)
     return {"ok": True, **result}
+
+
+class LiveUpdateRequest(BaseModel):
+    pregame_team1_prob: float
+    state: LiveMatchState
+    match_id: str = ""
+    pregame_per_map_prob: Optional[float] = None
+
+
+@router.post("/live/update")
+async def live_update(req: LiveUpdateRequest):
+    """Update a live win probability from current in-game state (transparent heuristic)."""
+    live = update_live_probability(req.pregame_team1_prob, req.state, req.pregame_per_map_prob)
+    return {"ok": True, "match_id": req.match_id, "live": live.model_dump()}
