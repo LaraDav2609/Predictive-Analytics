@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 
+from games.csgo.identity import build_aliases
 from games.csgo.models.csgo import CsgoMatch, CsgoTeam
 
 
@@ -46,7 +47,13 @@ class StubCsgoClient(CsgoDataClient):
     """In-memory sample data so the architecture runs end-to-end without a feed."""
 
     def __init__(self) -> None:
-        self._teams = list(_SAMPLE_TEAMS)
+        self._teams = [
+            t.model_copy(update={
+                "aliases": build_aliases(t.name, t.abbreviation),
+                "source_ids": {"stub": str(t.id)},
+            })
+            for t in _SAMPLE_TEAMS
+        ]
         self._matches = self._build_matches()
 
     def _build_matches(self) -> list[CsgoMatch]:
@@ -61,8 +68,11 @@ class StubCsgoClient(CsgoDataClient):
                 team1=ta.name, team2=tb.name,
                 team1_id=ta.id, team2_id=tb.id,
                 team1_abbrev=ta.abbreviation, team2_abbrev=tb.abbreviation,
+                team1_aliases=build_aliases(ta.name, ta.abbreviation),
+                team2_aliases=build_aliases(tb.name, tb.abbreviation),
                 date=base + timedelta(hours=3 * i),
-                event="IEM Katowice 2026", best_of=3,
+                event="IEM Katowice 2026", event_slug="iem-katowice-2026", best_of=3,
+                source_ids={"stub": f"{ta.id}-{tb.id}"},
             ))
         return matches
 

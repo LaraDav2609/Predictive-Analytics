@@ -21,7 +21,8 @@ from datetime import datetime, timezone
 import httpx
 
 from games.csgo.data.csgo_client import CsgoDataClient
-from games.csgo.models.csgo import CsgoMatch, CsgoTeam
+from games.csgo.identity import build_aliases
+from games.csgo.models.csgo import CsgoMatch, CsgoTeam, MapScore
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,40 @@ def _acronym(name: str, acronym: str | None) -> str:
     if acronym:
         return acronym.upper()
     return (name or "")[:4].upper()
+
+
+_GAME_STATUS_MAP = {
+    "not_started": "NOT_STARTED",
+    "not_played": "NOT_STARTED",
+    "running": "RUNNING",
+    "finished": "FINISHED",
+}
+
+
+def _roster_ids(players) -> list[int]:
+    out: list[int] = []
+    for p in players or []:
+        pid = p.get("id") if isinstance(p, dict) else None
+        if pid is not None:
+            out.append(int(pid))
+    return out
+
+
+def _map_games(games, team1_id, team2_id) -> list[MapScore]:
+    out: list[MapScore] = []
+    for g in games or []:
+        if not isinstance(g, dict):
+            continue
+        winner = g.get("winner") if isinstance(g.get("winner"), dict) else {}
+        wid = winner.get("id")
+        map_obj = g.get("map") if isinstance(g.get("map"), dict) else {}
+        out.append(MapScore(
+            order=g.get("position"),
+            map_name=map_obj.get("name"),
+            winner_id=int(wid) if wid is not None else None,
+            status=_GAME_STATUS_MAP.get(str(g.get("status")), "NOT_STARTED"),
+        ))
+    return out
 
 
 class PandaScoreCsgoClient(CsgoDataClient):
@@ -114,13 +149,17 @@ class PandaScoreCsgoClient(CsgoDataClient):
         name = raw.get("name")
         if tid is None or not name:
             return None
+        acr = _acronym(name, raw.get("acronym"))
         return CsgoTeam(
             id=int(tid),
             name=name,
-            abbreviation=_acronym(name, raw.get("acronym")),
+            abbreviation=acr,
             region=raw.get("location") or "",
             world_rank=None,
             rating=1500.0,
+            aliases=build_aliases(name, acr),
+            source_ids={"pandascore": str(tid)},
+            roster=_roster_ids(raw.get("players")),
         )
 
     def _map_match(self, raw: dict) -> CsgoMatch | None:
@@ -144,6 +183,20 @@ class PandaScoreCsgoClient(CsgoDataClient):
         tournament = raw.get("tournament") or {}
         league = raw.get("league") or {}
         event = serie.get("full_name") or tournament.get("name") or league.get("name")
+        event_slug = serie.get("slug") or tournament.get("slug") or league.get("slug")
+
+        a1 = _acronym(o1.get("name") or "", o1.get("acronym"))
+        a2 = _acronym(o2.get("name") or "", o2.get("acronym"))
+
+        # Winner: explicit winner_id, else infer from the series score.
+        winner_id = raw.get("winner_id")
+        if winner_id is None and isinstance(s1, int) and isinstance(s2, int) and s1 != s2:
+            winner_id = o1.get("id") if s1 > s2 else o2.get("id")
+        winner_code = None
+        if winner_id == o1.get("id"):
+            winner_code = a1
+        elif winner_id == o2.get("id"):
+            winner_code = a2
 
         return CsgoMatch(
             id=str(raw.get("id")),
@@ -151,14 +204,23 @@ class PandaScoreCsgoClient(CsgoDataClient):
             team2=o2.get("name") or "TBD",
             team1_id=int(o1.get("id")),
             team2_id=int(o2.get("id")),
-            team1_abbrev=_acronym(o1.get("name") or "", o1.get("acronym")),
-            team2_abbrev=_acronym(o2.get("name") or "", o2.get("acronym")),
+            team1_abbrev=a1,
+            team2_abbrev=a2,
+            team1_aliases=build_aliases(o1.get("name"), o1.get("acronym")),
+            team2_aliases=build_aliases(o2.get("name"), o2.get("acronym")),
             date=when,
             event=event,
+            event_slug=event_slug,
             best_of=best_of,
             status=_STATUS_MAP.get(str(raw.get("status")), "SCHEDULED"),
             team1_score=int(s1) if isinstance(s1, int) else None,
             team2_score=int(s2) if isinstance(s2, int) else None,
+            winner_id=int(winner_id) if winner_id is not None else None,
+            winner_code=winner_code,
+            map_scores=_map_games(raw.get("games"), o1.get("id"), o2.get("id")),
+            team1_roster=_roster_ids(o1.get("players")),
+            team2_roster=_roster_ids(o2.get("players")),
+            source_ids={"pandascore": str(raw.get("id"))},
         )
 
     # ── Provisional Elo from recent results (refined per-map in Phase 1) ──────

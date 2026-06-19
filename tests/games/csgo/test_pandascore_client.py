@@ -11,9 +11,11 @@ import httpx
 from games.csgo.data.csgo_client import StubCsgoClient
 from games.csgo.data.factory import build_csgo_client
 from games.csgo.data.pandascore_client import PandaScoreCsgoClient
+from games.csgo.identity import normalize
 
 _TEAMS = [
-    {"id": 1, "name": "Natus Vincere", "acronym": "NAVI", "location": "UA"},
+    {"id": 1, "name": "Natus Vincere", "acronym": "NAVI", "location": "UA",
+     "players": [{"id": 11}, {"id": 12}, {"id": 13}, {"id": 14}, {"id": 15}]},
     {"id": 2, "name": "FaZe Clan", "acronym": "FAZE", "location": "EU"},
     {"id": 3, "name": "Team Vitality", "acronym": "VIT", "location": "EU"},
 ]
@@ -22,9 +24,10 @@ _UPCOMING = [
     {
         "id": 1001, "name": "NAVI vs FAZE", "status": "not_started",
         "begin_at": "2026-06-20T17:00:00Z", "number_of_games": 3,
-        "serie": {"full_name": "IEM Katowice 2026"},
+        "serie": {"full_name": "IEM Katowice 2026", "slug": "iem-katowice-2026"},
         "opponents": [
-            {"opponent": {"id": 1, "name": "Natus Vincere", "acronym": "NAVI"}},
+            {"opponent": {"id": 1, "name": "Natus Vincere", "acronym": "NAVI",
+                          "players": [{"id": 11}, {"id": 12}]}},
             {"opponent": {"id": 2, "name": "FaZe Clan", "acronym": "FAZE"}},
         ],
         "results": [],
@@ -41,12 +44,16 @@ _UPCOMING = [
 _PAST = [
     {
         "id": 900, "status": "finished", "begin_at": "2026-06-10T17:00:00Z",
-        "number_of_games": 3, "serie": {"full_name": "BLAST Premier"},
+        "number_of_games": 3, "serie": {"full_name": "BLAST Premier"}, "winner_id": 1,
         "opponents": [
             {"opponent": {"id": 1, "name": "Natus Vincere", "acronym": "NAVI"}},
             {"opponent": {"id": 3, "name": "Team Vitality", "acronym": "VIT"}},
         ],
         "results": [{"team_id": 1, "score": 2}, {"team_id": 3, "score": 0}],
+        "games": [
+            {"position": 1, "status": "finished", "winner": {"id": 1, "type": "Team"}, "map": {"name": "Mirage"}},
+            {"position": 2, "status": "finished", "winner": {"id": 1}, "map": {"name": "Inferno"}},
+        ],
     },
     {
         "id": 901, "status": "finished", "begin_at": "2026-06-09T17:00:00Z",
@@ -130,3 +137,30 @@ def test_factory_builds_pandascore_with_token(monkeypatch):
     client = build_csgo_client()
     assert isinstance(client, PandaScoreCsgoClient)
     asyncio.run(client.close())
+
+
+def test_team_identity_fields_mapped():
+    c = _client()
+    asyncio.run(c.refresh())
+    navi = next(t for t in c.get_teams() if t.abbreviation == "NAVI")
+    assert navi.source_ids.get("pandascore") == "1"
+    assert any(normalize(a) == "natus vincere" for a in navi.aliases)
+    assert navi.roster == [11, 12, 13, 14, 15]
+
+
+def test_match_identity_and_results_mapped():
+    c = _client()
+    asyncio.run(c.refresh())
+
+    up = c.get_match("1001")
+    assert up.source_ids.get("pandascore") == "1001"
+    assert up.event_slug == "iem-katowice-2026"
+    assert any(normalize(a) == "natus vincere" for a in up.team1_aliases)
+    assert up.team1_roster == [11, 12]
+
+    past = c.get_match("900")
+    assert past.winner_id == 1
+    assert past.winner_code == "NAVI"
+    assert len(past.map_scores) == 2
+    assert past.map_scores[0].map_name == "Mirage"
+    assert past.map_scores[0].winner_id == 1
