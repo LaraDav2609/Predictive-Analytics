@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import timedelta
 from math import comb
 from typing import Optional
 
@@ -35,6 +36,10 @@ class TeamFeatures:
     map_strength: dict[str, float] = field(default_factory=dict)
     roster_stability: float = 1.0            # 1.0 = full core roster
     stand_in_count: int = 0
+    streak: float = 0.0                      # signed current streak (+wins / -losses), capped ±5
+    strength_of_schedule: float = 1.0        # avg recent opponent rating / 1500 (1.0 = neutral)
+    map_pool_depth: int = 0                  # # of maps with a winning record (veto leverage)
+    days_since_last_match: float = 0.0       # rust; capped at 30
 
 
 @dataclass
@@ -121,6 +126,53 @@ class FeatureExtractor:
             den += weight
         return round(num / den, 4) if den else 0.5
 
+    def _team_games(self, team_id: int) -> list[CsgoMatch]:
+        return sorted(
+            [m for m in self._past if team_id in (m.team1_id, m.team2_id) and _winner(m) is not None],
+            key=lambda x: x.date, reverse=True,
+        )
+
+    def _streak(self, team_id: int) -> float:
+        """Signed current streak: +n consecutive wins, -n consecutive losses (capped ±5)."""
+        games = self._team_games(team_id)
+        if not games:
+            return 0.0
+        won_latest = _winner(games[0]) == team_id
+        run = 0
+        for m in games:
+            if (_winner(m) == team_id) == won_latest:
+                run += 1
+            else:
+                break
+        run = min(run, 5)
+        return float(run if won_latest else -run)
+
+    def _strength_of_schedule(self, team_id: int, n: int = 10) -> float:
+        """Average recent-opponent rating, /1500 (1.0 = average opposition)."""
+        games = self._team_games(team_id)[:n]
+        if not games:
+            return 1.0
+        ratings = []
+        for m in games:
+            opp = m.team2_id if m.team1_id == team_id else m.team1_id
+            ratings.append(self._ratings[opp].rating if opp in self._ratings else 1500.0)
+        return round((sum(ratings) / len(ratings)) / 1500.0, 4)
+
+    @staticmethod
+    def _map_pool_depth(map_strength: dict[str, float]) -> int:
+        """How many maps the team wins more than it loses — a proxy for veto leverage."""
+        return sum(1 for w in map_strength.values() if w >= 0.55)
+
+    def _days_since_last_match(self, team_id: int, as_of) -> float:
+        """Rust: days since the team's previous match before `as_of` (capped at 30)."""
+        if as_of is None:
+            return 0.0
+        prior = [m for m in self._team_games(team_id) if m.date is not None and m.date < as_of]
+        if not prior:
+            return 0.0
+        gap = (as_of - prior[0].date).days
+        return round(min(30.0, max(0.0, float(gap))), 1)
+
     def _map_strength(self, team_id: int) -> dict[str, float]:
         wins: dict[str, int] = defaultdict(int)
         total: dict[str, int] = defaultdict(int)
@@ -142,20 +194,25 @@ class FeatureExtractor:
         stand_ins = [p for p in match_roster if p not in core]
         return round(max(0.0, 1.0 - len(stand_ins) / 5.0), 3), len(stand_ins)
 
-    def _team_features(self, team_id: int, match_roster: list[int]) -> TeamFeatures:
+    def _team_features(self, team_id: int, match_roster: list[int], as_of=None) -> TeamFeatures:
         r = self._ratings.get(team_id)
         team = self._teams.get(team_id)
         rating = r.rating if r else (team.rating if team else 1500.0)
         rd = r.rd if r else (team.rating_deviation if team else 350.0)
         stability, stand_ins = self._roster(team_id, match_roster)
+        map_strength = self._map_strength(team_id)
         return TeamFeatures(
             team_id=team_id,
             rating=round(rating, 1),
             rating_deviation=round(rd, 1),
             recent_form=self._recent_form(team_id),
-            map_strength=self._map_strength(team_id),
+            map_strength=map_strength,
             roster_stability=stability,
             stand_in_count=stand_ins,
+            streak=self._streak(team_id),
+            strength_of_schedule=self._strength_of_schedule(team_id),
+            map_pool_depth=self._map_pool_depth(map_strength),
+            days_since_last_match=self._days_since_last_match(team_id, as_of),
         )
 
     # ── head-to-head (low weight / contextual) ───────────────────────────────
@@ -182,8 +239,8 @@ class FeatureExtractor:
 
     # ── public ───────────────────────────────────────────────────────────────
     def extract(self, match: CsgoMatch) -> MatchFeatures:
-        f1 = self._team_features(match.team1_id, match.team1_roster)
-        f2 = self._team_features(match.team2_id, match.team2_roster)
+        f1 = self._team_features(match.team1_id, match.team1_roster, match.date)
+        f2 = self._team_features(match.team2_id, match.team2_roster, match.date)
         tier, tier_w = classify_event_tier(match.event)
         h2h_wr, h2h_n = self._h2h(match.team1_id, match.team2_id)
         likely = self._likely_maps(f1, f2, match.best_of)

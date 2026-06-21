@@ -84,6 +84,10 @@ class CsgoEnsembleModel:
             "h2h_shrink": (0.0 if not f.h2h_sample else f.h2h_sample / (f.h2h_sample + 5.0)),
             "best_of": float(f.best_of),
             "event_tier_weight": f.event_tier_weight,
+            "streak_diff": float(f.team1.streak - f.team2.streak),
+            "sos_diff": float(f.team1.strength_of_schedule - f.team2.strength_of_schedule),
+            "map_pool_diff": float(f.team1.map_pool_depth - f.team2.map_pool_depth),
+            "rust_diff": float(f.team1.days_since_last_match - f.team2.days_since_last_match),
         }
 
     def _per_map_prob(self, f: MatchFeatures) -> float:

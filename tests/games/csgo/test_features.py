@@ -74,3 +74,29 @@ def test_features_capture_strength_form_maps_roster_h2h():
     assert mf.format_amplification > 0.6       # bo3 amplifies the favorite
     assert mf.likely_maps                       # non-empty
     assert mf.provenance["ratings"] == "glicko2"
+
+
+def test_new_features_streak_sos_mappool_rust():
+    import math
+
+    from games.csgo.analytics.model import CsgoEnsembleModel
+
+    teams, past, ratings = _fixture()
+    fx = FeatureExtractor(past, ratings, teams)
+    upcoming = _match(999, 1, 2, winner=None, day=99, event="IEM Katowice 2026")
+    mf = fx.extract(upcoming)
+
+    # team1 won every game → max positive streak; team2's run is broken by losses to team1.
+    assert mf.team1.streak == 5.0
+    assert mf.team1.streak > mf.team2.streak
+    # team1 wins Mirage + Inferno → at least two comfortable maps (veto leverage).
+    assert mf.team1.map_pool_depth >= 2
+    # strength-of-schedule is centred near 1.0 (avg opponent rating / 1500).
+    assert 0.5 < mf.team1.strength_of_schedule < 1.5
+    # rust is bounded [0, 30].
+    assert 0.0 <= mf.team1.days_since_last_match <= 30.0
+
+    # The new signals surface in the GBM feature vector and are finite.
+    fv = CsgoEnsembleModel().feature_vector(mf)
+    for key in ("streak_diff", "sos_diff", "map_pool_diff", "rust_diff"):
+        assert key in fv and math.isfinite(fv[key])
