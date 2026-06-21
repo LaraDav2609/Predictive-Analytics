@@ -74,6 +74,24 @@ def test_factory_selects_localfile(tmp_path, monkeypatch):
     assert isinstance(build_csgo_client(), StubCsgoClient)   # missing file → stub
 
 
+def test_factory_tags_data_provenance(tmp_path, monkeypatch):
+    # A real provider reports itself as non-synthetic.
+    path = _write(tmp_path, _CSV)
+    monkeypatch.setenv("CSGO_DATA_PROVIDER", "localfile")
+    monkeypatch.setenv("CSGO_HISTORY_FILE", path)
+    real = build_csgo_client()
+    assert real.provider_name == "localfile" and real.is_synthetic is False
+
+    # A stub fallback (missing file) reports synthetic, so the dashboard can flag it.
+    monkeypatch.delenv("CSGO_HISTORY_FILE")
+    fell_back = build_csgo_client()
+    assert fell_back.provider_name == "stub" and fell_back.is_synthetic is True
+
+    # Default (no provider configured) is synthetic too.
+    monkeypatch.delenv("CSGO_DATA_PROVIDER")
+    assert build_csgo_client().is_synthetic is True
+
+
 def test_missing_file_is_graceful(tmp_path):
     c = LocalHistoryCsgoClient(str(tmp_path / "does-not-exist.csv"))
     assert not c.is_available()

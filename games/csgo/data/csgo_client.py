@@ -17,6 +17,11 @@ from games.csgo.models.csgo import CsgoMatch, CsgoPlayer, CsgoTeam, MapScore
 class CsgoDataClient(ABC):
     """Contract a CSGO data source must implement (HLTV, PandaScore, ...)."""
 
+    # Effective data provenance, surfaced to the API/dashboard; the factory overrides
+    # these per instance. Defaults assume synthetic so nothing silently looks "real".
+    provider_name: str = "stub"
+    is_synthetic: bool = True
+
     @abstractmethod
     def get_teams(self) -> list[CsgoTeam]: ...
 

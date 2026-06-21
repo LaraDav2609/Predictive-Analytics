@@ -24,6 +24,14 @@ from games.csgo.data.csgo_client import CsgoDataClient, StubCsgoClient
 logger = logging.getLogger(__name__)
 
 
+def _tag(client: CsgoDataClient, provider: str, synthetic: bool) -> CsgoDataClient:
+    """Stamp the EFFECTIVE provider on the client so the API/dashboard can show whether
+    the numbers are real or synthetic (a stub fallback reports provider='stub')."""
+    client.provider_name = provider
+    client.is_synthetic = synthetic
+    return client
+
+
 def build_csgo_client() -> CsgoDataClient:
     provider = os.getenv("CSGO_DATA_PROVIDER", "stub").strip().lower()
 
@@ -34,7 +42,7 @@ def build_csgo_client() -> CsgoDataClient:
                 "CSGO_DATA_PROVIDER=pandascore but PANDASCORE_TOKEN is unset — "
                 "falling back to stub CSGO data."
             )
-            return StubCsgoClient()
+            return _tag(StubCsgoClient(), "stub", True)
 
         # Imported lazily so the stub path has no httpx import cost.
         from games.csgo.data.pandascore_client import PandaScoreCsgoClient
@@ -46,29 +54,29 @@ def build_csgo_client() -> CsgoDataClient:
                 return default
 
         logger.info("CSGO data provider: PandaScore")
-        return PandaScoreCsgoClient(
+        return _tag(PandaScoreCsgoClient(
             token=token,
             base_url=os.getenv("PANDASCORE_BASE_URL", "https://api.pandascore.co"),
             game=os.getenv("CSGO_PANDASCORE_GAME", "csgo"),
             lookback_days=_int_env("CSGO_LOOKBACK_DAYS", 180),
             max_teams=_int_env("CSGO_MAX_TEAMS", 100),
-        )
+        ), "pandascore", False)
 
     if provider == "localfile":
         path = os.getenv("CSGO_HISTORY_FILE", "").strip()
         if not path:
             logger.warning("CSGO_DATA_PROVIDER=localfile but CSGO_HISTORY_FILE is unset — using stub.")
-            return StubCsgoClient()
+            return _tag(StubCsgoClient(), "stub", True)
         from games.csgo.data.localfile_client import LocalHistoryCsgoClient
 
         logger.info("CSGO data provider: local history file (%s)", path)
-        return LocalHistoryCsgoClient(path)
+        return _tag(LocalHistoryCsgoClient(path), "localfile", False)
 
     if provider == "liquipedia":
         key = os.getenv("LIQUIPEDIA_API_KEY", "").strip()
         if not key:
             logger.warning("CSGO_DATA_PROVIDER=liquipedia but LIQUIPEDIA_API_KEY is unset — using stub.")
-            return StubCsgoClient()
+            return _tag(StubCsgoClient(), "stub", True)
         from games.csgo.data.liquipedia_client import LiquipediaCsgoClient
 
         try:
@@ -76,15 +84,15 @@ def build_csgo_client() -> CsgoDataClient:
         except ValueError:
             lookback = 180
         logger.info("CSGO data provider: Liquipedia")
-        return LiquipediaCsgoClient(
+        return _tag(LiquipediaCsgoClient(
             key,
             user_agent=os.getenv("LIQUIPEDIA_USER_AGENT",
                                  "PredictiveAnalytics-CSGO/1.0 (set LIQUIPEDIA_USER_AGENT with contact)"),
             base_url=os.getenv("LIQUIPEDIA_BASE_URL", "https://api.liquipedia.net/api/v3"),
             wiki=os.getenv("CSGO_LIQUIPEDIA_WIKI", "counterstrike"),
             lookback_days=lookback,
-        )
+        ), "liquipedia", False)
 
     if provider not in ("stub", ""):
         logger.warning("Unknown CSGO_DATA_PROVIDER=%r — using stub.", provider)
-    return StubCsgoClient()
+    return _tag(StubCsgoClient(), "stub", True)

@@ -122,7 +122,21 @@ async def backtest(calibrate: bool = False):
     past = client.get_past_matches()
     teams_by_id = {t.id: t for t in client.get_teams()}
     result = run_backtest(past, teams_by_id=teams_by_id, calibrate=calibrate)
-    return {"ok": True, **result}
+    return {"ok": True,
+            "provider": getattr(client, "provider_name", "stub"),
+            "synthetic": getattr(client, "is_synthetic", True),
+            **result}
+
+
+@router.get("/source")
+async def source():
+    """Active data provenance — which provider is live and whether it's synthetic — so the
+    dashboard can flag stub numbers instead of letting them pass for real results."""
+    return {"ok": True,
+            "provider": getattr(client, "provider_name", "stub"),
+            "synthetic": getattr(client, "is_synthetic", True),
+            "history_matches": len(client.get_past_matches()),
+            "teams": len(client.get_teams())}
 
 
 @router.get("/replay/{match_id}")
