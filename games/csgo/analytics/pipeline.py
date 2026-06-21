@@ -32,8 +32,15 @@ class CsgoModelPipeline:
         self._ratings = rate_matches(self._past)
         self._map_ratings = rate_maps(self._past)
         self._teams_by_id = {t.id: t for t in (teams or [])}
-        logger.info("CSGO pipeline fit: %d past matches, %d team ratings, %d map ratings",
-                    len(self._past), len(self._ratings), len(self._map_ratings))
+
+        # Fit a Platt scaler on the model's walk-forward predictions over history and apply
+        # it to live predictions (None when too little history / no sklearn → stays raw).
+        from games.csgo.analytics.backtest import fit_calibrator
+        self.model.calibrator = fit_calibrator(self._past, self._teams_by_id)
+
+        logger.info("CSGO pipeline fit: %d past matches, %d team ratings, %d map ratings, calibrated=%s",
+                    len(self._past), len(self._ratings), len(self._map_ratings),
+                    self.model.calibrator is not None)
 
     def load_teams(self, teams: list[CsgoTeam]) -> None:
         """Startup compatibility — teams only, before history is available."""

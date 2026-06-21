@@ -85,6 +85,59 @@ def _simulate_bet(match_id: str, model_prob: float, actual: float,
     return {"stake": stake, "pnl": pnl, "won": won}
 
 
+def _fold_result(engine: Glicko2, ratings: dict, map_ratings: dict, m: CsgoMatch) -> None:
+    """Update global + per-map Glicko ratings with match m's result. The single leak-free
+    'reveal the outcome' step shared by the backtest, the replay, and calibrator fitting."""
+    r1 = ratings.get(m.team1_id, Rating())
+    r2 = ratings.get(m.team2_id, Rating())
+    s1 = 1.0 if _winner(m) == m.team1_id else 0.0
+    ratings[m.team1_id] = engine.update(r1, r2, s1)
+    ratings[m.team2_id] = engine.update(r2, r1, 1.0 - s1)
+    for ms in m.map_scores:
+        if ms.winner_id is None or not ms.map_name:
+            continue
+        k1, k2 = (m.team1_id, ms.map_name), (m.team2_id, ms.map_name)
+        mr1, mr2 = map_ratings.get(k1, Rating()), map_ratings.get(k2, Rating())
+        ms1 = 1.0 if ms.winner_id == m.team1_id else 0.0
+        map_ratings[k1] = engine.update(mr1, mr2, ms1)
+        map_ratings[k2] = engine.update(mr2, mr1, 1.0 - ms1)
+
+
+def fit_calibrator(matches: list[CsgoMatch], teams_by_id: dict | None = None, min_history: int = 20):
+    """Fit a Platt scaler on the ensemble's walk-forward predictions over history, for
+    applying to FUTURE live predictions (the calibrator learns the model's miscalibration;
+    fit on the past, applied going forward). Returns None when there's too little history
+    (<30 scored) or sklearn is unavailable, so the caller stays uncalibrated."""
+    model = CsgoEnsembleModel()   # raw, to collect uncalibrated predictions
+    finished = sorted([m for m in matches if _winner(m) is not None], key=lambda x: x.date)
+
+    engine = Glicko2()
+    ratings: dict[int, Rating] = {}
+    map_ratings: dict[tuple[int, str], Rating] = {}
+    history: list[CsgoMatch] = []
+    probs: list[float] = []
+    actuals: list[float] = []
+    for m in finished:
+        if len(history) >= min_history and m.team1_id in ratings and m.team2_id in ratings:
+            feats = FeatureExtractor(history, dict(ratings), teams_by_id or {},
+                                     map_ratings=dict(map_ratings)).extract(m)
+            probs.append(model.predict(feats).winner_prob)
+            actuals.append(1.0 if _winner(m) == m.team1_id else 0.0)
+        _fold_result(engine, ratings, map_ratings, m)
+        history.append(m)
+
+    if len(probs) < 30:
+        return None
+    try:
+        from common.ml.calibration import PlattScaler
+    except Exception:
+        return None
+    try:
+        return PlattScaler().fit(np.array(probs), np.array(actuals))
+    except Exception:
+        return None
+
+
 def run_backtest(
     matches: list[CsgoMatch],
     model: CsgoEnsembleModel | None = None,
@@ -127,20 +180,7 @@ def run_backtest(
                         bets.append(bet)
 
         # Then fold the result in (leak-free).
-        r1 = ratings.get(m.team1_id, Rating())
-        r2 = ratings.get(m.team2_id, Rating())
-        s1 = 1.0 if _winner(m) == m.team1_id else 0.0
-        ratings[m.team1_id] = engine.update(r1, r2, s1)
-        ratings[m.team2_id] = engine.update(r2, r1, 1.0 - s1)
-        for ms in m.map_scores:
-            if ms.winner_id is None or not ms.map_name:
-                continue
-            k1, k2 = (m.team1_id, ms.map_name), (m.team2_id, ms.map_name)
-            mr1 = map_ratings.get(k1, Rating())
-            mr2 = map_ratings.get(k2, Rating())
-            ms1 = 1.0 if ms.winner_id == m.team1_id else 0.0
-            map_ratings[k1] = engine.update(mr1, mr2, ms1)
-            map_ratings[k2] = engine.update(mr2, mr1, 1.0 - ms1)
+        _fold_result(engine, ratings, map_ratings, m)
         history.append(m)
 
     result = _metrics(records, bets)
@@ -275,19 +315,7 @@ def replay_match(
     for m in finished:
         if str(m.id) == str(target.id):
             break
-        r1 = ratings.get(m.team1_id, Rating())
-        r2 = ratings.get(m.team2_id, Rating())
-        s1 = 1.0 if _winner(m) == m.team1_id else 0.0
-        ratings[m.team1_id] = engine.update(r1, r2, s1)
-        ratings[m.team2_id] = engine.update(r2, r1, 1.0 - s1)
-        for ms in m.map_scores:
-            if ms.winner_id is None or not ms.map_name:
-                continue
-            k1, k2 = (m.team1_id, ms.map_name), (m.team2_id, ms.map_name)
-            mr1, mr2 = map_ratings.get(k1, Rating()), map_ratings.get(k2, Rating())
-            ms1 = 1.0 if ms.winner_id == m.team1_id else 0.0
-            map_ratings[k1] = engine.update(mr1, mr2, ms1)
-            map_ratings[k2] = engine.update(mr2, mr1, 1.0 - ms1)
+        _fold_result(engine, ratings, map_ratings, m)
         history.append(m)
 
     leak_free = (len(history) >= min_history

@@ -50,6 +50,26 @@ def test_replay_match_unknown_id_is_graceful():
     assert r["ok"] is False and r["reason"] == "match_not_found_or_unfinished"
 
 
+def test_fit_calibrator_returns_scaler_on_history_and_none_on_too_little():
+    from games.csgo.analytics.backtest import fit_calibrator
+    past = StubCsgoClient().get_past_matches()
+    assert fit_calibrator(past, min_history=10) is not None   # enough scored → usable scaler
+    assert fit_calibrator(past[:5]) is None                   # too little → caller stays raw
+
+
+def test_pipeline_applies_calibration_to_live_predictions():
+    from games.csgo.analytics.pipeline import CsgoModelPipeline
+    c = StubCsgoClient()
+    p = CsgoModelPipeline()
+    p.fit(c.get_past_matches(), c.get_teams())
+    assert p.model.calibrator is not None
+    scheduled = [m for m in c.get_matches() if m.status == "SCHEDULED"]
+    assert scheduled, "stub should expose upcoming matches"
+    pred = p.predict(scheduled[0])
+    assert pred.feature_provenance.get("calibrated") == "yes"
+    assert 0.0 <= pred.team1_win_prob <= 1.0
+
+
 def test_backtest_betting_sim_when_prices_supplied():
     past = StubCsgoClient().get_past_matches()
     res = run_backtest(past, min_history=20, market_prob_for=lambda m: 0.5, min_edge_bps=100)
