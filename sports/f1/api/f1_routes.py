@@ -2830,6 +2830,7 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
     confidence_report = _confidence_report(truth, live_state=live_state, probabilities=probability_rows)
     payload = {
         "ok": True,
+        "race_id": _race_entity_id(client.season, race),
         "round": round_num,
         "session": (session or "race").lower(),
         "model_id": simulation.get("model_id") or selected_model_id,
@@ -2894,6 +2895,23 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
             payload,
             model_id=simulation.get("model_id") or simulation.get("model_version") or "production_v1",
         )
+    # Live path: publish per-driver market probabilities to the Redis bridge so the
+    # dashboard's F1ProbabilityRedisSubscriber -> SignalR (group f1:race:{entity_id})
+    # pushes them to connected browsers. Publishing only happens on cache-miss (every
+    # _LIVE_RESPONSE_CACHE_TTL_SECONDS), which is the right cadence for poll-driven fanout.
+    bridge_records = _simulation_rows_to_outcome_probabilities(
+        season=client.season,
+        race=race,
+        rows=probability_rows,
+        model_version=str(
+            simulation.get("prediction_model_version")
+            or simulation.get("model_id")
+            or PRODUCTION_MODEL_ID
+        ),
+        generated_at=simulation.get("generated_at"),
+    )
+    payload["bridge_record_count"] = len(bridge_records)
+    payload["bridge_publish"] = _publish_outcome_probabilities(bridge_records)
     response_payload = _compact_live_probability_payload(payload) if compact else payload
     _set_ttl_cache(_live_probability_response_cache, cache_key, response_payload, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_probabilities")
     return response_payload
@@ -3054,6 +3072,7 @@ async def get_race(round_num: int):
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found"}
+    race.race_id = _race_entity_id(client.season, race)
     if race.status == "SCHEDULED" and predictor:
         race.prediction = predictor.predict_race(race)
     return {"ok": True, "race": race.model_dump(mode="json")}

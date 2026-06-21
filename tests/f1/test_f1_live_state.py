@@ -225,7 +225,7 @@ class _FakeOpenF1:
     async def get_session_features(self, race, session, drivers, live=False):
         return self.session_features()
 
-    async def get_track_data(self, race, drivers, session="race", live=False):
+    async def get_track_data(self, race, drivers, session="race", live=False, static_only=False):
         return self.track_data()
 
     @staticmethod

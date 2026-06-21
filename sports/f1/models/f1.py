@@ -101,6 +101,7 @@ class Race(BaseModel):
     country: str
     date: datetime
     circuit_id: str | None = None
+    race_id: str | None = None  # canonical bridge id "{season}-{round:02d}-{SLUG}"; stamped by the API layer
     locality: str | None = None
     latitude: float | None = None
     longitude: float | None = None
