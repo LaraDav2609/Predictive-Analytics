@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from asyncio import sleep
 from copy import deepcopy
@@ -35,6 +36,7 @@ from sports.f1.predictor.models.registry import F1ModelRegistry
 from sports.f1.predictor.service import F1PredictionService
 from sports.f1.predictor.storage import F1Storage
 from sports.f1.predictor.truth import build_race_truth_snapshot
+from sports.f1.predictor.agents import build_car_performance_agent
 from sports.f1.predictor.features.car_model import build_car_model_analysis, summarize_car_data
 from sports.f1.predictor.features.sentiment import build_race_sentiment_impact
 from sports.f1.predictor.features.tires import TireFeatureProvider
@@ -44,6 +46,7 @@ from sports.f1.predictor.features.weekend import build_weekend_evidence, normali
 from sports.f1.predictor.probability import detect_stage, enrich_probability_payload
 from sports.f1.predictor.probability.calibration import build_calibration_profile
 from sports.f1.predictor.data_quality import attach_data_quality, build_data_quality_report
+from sports.f1.assistant import AssistantActionRequest, AssistantChatRequest, F1AssistantService
 
 router = APIRouter(prefix="/f1", tags=["f1"])
 
@@ -54,11 +57,19 @@ openf1: OpenF1Client | None = None
 live_engine: F1LiveSessionEngine | None = None
 live_recorder: FastF1LiveRecorderManager | None = None
 storage: F1Storage | None = None
+backtester: F1BacktestService | None = None
 
 _STATIC_RESPONSE_CACHE_TTL_SECONDS = 60.0
+_LIVE_RESPONSE_CACHE_TTL_SECONDS = 8.0
 _simulation_response_cache: dict[tuple[int, str, str, bool], tuple[float, dict]] = {}
 _track_response_cache: dict[tuple[int, str], tuple[float, dict]] = {}
 _weekend_evidence_response_cache: dict[tuple[int, str], tuple[float, dict]] = {}
+_live_state_response_cache: dict[tuple[int, str], tuple[float, dict]] = {}
+_live_truth_response_cache: dict[tuple[int, str, bool], tuple[float, dict]] = {}
+_live_probability_response_cache: dict[tuple[int, str, str, bool], tuple[float, dict]] = {}
+_race_profile_response_cache: dict[tuple[int], tuple[float, dict]] = {}
+_race_profile_tasks: dict[tuple[int], asyncio.Task] = {}
+_live_state_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _outcome_publisher_override = None
 _last_bridge_publish_status: dict = {"ok": None, "reason": "not_requested", "record_count": 0}
 
@@ -93,6 +104,40 @@ def _get_static_cache(cache: dict, key: tuple) -> dict | None:
     return cached
 
 
+def _get_ttl_cache(cache: dict, key: tuple, ttl_seconds: float, label: str) -> dict | None:
+    entry = cache.get(key)
+    if not entry:
+        return None
+    cached_at, payload = entry
+    age = monotonic() - cached_at
+    if age > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    cached = deepcopy(payload)
+    existing_cache = cached.get("response_cache") or {}
+    cached["response_cache"] = {
+        **existing_cache,
+        "scope": label,
+        "hit": True,
+        "age_seconds": round(age, 2),
+        "ttl_seconds": ttl_seconds,
+    }
+    return cached
+
+
+def _set_ttl_cache(cache: dict, key: tuple, payload: dict, ttl_seconds: float, label: str) -> None:
+    stored = deepcopy(payload)
+    existing_cache = stored.get("response_cache") or {}
+    stored["response_cache"] = {
+        **existing_cache,
+        "scope": label,
+        "hit": False,
+        "age_seconds": 0,
+        "ttl_seconds": ttl_seconds,
+    }
+    cache[key] = (monotonic(), stored)
+
+
 def _set_static_cache(cache: dict, key: tuple, payload: dict) -> None:
     stored = deepcopy(payload)
     existing_cache = stored.get("response_cache") or {}
@@ -108,6 +153,33 @@ def _set_static_cache(cache: dict, key: tuple, payload: dict) -> None:
 def _clear_static_response_caches() -> None:
     _simulation_response_cache.clear()
     _track_response_cache.clear()
+    _live_state_response_cache.clear()
+    _live_truth_response_cache.clear()
+    _live_probability_response_cache.clear()
+    _race_profile_response_cache.clear()
+
+
+async def _race_profile_for_round(round_num: int) -> dict:
+    cache_key = (round_num,)
+    cached = _get_ttl_cache(_race_profile_response_cache, cache_key, _STATIC_RESPONSE_CACHE_TTL_SECONDS, "race_profile")
+    if cached:
+        return cached
+
+    task = _race_profile_tasks.get(cache_key)
+    if task is None or task.done():
+        task = asyncio.create_task(client.get_race_profile(round_num, predictor))
+        _race_profile_tasks[cache_key] = task
+    try:
+        profile = await task
+    finally:
+        if _race_profile_tasks.get(cache_key) is task:
+            _race_profile_tasks.pop(cache_key, None)
+
+    if isinstance(profile, dict) and profile.get("ok", True):
+        _set_ttl_cache(_race_profile_response_cache, cache_key, profile, _STATIC_RESPONSE_CACHE_TTL_SECONDS, "race_profile")
+        cached_profile = _get_ttl_cache(_race_profile_response_cache, cache_key, _STATIC_RESPONSE_CACHE_TTL_SECONDS, "race_profile")
+        return cached_profile or profile
+    return profile
 
 
 def _available_model_ids() -> set[str]:
@@ -164,6 +236,17 @@ def _prediction_model_fields(prediction: dict | None, selected_model_id: str) ->
         "dnf_adapter_source": prediction.get("dnf_adapter_source"),
         "rating_adapter_source": prediction.get("rating_adapter_source"),
     }
+
+
+def _assistant_service() -> F1AssistantService:
+    return F1AssistantService(
+        client=client,
+        predictor=predictor,
+        openf1=openf1,
+        live_engine=live_engine,
+        live_recorder=live_recorder,
+        storage=storage,
+    )
 
 
 def _ml_live_runner_payload(
@@ -390,12 +473,20 @@ def _publish_outcome_probabilities(records: list[OutcomeProbability]) -> dict:
 
 
 def init(fc: F1Client, fp: F1Predictor):
-    global client, predictor, openf1, live_engine, live_recorder, storage
+    global client, predictor, openf1, live_engine, live_recorder, storage, backtester
     client, predictor = fc, fp
     openf1 = OpenF1Client()
     live_engine = F1LiveSessionEngine(openf1)
     live_recorder = FastF1LiveRecorderManager()
     storage = F1Storage()
+    backtester = F1BacktestService(client)
+
+
+def _backtester() -> F1BacktestService:
+    global backtester
+    if backtester is None:
+        backtester = F1BacktestService(client)
+    return backtester
 
 
 async def close():
@@ -754,6 +845,273 @@ def _apply_live_probability_fields(payload: dict, truth: dict | None = None) -> 
     return payload
 
 
+_LIVE_PROBABILITY_ROW_KEYS = {
+    "driver_id",
+    "driver_code",
+    "driver_name",
+    "name",
+    "code",
+    "team",
+    "constructor_id",
+    "position",
+    "rank",
+    "win_probability",
+    "calibrated_probability",
+    "raw_probability",
+    "live_adjusted_probability",
+    "live_probability_delta",
+    "podium_probability",
+    "top5_probability",
+    "points_probability",
+    "dnf_probability",
+    "wdc_probability",
+    "expected_finish",
+    "confidence",
+    "source_mode",
+    "top_reason",
+    "live_dynamics_explanations",
+    "live_evidence_score",
+    "race_sentiment_delta",
+    "race_sentiment_confidence",
+    "strategy_state",
+    "tyre_phase",
+    "pit_window_status",
+    "live_position_delta",
+    "gap_delta",
+    "pace_trend_delta",
+    "tyre_risk_delta",
+    "pit_strategy_delta",
+    "live_strength_multiplier",
+}
+
+
+_LIVE_COMPONENT_KEYS = {
+    "live_position_delta",
+    "gap_delta",
+    "pace_trend_delta",
+    "tyre_risk_delta",
+    "pit_strategy_delta",
+    "live_strength_multiplier",
+    "live_dynamics_explanations",
+    "live_evidence_score",
+    "race_sentiment_delta",
+    "race_sentiment_confidence",
+}
+
+
+_LIVE_STATE_DRIVER_KEYS = {
+    "driver_id",
+    "driver_code",
+    "driver_name",
+    "team",
+    "position",
+    "gap_to_leader",
+    "interval",
+    "lap",
+    "compound",
+    "tyre_age",
+    "pit_stops",
+    "progress",
+    "estimated_progress",
+    "x",
+    "y",
+    "source_mode",
+    "confidence",
+}
+
+
+def _compact_dict(source: dict | None, keys: set[str]) -> dict:
+    source = source or {}
+    return {key: source.get(key) for key in keys if key in source and source.get(key) is not None}
+
+
+def _compact_data_quality(report: dict | None) -> dict:
+    report = report or {}
+    return {
+        "ok": report.get("ok", True),
+        "data_quality_score": report.get("data_quality_score"),
+        "data_quality_label": report.get("data_quality_label"),
+        "source_coverage": report.get("source_coverage") or {},
+        "source_disagreement": {
+            key: value
+            for key, value in (report.get("source_disagreement") or {}).items()
+            if key in {"score", "label", "items"}
+        },
+        "bias_warnings": (report.get("bias_warnings") or [])[:5],
+        "influence_caps_applied": report.get("influence_caps_applied") or {},
+        "leakage_guard_status": report.get("leakage_guard_status") or {},
+    }
+
+
+def _compact_truth_snapshot(truth: dict | None) -> dict:
+    truth = truth or {}
+    signals = truth.get("signals") or {}
+    compact = {
+        "ok": truth.get("ok", True),
+        "round": truth.get("round"),
+        "session": truth.get("session"),
+        "source_mode": truth.get("source_mode"),
+        "confidence": truth.get("confidence"),
+        "confidence_ceiling": truth.get("confidence_ceiling"),
+        "confidence_reason": truth.get("confidence_reason"),
+        "data_age_seconds": truth.get("data_age_seconds"),
+        "fallback_reason": truth.get("fallback_reason"),
+        "missing_groups": truth.get("missing_groups") or [],
+        "source_coverage": truth.get("source_coverage") or {},
+        "data_quality": _compact_data_quality(truth.get("data_quality") or {}),
+    }
+    if signals.get("weather"):
+        compact["signals"] = {"weather": signals.get("weather")}
+    return compact
+
+
+def _compact_live_state_payload(live_state: dict | None) -> dict:
+    live_state = live_state or {}
+    drivers = live_state.get("drivers") or live_state.get("live_positions") or []
+    return {
+        "ok": live_state.get("ok", True),
+        "round": live_state.get("round"),
+        "session": live_state.get("session"),
+        "mode": live_state.get("mode"),
+        "source_mode": live_state.get("source_mode") or live_state.get("mode"),
+        "confidence": live_state.get("confidence"),
+        "data_age_seconds": live_state.get("data_age_seconds"),
+        "fallback_reason": live_state.get("fallback_reason"),
+        "last_successful_source": live_state.get("last_successful_source"),
+        "driver_count": live_state.get("driver_count") or len(drivers),
+        "drivers": [_compact_dict(driver, _LIVE_STATE_DRIVER_KEYS) for driver in drivers[:24] if isinstance(driver, dict)],
+    }
+
+
+def _compact_probability_row(row: dict) -> dict:
+    compact = _compact_dict(row, _LIVE_PROBABILITY_ROW_KEYS)
+    components = _compact_dict(row.get("components") or {}, _LIVE_COMPONENT_KEYS)
+    if components:
+        compact["components"] = components
+    return compact
+
+
+def _compact_live_probability_payload(payload: dict) -> dict:
+    rows = payload.get("probabilities") or []
+    compact_rows = [_compact_probability_row(row) for row in rows if isinstance(row, dict)]
+    compact = {
+        "ok": payload.get("ok", True),
+        "round": payload.get("round"),
+        "session": payload.get("session"),
+        "model_id": payload.get("model_id"),
+        "selected_model_id": payload.get("selected_model_id"),
+        "prediction_model_version": payload.get("prediction_model_version"),
+        "source_mode": payload.get("source_mode"),
+        "confidence": payload.get("confidence"),
+        "confidence_ceiling": payload.get("confidence_ceiling"),
+        "confidence_reason": payload.get("confidence_reason"),
+        "data_age_seconds": payload.get("data_age_seconds"),
+        "fallback_reason": payload.get("fallback_reason"),
+        "missing_groups": payload.get("missing_groups") or [],
+        "probability_explanations": (payload.get("probability_explanations") or [])[:12],
+        "probabilities": compact_rows,
+        "context": payload.get("context") or {},
+        "stage": payload.get("stage"),
+        "calibration_profile": payload.get("calibration_profile") or {},
+        "top_probability_movers": payload.get("top_probability_movers") or [],
+        "strategy_state": payload.get("strategy_state") or {},
+        "probability_timeline": payload.get("probability_timeline") or {},
+        "weather": payload.get("weather") or {},
+        "weather_source": payload.get("weather_source"),
+        "weather_confidence": payload.get("weather_confidence"),
+        "weather_missing": payload.get("weather_missing"),
+        "weather_model_impact": payload.get("weather_model_impact") or {},
+        "weather_explanations": payload.get("weather_explanations") or [],
+        "confidence_report": payload.get("confidence_report") or {},
+        "data_quality": _compact_data_quality(payload.get("data_quality") or {}),
+        "truth": _compact_truth_snapshot(payload.get("truth") or {}),
+        "live_state": _compact_live_state_payload(payload.get("live_state") or {}),
+        "weekend_evidence_confidence": payload.get("weekend_evidence_confidence"),
+        "weekend_evidence_missing_groups": payload.get("weekend_evidence_missing_groups") or [],
+        "sentiment_source_count": payload.get("sentiment_source_count") or 0,
+        "sentiment_article_count": payload.get("sentiment_article_count") or 0,
+        "sentiment_confidence": payload.get("sentiment_confidence") or 0.0,
+        "sentiment_missing_groups": payload.get("sentiment_missing_groups") or [],
+        "sentiment_explanations": (payload.get("sentiment_explanations") or [])[:5],
+        "timeline_record": payload.get("timeline_record") or {},
+        "storage": payload.get("storage") or {},
+    }
+    for key in (
+        "ml_input_source",
+        "ml_provider_sources",
+        "ml_fallback_reason",
+        "ml_confidence",
+        "trained_artifacts_used",
+        "ml_artifact_id",
+        "ml_artifact_version",
+        "ml_live_runner",
+        "ml_live_runner_used",
+    ):
+        if payload.get(key) is not None:
+            compact[key] = payload.get(key)
+    return compact
+
+
+def _compact_timeline_event(event: dict) -> dict:
+    event = event or {}
+    compact = {
+        key: event.get(key)
+        for key in (
+            "at",
+            "type",
+            "lap",
+            "time",
+            "date",
+            "message",
+            "event",
+            "category",
+            "source",
+            "driver",
+            "mode",
+            "source_mode",
+            "confidence",
+            "stage",
+            "chaos_score",
+            "fallback_reason",
+        )
+        if event.get(key) is not None
+    }
+    top_rows = event.get("top5") or event.get("top") or []
+    if isinstance(top_rows, list) and top_rows:
+        compact["top5"] = [
+            _compact_dict(row, {"driver_id", "driver_code", "driver_name", "team", "win_probability", "live_probability_delta"})
+            for row in top_rows[:5]
+            if isinstance(row, dict)
+        ]
+    movers = event.get("movers") or []
+    if isinstance(movers, list) and movers:
+        compact["movers"] = [
+            _compact_dict(row, {"driver_id", "driver_code", "driver_name", "team", "delta", "live_adjusted_probability", "top_reason"})
+            for row in movers[:5]
+            if isinstance(row, dict)
+        ]
+    summary = event.get("live_dynamics_summary") or []
+    if isinstance(summary, list) and summary:
+        compact["live_dynamics_summary"] = [
+            _compact_dict(row, {"driver_id", "driver_code", "delta", "reason"})
+            for row in summary[:5]
+            if isinstance(row, dict)
+        ]
+    return compact
+
+
+def _compact_live_timeline_payload(payload: dict) -> dict:
+    events = payload.get("events") or []
+    return {
+        "ok": payload.get("ok", True),
+        "round": payload.get("round"),
+        "session": payload.get("session"),
+        "current": _compact_live_state_payload(payload.get("current") or {}),
+        "events": [_compact_timeline_event(event) for event in events[-40:] if isinstance(event, dict)],
+        "event_count": len(events),
+    }
+
+
 def _confidence_report(
     truth: dict | None,
     *,
@@ -799,7 +1157,7 @@ def _tyre_phase(dynamic: dict, components: dict) -> dict:
 async def _sprint_unavailable(round_num: int, session: str) -> dict | None:
     if (session or "").lower() != "sprint":
         return None
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     context = profile.get("context") or {}
     if context.get("has_sprint"):
         return None
@@ -812,6 +1170,36 @@ async def _sprint_unavailable(round_num: int, session: str) -> dict | None:
 
 
 async def _live_state_for_round(round_num: int, session: str = "race", force: bool = False) -> dict:
+    session_key = (session or "race").lower()
+    cache_key = (round_num, session_key)
+    if not force:
+        cached = _get_ttl_cache(_live_state_response_cache, cache_key, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_state")
+        if cached:
+            return cached
+        task = _live_state_tasks.get(cache_key)
+        if task is not None and not task.done():
+            state = await task
+            return deepcopy(state)
+        task = asyncio.create_task(_live_state_for_round_uncached(round_num, session=session, force=False))
+        _live_state_tasks[cache_key] = task
+        try:
+            state = await task
+        finally:
+            if _live_state_tasks.get(cache_key) is task:
+                _live_state_tasks.pop(cache_key, None)
+        return deepcopy(state)
+    else:
+        _live_state_response_cache.pop(cache_key, None)
+        _live_truth_response_cache.pop((round_num, session_key, True), None)
+        for key in list(_live_probability_response_cache):
+            if key[0] == round_num and key[1] == session_key:
+                _live_probability_response_cache.pop(key, None)
+    return await _live_state_for_round_uncached(round_num, session=session, force=force)
+
+
+async def _live_state_for_round_uncached(round_num: int, session: str = "race", force: bool = False) -> dict:
+    session_key = (session or "race").lower()
+    cache_key = (round_num, session_key)
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
@@ -844,6 +1232,7 @@ async def _live_state_for_round(round_num: int, session: str = "race", force: bo
     attach_confidence_report(state, _confidence_report({}, live_state=state))
     if storage and state:
         state["storage"] = await storage.persist_live_state(client.season, race, session, state)
+    _set_ttl_cache(_live_state_response_cache, cache_key, state, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_state")
     return state
 
 
@@ -974,6 +1363,54 @@ async def _car_model_for_round(
     }
 
 
+async def _car_performance_agent_for_round(
+    round_num: int,
+    session: str = "race",
+    live: bool = False,
+    *,
+    constructor_id: str | None = None,
+    include_car_data: bool = False,
+) -> dict:
+    payload = await _car_model_for_round(
+        round_num,
+        session=session,
+        live=live,
+        include_car_data=include_car_data,
+    )
+    if not payload.get("ok"):
+        return payload
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+
+    weekend_evidence = await _weekend_evidence_for_round(
+        round_num,
+        session=session,
+        live=live,
+        weather=payload.get("weather") or {},
+    )
+    analysis = build_car_performance_agent(
+        race=race,
+        drivers=client.get_drivers(),
+        constructors=client.get_constructors(),
+        features={},
+        session=session,
+        constructor_id=constructor_id,
+        track=payload.get("track") or {},
+        weather=payload.get("weather") or {},
+        tires=payload.get("tires") or {},
+        weekend_evidence=weekend_evidence if weekend_evidence.get("ok", True) else {},
+        openf1_session={"raw_counts": payload.get("openf1_raw_counts") or {}},
+        car_model=payload.get("car_model") or {},
+        sentiment_impact=payload.get("sentiment_impact") or {},
+    )
+    if analysis.get("ok"):
+        analysis["race"] = payload.get("race")
+        analysis["live"] = live
+        analysis["include_car_data"] = include_car_data
+    return analysis
+
+
 async def _weekend_evidence_for_round(
     round_num: int,
     session: str = "race",
@@ -999,7 +1436,7 @@ async def _weekend_evidence_for_round(
         if cached:
             return cached
 
-    profile = profile if profile is not None else await client.get_race_profile(round_num, predictor)
+    profile = profile if profile is not None else await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
 
@@ -1010,9 +1447,14 @@ async def _weekend_evidence_for_round(
             sessions_to_fetch.add("qualifying")
         if (profile.get("context") or {}).get("has_sprint"):
             sessions_to_fetch.update({"sprint", "sprint_qualifying"})
+        future_weekend = race.date > datetime.now(timezone.utc)
+        missing_timing_sessions = 0
         for code in sorted(sessions_to_fetch):
             if openf1_session is not None and code == session_code:
                 openf1_sessions[code] = openf1_session
+                continue
+            if future_weekend and missing_timing_sessions >= 2:
+                openf1_sessions[code] = _openf1_probe_short_circuited(code)
                 continue
             try:
                 openf1_sessions[code] = await openf1.get_session_features(
@@ -1021,6 +1463,8 @@ async def _weekend_evidence_for_round(
                     drivers=client.get_drivers(),
                     live=live and code == session_code,
                 )
+                if _openf1_detail_unavailable(openf1_sessions[code]):
+                    missing_timing_sessions += 1
             except Exception as exc:
                 openf1_sessions[code] = {
                     "ok": False,
@@ -1028,6 +1472,7 @@ async def _weekend_evidence_for_round(
                     "session": code,
                     "reason": f"openf1_error:{exc.__class__.__name__}",
                 }
+                missing_timing_sessions += 1
     elif openf1_session is not None:
         openf1_sessions[session_code] = openf1_session
 
@@ -1075,6 +1520,7 @@ async def _truth_snapshot_for_round(
     openf1_session: dict | None = None,
     live_state: dict | None = None,
 ) -> dict:
+    session_key = (session or "race").lower()
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
@@ -1083,7 +1529,13 @@ async def _truth_snapshot_for_round(
     if sprint_error:
         return {**sprint_error, "race": race.model_dump(mode="json")}
 
-    profile = profile if profile is not None else await client.get_race_profile(round_num, predictor)
+    cache_key = (round_num, session_key, bool(live))
+    if live:
+        cached = _get_ttl_cache(_live_truth_response_cache, cache_key, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "race_truth")
+        if cached:
+            return cached
+
+    profile = profile if profile is not None else await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
 
@@ -1163,6 +1615,8 @@ async def _truth_snapshot_for_round(
     attach_confidence_report(truth, _confidence_report(truth, live_state=live_state or features.get("live_state") or {}))
     if storage and truth.get("ok"):
         truth["storage"] = await storage.persist_truth_snapshot(client.season, race, session, truth)
+    if live:
+        _set_ttl_cache(_live_truth_response_cache, cache_key, truth, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "race_truth")
     return truth
 
 
@@ -1203,13 +1657,31 @@ def _openf1_session_arg(session_code: str) -> str:
     }.get(session_code, "race")
 
 
+def _openf1_detail_unavailable(payload: dict | None) -> bool:
+    if not payload or not payload.get("ok"):
+        return True
+    raw_counts = payload.get("raw_counts") or {}
+    return not any(int(raw_counts.get(key) or 0) > 0 for key in ("laps", "positions", "intervals"))
+
+
+def _openf1_probe_short_circuited(session_code: str) -> dict:
+    return {
+        "ok": False,
+        "source": "openf1",
+        "session": session_code,
+        "reason": "openf1_detail_probe_short_circuited",
+        "raw_counts": {},
+        "detail_probe_stopped": True,
+    }
+
+
 async def _weekend_session_result(round_num: int, session: str) -> dict:
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
 
     session_code = _canonical_weekend_session(session)
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
 
@@ -1459,6 +1931,31 @@ def _fastf1_mode(value: str | None) -> str:
     return mode if mode in {"off", "fallback", "force"} else "off"
 
 
+@router.get("/assistant/context")
+async def get_f1_assistant_context(route: str = "/F1"):
+    return (await _assistant_service().context(route)).model_dump()
+
+
+@router.get("/assistant/tools")
+async def get_f1_assistant_tools():
+    return _assistant_service().tools()
+
+
+@router.get("/assistant/diagnostics")
+async def get_f1_assistant_diagnostics(route: str = "/F1"):
+    return await _assistant_service().diagnostics(route)
+
+
+@router.post("/assistant/chat")
+async def post_f1_assistant_chat(request: AssistantChatRequest):
+    return (await _assistant_service().chat(request)).model_dump()
+
+
+@router.post("/assistant/action")
+async def post_f1_assistant_action(request: AssistantActionRequest):
+    return (await _assistant_service().action(request)).model_dump()
+
+
 @router.get("/drivers")
 async def get_drivers():
     drivers = client.get_drivers()
@@ -1528,6 +2025,22 @@ async def get_constructor_car_model(
     }
 
 
+@router.get("/constructors/{constructor_id}/car-performance-agent")
+async def get_constructor_car_performance_agent(
+    constructor_id: str,
+    round: int | None = None,
+    session: str = "race",
+    include_car_data: bool = False,
+):
+    round_num = round or next((race.round for race in client.get_races() if race.status != "COMPLETED"), None) or 1
+    return await _car_performance_agent_for_round(
+        round_num,
+        session=session,
+        constructor_id=constructor_id,
+        include_car_data=include_car_data,
+    )
+
+
 @router.get("/calendar")
 async def get_calendar():
     races = client.get_races()
@@ -1543,8 +2056,7 @@ async def get_f1_models():
 
 @router.get("/models/compare")
 async def compare_f1_models(season: int | None = None, include_races: bool = False, allow_partial: bool = False, stage: str = "pre_weekend"):
-    backtester = F1BacktestService(client)
-    return await backtester.compare_season(season=season, include_races=include_races, allow_partial=allow_partial, stage=stage)
+    return await _backtester().compare_season(season=season, include_races=include_races, allow_partial=allow_partial, stage=stage)
 
 
 @router.get("/models/compare/summary")
@@ -1555,9 +2067,8 @@ async def compare_f1_models_summary(
     allow_partial: bool = False,
     stage: str = "pre_weekend",
 ):
-    backtester = F1BacktestService(client)
     end = end_season if end_season is not None else max(start_season, client.season - 1)
-    return await backtester.compare_summary(
+    return await _backtester().compare_summary(
         start_season=start_season,
         end_season=end,
         include_races=include_races,
@@ -1667,8 +2178,7 @@ async def get_f1_storage_health():
 
 @router.get("/backtest")
 async def get_f1_backtest(season: int | None = None, include_races: bool = False, allow_partial: bool = False, model_id: str | None = None, stage: str = "pre_weekend"):
-    backtester = F1BacktestService(client)
-    result = await backtester.backtest_season(season=season, include_races=include_races, allow_partial=allow_partial, model_id=model_id, stage=stage)
+    result = await _backtester().backtest_season(season=season, include_races=include_races, allow_partial=allow_partial, model_id=model_id, stage=stage)
     if storage and result.get("ok"):
         result["storage"] = await storage.persist_backtest_result(result)
     return result
@@ -1686,9 +2196,8 @@ async def get_f1_deep_backtest(
     export_artifact: bool = False,
     cache_policy: str = "read_through",
 ):
-    backtester = F1BacktestService(client)
     end = end_season if end_season is not None else max(start_season, client.season - 1)
-    result = await backtester.deep_backtest(
+    result = await _backtester().deep_backtest(
         start_season=start_season,
         end_season=end,
         stages=_csv_values(stages),
@@ -1748,7 +2257,7 @@ async def _build_backtest_evidence_cache_round(
         if not race:
             return {"ok": False, "reason": "Race not found", "code": "race_not_found", "round": round_num}
         drivers = client.get_drivers()
-        profile = await client.get_race_profile(round_num, predictor)
+        profile = await _race_profile_for_round(round_num)
         if not profile.get("ok"):
             return profile
     result = await writer.build_round(
@@ -2058,7 +2567,7 @@ async def get_f1_live_timeline(round_num: int, session: str = "race"):
         return {**sprint_error, "race": race.model_dump(mode="json")}
     if not live_engine:
         return {"ok": False, "reason": "Live session engine unavailable", "events": []}
-    return live_engine.get_timeline(race, session=session)
+    return _compact_live_timeline_payload(live_engine.get_timeline(race, session=session))
 
 
 @router.get("/live/{round_num}/sources")
@@ -2229,14 +2738,15 @@ async def stop_f1_live_recorder(round_num: int, session: str = "race"):
 
 
 @router.get("/live/{round_num}/probabilities")
-async def get_f1_live_probabilities(round_num: int, session: str = "race", model_id: str | None = None):
+async def get_f1_live_probabilities(round_num: int, session: str = "race", model_id: str | None = None, compact: bool = False):
     selected_model_id, model_error = _resolve_model_id(model_id)
     if model_error:
         return model_error
+    session_key = (session or "race").lower()
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
     context = profile.get("context") or {}
@@ -2248,6 +2758,10 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
             "race": race.model_dump(mode="json"),
             "context": context,
         }
+    cache_key = (round_num, session_key, selected_model_id, bool(compact))
+    cached = _get_ttl_cache(_live_probability_response_cache, cache_key, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_probabilities")
+    if cached:
+        return cached
     features = await client.get_prediction_features()
     live_state = await _live_state_for_round(round_num, session=session, force=False)
     if live_state.get("ok") or live_state.get("mode"):
@@ -2380,7 +2894,9 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
             payload,
             model_id=simulation.get("model_id") or simulation.get("model_version") or "production_v1",
         )
-    return payload
+    response_payload = _compact_live_probability_payload(payload) if compact else payload
+    _set_ttl_cache(_live_probability_response_cache, cache_key, response_payload, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_probabilities")
+    return response_payload
 
 
 @router.get("/backtest/summary")
@@ -2392,9 +2908,8 @@ async def get_f1_backtest_summary(
     model_id: str | None = None,
     stage: str = "pre_weekend",
 ):
-    backtester = F1BacktestService(client)
     end = end_season if end_season is not None else max(start_season, client.season - 1)
-    result = await backtester.backtest_summary(
+    result = await _backtester().backtest_summary(
         start_season=start_season,
         end_season=end,
         include_races=include_races,
@@ -2409,8 +2924,7 @@ async def get_f1_backtest_summary(
 
 @router.get("/backtest/races/{season}/{round_num}")
 async def get_f1_backtest_race(season: int, round_num: int, allow_partial: bool = True, model_id: str | None = None, stage: str = "pre_weekend"):
-    backtester = F1BacktestService(client)
-    result = await backtester.backtest_race(season=season, round_num=round_num, allow_partial=allow_partial, model_id=model_id, stage=stage)
+    result = await _backtester().backtest_race(season=season, round_num=round_num, allow_partial=allow_partial, model_id=model_id, stage=stage)
     if storage and result.get("ok"):
         result["storage"] = await storage.persist_backtest_result(result)
     return result
@@ -2547,7 +3061,7 @@ async def get_race(round_num: int):
 
 @router.get("/races/{round_num}/profile")
 async def get_race_profile(round_num: int):
-    return await client.get_race_profile(round_num, predictor)
+    return await _race_profile_for_round(round_num)
 
 
 @router.get("/races/{round_num}/sessions/{session}")
@@ -2574,7 +3088,7 @@ async def get_race_data_quality(round_num: int, session: str = "race", live: boo
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
     truth = await _truth_snapshot_for_round(round_num, session=session, live=live, profile=profile)
@@ -2620,6 +3134,23 @@ async def get_race_car_model(
     return await _car_model_for_round(round_num, session=session, live=live, include_car_data=include_car_data)
 
 
+@router.get("/races/{round_num}/car-performance-agent")
+async def get_race_car_performance_agent(
+    round_num: int,
+    session: str = "race",
+    constructor_id: str | None = None,
+    live: bool = False,
+    include_car_data: bool = False,
+):
+    return await _car_performance_agent_for_round(
+        round_num,
+        session=session,
+        live=live,
+        constructor_id=constructor_id,
+        include_car_data=include_car_data,
+    )
+
+
 @router.get("/races/{round_num}/sentiment-impact")
 async def get_race_sentiment_impact(round_num: int, session: str = "race"):
     race = client.get_race_by_round(round_num)
@@ -2640,7 +3171,7 @@ async def get_race_probability_audit(
     race = client.get_race_by_round(round_num)
     if not race:
         return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
     simulation = await get_race_simulation(round_num, session=session, live=live, model_id=model_id)
@@ -2697,7 +3228,7 @@ async def get_race_features(round_num: int, session: str = "race", live: bool = 
     if not race:
         return {"ok": False, "reason": "Race not found"}
     if (session or "").lower() == "sprint":
-        profile = await client.get_race_profile(round_num, predictor)
+        profile = await _race_profile_for_round(round_num)
         context = profile.get("context") or {}
         if not context.get("has_sprint"):
             return {
@@ -2721,7 +3252,7 @@ async def get_race_features(round_num: int, session: str = "race", live: bool = 
     if live and live_engine:
         live_state = await live_engine.get_state(race, client.get_drivers(), session=session, force=False)
         features = {**features, "live_state": live_state}
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     truth = await _truth_snapshot_for_round(
         round_num,
         session=session,
@@ -2804,7 +3335,7 @@ async def get_race_simulation(
         return {"ok": False, "reason": "Race not found"}
 
     features = await client.get_prediction_features()
-    profile = await client.get_race_profile(round_num, predictor)
+    profile = await _race_profile_for_round(round_num)
     if not profile.get("ok"):
         return profile
     context = profile.get("context") or {}
@@ -2979,7 +3510,7 @@ async def get_race_track(round_num: int, session: str = "race", live: bool = Fal
     if not openf1:
         return {"ok": False, "reason": "OpenF1 client unavailable"}
     if normalized_session == "sprint":
-        profile = await client.get_race_profile(round_num, predictor)
+        profile = await _race_profile_for_round(round_num)
         context = profile.get("context") or {}
         if not context.get("has_sprint"):
             return {

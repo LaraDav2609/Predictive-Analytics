@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import re
+import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,11 @@ WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIMEDIA_HEADERS = {
     "User-Agent": "F1PredictorDashboard/1.0 (https://localhost.localdomain)",
 }
+OPENF1_MISSING_ENDPOINT_TTL_SECONDS = 10 * 60
+OPENF1_STATIC_ENDPOINT_TTL_SECONDS = 5 * 60
+OPENF1_EMPTY_SESSION_FEATURES_TTL_SECONDS = 2 * 60
+OPENF1_LIVE_SESSION_FEATURES_TTL_SECONDS = 8
+OPENF1_STATIC_SESSION_FEATURES_TTL_SECONDS = 60
 
 
 class OpenF1Client:
@@ -35,13 +41,39 @@ class OpenF1Client:
         self._trace_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._svg_trace_cache: dict[str, dict[str, Any]] = {}
         self._last_error: dict[str, Any] | None = None
+        self._rate_limit_until: datetime | None = None
+        self._negative_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[datetime, dict[str, Any]]] = {}
+        self._positive_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[datetime, list[dict[str, Any]]]] = {}
+        self._inflight_requests: dict[
+            tuple[str, tuple[tuple[str, str], ...]],
+            asyncio.Task[tuple[list[dict[str, Any]], dict[str, Any] | None]],
+        ] = {}
+        self._session_features_cache: dict[
+            tuple[Any, ...],
+            tuple[datetime, dict[str, Any]],
+        ] = {}
+        self._session_features_inflight: dict[
+            tuple[Any, ...],
+            asyncio.Task[dict[str, Any]],
+        ] = {}
 
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def get_session_data(self, race: Race, session: str = "race", live: bool = False) -> dict[str, Any]:
+    async def get_session_data(
+        self,
+        race: Race,
+        session: str = "race",
+        live: bool = False,
+        historical_fallback: bool = False,
+    ) -> dict[str, Any]:
         session_kind = _session_kind(session)
-        session_rows = await self._find_session_candidates(race, session_kind, live)
+        session_rows = await self._find_session_candidates(
+            race,
+            session_kind,
+            live,
+            historical_fallback=historical_fallback,
+        )
         if not session_rows:
             reason = "openf1_session_unavailable"
             if self._last_error and self._last_error.get("status_code") == 429:
@@ -64,21 +96,100 @@ class OpenF1Client:
         live: bool = False,
         endpoints: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> dict[str, Any]:
-        session_info = await self.get_session_data(race, session, live)
+        if _race_session_is_future(race, session, live):
+            return {
+                "ok": False,
+                "source": "openf1",
+                "session": _session_kind(session),
+                "reason": "openf1_future_session_not_started",
+                "raw_counts": _empty_raw_counts(),
+                "confidence": 0.0,
+            }
+        selected = _feature_endpoints(endpoints)
+        cache_key = _session_features_cache_key(race, session, drivers or [], live, selected)
+        now = datetime.now(timezone.utc)
+        cached = self._session_features_cache.get(cache_key)
+        if cached:
+            expires_at, payload = cached
+            if now < expires_at:
+                cached_at = payload.get("_cached_at") if isinstance(payload, dict) else None
+                public_payload = {key: value for key, value in payload.items() if key != "_cached_at"}
+                return deepcopy({
+                    **public_payload,
+                    "cache": "session_features",
+                    "cache_age_seconds": max(
+                        0,
+                        int((now - cached_at).total_seconds()) if isinstance(cached_at, datetime) else 0,
+                    ),
+                })
+            self._session_features_cache.pop(cache_key, None)
+
+        task = self._session_features_inflight.get(cache_key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._get_session_features_uncached(
+                    race,
+                    session=session,
+                    drivers=drivers,
+                    live=live,
+                    selected=selected,
+                )
+            )
+            self._session_features_inflight[cache_key] = task
+        try:
+            payload = await task
+        finally:
+            if self._session_features_inflight.get(cache_key) is task:
+                self._session_features_inflight.pop(cache_key, None)
+
+        ttl = _session_features_ttl_seconds(payload, live)
+        if ttl > 0:
+            cached_payload = deepcopy(payload)
+            cached_payload["_cached_at"] = datetime.now(timezone.utc)
+            self._session_features_cache[cache_key] = (
+                datetime.now(timezone.utc) + timedelta(seconds=ttl),
+                cached_payload,
+            )
+        return deepcopy(payload)
+
+    async def _get_session_features_uncached(
+        self,
+        race: Race,
+        session: str = "race",
+        drivers: list[Driver] | None = None,
+        live: bool = False,
+        selected: set[str] | None = None,
+    ) -> dict[str, Any]:
+        session_info = await self.get_session_data(race, session, live, historical_fallback=False)
         if not session_info.get("ok"):
             return session_info
         session_key = session_info.get("session_key")
         if not session_key:
             return {"ok": False, "source": "openf1", "reason": "openf1_session_key_missing"}
 
-        selected = _feature_endpoints(endpoints)
-        lap_rows = await self.get_laps(int(session_key)) if "laps" in selected else []
-        position_rows = await self.get_positions(int(session_key)) if "positions" in selected else []
-        interval_rows = await self.get_intervals(int(session_key)) if "intervals" in selected else []
-        stint_rows = await self.get_stints(int(session_key)) if "stints" in selected else []
-        pit_rows = await self.get_pits(int(session_key)) if "pits" in selected else []
-        weather_rows = await self.get_weather(int(session_key)) if "weather" in selected else []
-        race_control_rows = await self.get_race_control(int(session_key)) if "race_control" in selected else []
+        selected = selected or _feature_endpoints(None)
+        missing_detail_count = 0
+        skipped_endpoints: list[str] = []
+
+        async def fetch_detail(name: str, loader) -> list[dict[str, Any]]:
+            nonlocal missing_detail_count
+            if name not in selected:
+                return []
+            if missing_detail_count >= 2:
+                skipped_endpoints.append(name)
+                return []
+            rows = await loader()
+            if self._last_error and self._last_error.get("status_code") in {404, 410}:
+                missing_detail_count += 1
+            return rows
+
+        lap_rows = await fetch_detail("laps", lambda: self.get_laps(int(session_key)))
+        position_rows = await fetch_detail("positions", lambda: self.get_positions(int(session_key)))
+        interval_rows = await fetch_detail("intervals", lambda: self.get_intervals(int(session_key)))
+        stint_rows = await fetch_detail("stints", lambda: self.get_stints(int(session_key)))
+        pit_rows = await fetch_detail("pits", lambda: self.get_pits(int(session_key)))
+        weather_rows = await fetch_detail("weather", lambda: self.get_weather(int(session_key)))
+        race_control_rows = await fetch_detail("race_control", lambda: self.get_race_control(int(session_key)))
         return {
             "ok": True,
             "source": "openf1",
@@ -86,6 +197,8 @@ class OpenF1Client:
             "session_key": session_key,
             "meeting_key": session_info.get("meeting_key"),
             "requested_endpoints": sorted(selected),
+            "skipped_endpoints": skipped_endpoints,
+            "detail_probe_stopped": bool(skipped_endpoints),
             "laps": _summarize_laps(lap_rows, drivers or []),
             "positions": _summarize_positions(position_rows, drivers or []),
             "intervals": _summarize_intervals(interval_rows, drivers or []),
@@ -137,6 +250,7 @@ class OpenF1Client:
         drivers: list[Driver],
         session: str = "race",
         live: bool = False,
+        static_only: bool = False,
     ) -> dict[str, Any]:
         """Return normalized OpenF1 trace/live coordinates for an F1 session.
 
@@ -146,6 +260,8 @@ class OpenF1Client:
         """
         session_kind = _session_kind(session)
         track_key = _track_key(race)
+        if _race_session_is_future(race, session, live):
+            return _estimated_trace(race, "openf1_future_session_not_started_static_geometry")
         if track_key in CURATED_PREFERRED_TRACKS and not live:
             return _estimated_trace(race, "preferred_curated_centerline_geometry")
 
@@ -155,7 +271,15 @@ class OpenF1Client:
             if svg_trace:
                 return svg_trace
 
-        session_rows = await self._find_session_candidates(race, session_kind, live)
+        if static_only:
+            return _estimated_trace(race, "openf1_timing_unavailable_static_geometry")
+
+        session_rows = await self._find_session_candidates(
+            race,
+            session_kind,
+            live,
+            historical_fallback=not live,
+        )
         if not session_rows:
             if session_kind != "race":
                 fallback = await self._fallback_race_trace(race, drivers, f"openf1_{session_kind}_session_unavailable")
@@ -268,7 +392,7 @@ class OpenF1Client:
         raise ValueError(f"wikimedia_svg_url_unavailable:{filename}")
 
     async def _fallback_race_trace(self, race: Race, drivers: list[Driver], reason: str) -> dict[str, Any] | None:
-        race_sessions = await self._find_session_candidates(race, "race", False)
+        race_sessions = await self._find_session_candidates(race, "race", False, historical_fallback=True)
         for session_row in race_sessions:
             session_key = session_row.get("session_key")
             meeting_key = session_row.get("meeting_key")
@@ -295,14 +419,21 @@ class OpenF1Client:
                 }, race)
         return None
 
-    async def _find_session_candidates(self, race: Race, session_kind: str, live: bool) -> list[dict[str, Any]]:
-        cache_key = (race.date.year, race.round, session_kind)
+    async def _find_session_candidates(
+        self,
+        race: Race,
+        session_kind: str,
+        live: bool,
+        historical_fallback: bool = False,
+    ) -> list[dict[str, Any]]:
+        cache_key = (race.date.year, race.round, session_kind, bool(historical_fallback))
         if cache_key in self._session_cache:
             return self._session_cache[cache_key]
 
         candidates: list[dict[str, Any]] = []
         rate_limited = False
-        for year in _candidate_years(race.date.year):
+        years = [race.date.year] if live or not historical_fallback else _candidate_years(race.date.year)
+        for year in years:
             year_sessions = await self._get_list("/sessions", {"year": year})
             if self._last_error and self._last_error.get("status_code") == 429:
                 rate_limited = True
@@ -340,11 +471,17 @@ class OpenF1Client:
 
         raw_points: list[dict[str, float]] = []
         trace_driver_number: int | None = None
+        missing_location_count = 0
         for driver_number in driver_numbers:
+            if missing_location_count >= 1:
+                break
             rows = await self._get_list("/location", {
                 "session_key": session_key,
                 "driver_number": driver_number,
             })
+            if self._last_error and self._last_error.get("status_code") in {404, 410}:
+                missing_location_count += 1
+                continue
             raw_points = _valid_location_points(rows)
             if len(raw_points) >= 24:
                 trace_driver_number = driver_number
@@ -414,36 +551,198 @@ class OpenF1Client:
         return rows[0] if rows else None
 
     async def _get_list(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        request_key = _request_cache_key(path, params)
+        positive = self._positive_cache.get(request_key)
+        if positive:
+            expires_at, cached_rows = positive
+            if now < expires_at:
+                self._last_error = None
+                return _clone_rows(cached_rows)
+            self._positive_cache.pop(request_key, None)
+
+        negative = self._negative_cache.get(request_key)
+        if negative:
+            expires_at, cached_error = negative
+            if now < expires_at:
+                self._last_error = {
+                    **cached_error,
+                    "cached": True,
+                    "retry_after_seconds": max(1, int((expires_at - now).total_seconds())),
+                }
+                return []
+            self._negative_cache.pop(request_key, None)
+        if self._rate_limit_until and now < self._rate_limit_until:
+            self._last_error = {
+                "path": path,
+                "params": params,
+                "status_code": 429,
+                "error": "OpenF1RateLimitCooldown",
+                "retry_after_seconds": max(1, int((self._rate_limit_until - now).total_seconds())),
+            }
+            return []
+
+        task = self._inflight_requests.get(request_key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._get_list_uncached(path, params, request_key))
+            self._inflight_requests[request_key] = task
+        try:
+            rows, error = await task
+            self._last_error = error
+            return list(rows)
+        finally:
+            if self._inflight_requests.get(request_key) is task:
+                self._inflight_requests.pop(request_key, None)
+
+    async def _get_list_uncached(
+        self,
+        path: str,
+        params: dict[str, Any],
+        request_key: tuple[str, tuple[tuple[str, str], ...]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         for attempt in range(3):
             try:
-                self._last_error = None
                 response = await self._client.get(path, params=params)
                 response.raise_for_status()
                 data = response.json()
-                return data if isinstance(data, list) else []
+                rows = data if isinstance(data, list) else []
+                ttl = _positive_cache_ttl_seconds(path)
+                if ttl and rows:
+                    self._positive_cache[request_key] = (
+                        datetime.now(timezone.utc) + timedelta(seconds=ttl),
+                        _clone_rows(rows),
+                    )
+                return rows, None
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response else None
-                self._last_error = {
+                error = {
                     "path": path,
                     "params": params,
                     "status_code": status_code,
                     "error": exc.__class__.__name__,
                 }
-                if status_code == 429 and attempt < 2:
-                    await asyncio.sleep(0.8 * (attempt + 1))
-                    continue
+                if status_code == 429:
+                    self._rate_limit_until = datetime.now(timezone.utc) + timedelta(seconds=45)
+                    logger.warning("OpenF1 rate limited; cooling requests for 45 seconds")
+                    return [], error
+                if status_code in {404, 410}:
+                    expires_at = datetime.now(timezone.utc) + timedelta(seconds=OPENF1_MISSING_ENDPOINT_TTL_SECONDS)
+                    self._negative_cache[request_key] = (expires_at, {**error, "negative_cache": True})
+                    logger.info("OpenF1 endpoint unavailable; caching miss for %s %s", path, params)
+                    return [], error
                 logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
-                return []
+                return [], error
             except (httpx.HTTPError, ValueError) as exc:
-                self._last_error = {
+                error = {
                     "path": path,
                     "params": params,
                     "status_code": None,
                     "error": exc.__class__.__name__,
                 }
                 logger.warning("OpenF1 request failed for %s %s: %s", path, params, exc)
-                return []
-        return []
+                return [], error
+        return [], None
+
+
+def _positive_cache_ttl_seconds(path: str) -> int:
+    if path in {"/sessions", "/meetings", "/drivers"}:
+        return OPENF1_STATIC_ENDPOINT_TTL_SECONDS
+    return 0
+
+
+def _session_features_ttl_seconds(payload: dict[str, Any], live: bool) -> int:
+    if not payload.get("ok"):
+        reason = str(payload.get("reason") or "")
+        if reason in {"openf1_rate_limited", "openf1_session_unavailable"}:
+            return OPENF1_EMPTY_SESSION_FEATURES_TTL_SECONDS
+        return 30
+    raw_counts = payload.get("raw_counts") or {}
+    has_rows = any(int(value or 0) > 0 for value in raw_counts.values())
+    if not has_rows:
+        return OPENF1_EMPTY_SESSION_FEATURES_TTL_SECONDS
+    return OPENF1_LIVE_SESSION_FEATURES_TTL_SECONDS if live else OPENF1_STATIC_SESSION_FEATURES_TTL_SECONDS
+
+
+def _session_features_cache_key(
+    race: Race,
+    session: str,
+    drivers: list[Driver],
+    live: bool,
+    selected: set[str],
+) -> tuple[Any, ...]:
+    driver_numbers = tuple(sorted(str(driver.number or "") for driver in drivers))
+    return (
+        _race_year(race),
+        int(race.round or 0),
+        _session_kind(session),
+        bool(live),
+        tuple(sorted(selected)),
+        driver_numbers,
+    )
+
+
+def _race_year(race: Race) -> int:
+    year = getattr(race, "year", None)
+    if year:
+        return int(year)
+    date_value = getattr(race, "date", None)
+    if isinstance(date_value, datetime):
+        return int(date_value.year)
+    if hasattr(date_value, "year"):
+        return int(date_value.year)
+    return 0
+
+
+def _race_session_is_future(race: Race, session: str, live: bool) -> bool:
+    date_value = getattr(race, "date", None)
+    if not date_value:
+        return False
+    if isinstance(date_value, datetime):
+        race_datetime = date_value
+    else:
+        race_datetime = datetime(date_value.year, date_value.month, date_value.day, tzinfo=timezone.utc)
+    if race_datetime.tzinfo is None:
+        race_datetime = race_datetime.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now < (race_datetime - timedelta(days=4)):
+        return True
+    if not live:
+        return False
+    session_kind = _session_kind(session)
+    # Practice and qualifying can exist before race day, so only hard-stop live race
+    # probes until the race date is near enough to plausibly have live timing rows.
+    if session_kind != "race":
+        return False
+    return now < (race_datetime - timedelta(hours=6))
+
+
+def _empty_raw_counts() -> dict[str, int]:
+    return {
+        "laps": 0,
+        "positions": 0,
+        "intervals": 0,
+        "stints": 0,
+        "pits": 0,
+        "weather": 0,
+        "race_control": 0,
+    }
+
+
+def _clone_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row) for row in rows]
+
+
+def _request_cache_key(path: str, params: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return (
+        path,
+        tuple(sorted((str(key), _cache_value(value)) for key, value in (params or {}).items())),
+    )
+
+
+def _cache_value(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return str(value)
+    return repr(value)
 
 
 def _feature_endpoints(endpoints: list[str] | tuple[str, ...] | set[str] | None) -> set[str]:

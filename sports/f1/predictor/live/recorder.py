@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+MODULE_CHECK_CACHE_SECONDS = 10 * 60
+MODULE_CHECK_TIMEOUT_SECONDS = 3
+
 
 class FastF1LiveRecorderManager:
     def __init__(self, directory: str | None = None) -> None:
@@ -141,14 +144,15 @@ class FastF1LiveRecorderManager:
         now = monotonic()
         key = (executable, module)
         cached = self._module_cache.get(key)
-        if cached and now - cached[0] < 60.0:
+        if cached and now - cached[0] < MODULE_CHECK_CACHE_SECONDS:
             return cached[1]
         try:
             result = subprocess.run(
                 [executable, "-c", f"import {module}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                stdin=subprocess.DEVNULL,
+                timeout=MODULE_CHECK_TIMEOUT_SECONDS,
             )
             available = result.returncode == 0
         except Exception:

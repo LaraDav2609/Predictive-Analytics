@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from sports.f1.data.f1_client import F1Client
 from sports.baseball.data.mlb_client import MLBClient
@@ -13,7 +14,7 @@ from sports.baseball.data.mlb_historical_client import MLBHistoricalClient
 from sports.baseball.data.pybaseball_client import PybaseballClient
 from sports.f1.analytics.f1_predictor import F1Predictor
 from sports.baseball.analytics.baseball_predictor import BaseballPredictor
-from sports.f1.data.f1_sentiment import refresh_f1_sentiment
+from sports.f1.data.f1_sentiment import read_f1_sentiment, refresh_f1_sentiment
 from common.api import common_routes
 from sports.f1.api import f1_routes
 from sports.baseball.api import baseball_routes, baseball_history_routes
@@ -22,6 +23,8 @@ from games.csgo.analytics.csgo_predictor import CsgoPredictor
 from games.csgo.api import csgo_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Shared client instances
@@ -50,18 +53,33 @@ def _track_startup_task(name: str, coro) -> None:
 async def _load_f1_data(client: F1Client, predictor: F1Predictor) -> None:
     await client.refresh()
     f1_features = await client.get_prediction_features()
+    f1_sentiment = None
     try:
-        f1_sentiment = await asyncio.wait_for(
-            refresh_f1_sentiment(
-                client.get_drivers(),
-                client.get_constructors(),
-                client.season,
-            ),
-            timeout=20,
-        )
+        cached_sentiment = read_f1_sentiment(client.get_drivers(), client.get_constructors())
+        if (
+            cached_sentiment.get("source_items")
+            or cached_sentiment.get("published_items")
+            or cached_sentiment.get("composite")
+            or cached_sentiment.get("items")
+        ):
+            f1_sentiment = cached_sentiment
+            logger.info("F1 sentiment startup reused cached snapshot")
     except Exception as exc:
-        logger.warning("F1 sentiment startup refresh skipped: %s", exc)
-        f1_sentiment = None
+        logger.debug("F1 sentiment startup cache read skipped: %s", exc)
+
+    if not f1_sentiment:
+        try:
+            f1_sentiment = await asyncio.wait_for(
+                refresh_f1_sentiment(
+                    client.get_drivers(),
+                    client.get_constructors(),
+                    client.season,
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            logger.warning("F1 sentiment startup refresh skipped: %s", exc)
+            f1_sentiment = None
     predictor.load_drivers(
         client.get_drivers(),
         client.get_constructors(),
@@ -137,6 +155,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(common_routes.router, prefix="/api")
 app.include_router(f1_routes.router, prefix="/api")

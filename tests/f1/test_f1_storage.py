@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
+from time import monotonic
 from unittest.mock import AsyncMock
 
 from sports.f1.predictor.storage.clickhouse_store import (
@@ -10,6 +12,7 @@ from sports.f1.predictor.storage.clickhouse_store import (
     sentiment_item_rows,
     track_geometry_row,
 )
+from sports.f1.predictor.storage.manager import F1Storage
 from sports.f1.predictor.storage.redis_store import F1RedisKeys
 
 
@@ -111,6 +114,70 @@ class F1StorageMappingTests(unittest.TestCase):
 
 
 class F1ClickHouseSoftFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_storage_health_is_short_ttl_cached(self):
+        redis = _FakeRedisHealth()
+        clickhouse = _FakeClickHouseHealth()
+        storage = F1Storage(redis_store=redis, clickhouse_store=clickhouse)
+
+        first = await storage.health()
+        second = await storage.health()
+
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(1, redis.calls)
+        self.assertEqual(1, clickhouse.calls)
+
+    async def test_storage_health_clickhouse_timeout_is_best_effort_and_cached(self):
+        redis = _FakeRedisHealth()
+        clickhouse = _SlowFakeClickHouseHealth()
+        storage = F1Storage(redis_store=redis, clickhouse_store=clickhouse)
+        storage._clickhouse_health_timeout_seconds = 0.01
+
+        first = await storage.health()
+        second = await storage.health()
+
+        self.assertFalse(first["cached"])
+        self.assertFalse(first["clickhouse"]["available"])
+        self.assertTrue(first["clickhouse"]["best_effort"])
+        self.assertEqual("clickhouse_health_timeout", first["clickhouse"]["last_error"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(1, redis.calls)
+        self.assertEqual(1, clickhouse.calls)
+
+    async def test_clickhouse_write_backoff_skips_operation_factory(self):
+        redis = _FakeRedisHealth()
+        clickhouse = _FakeClickHouseHealth()
+        clickhouse._disabled_until = monotonic() + 30.0
+        clickhouse._last_error = "clickhouse_down"
+        storage = F1Storage(redis_store=redis, clickhouse_store=clickhouse)
+        called = False
+
+        async def _operation():
+            nonlocal called
+            called = True
+            return {"ok": True}
+
+        status = await storage._clickhouse_best_effort(lambda: _operation(), "f1_probability_snapshots")
+
+        self.assertFalse(status["ok"])
+        self.assertTrue(status["skipped"])
+        self.assertEqual("clickhouse_down", status["reason"])
+        self.assertFalse(called)
+
+    async def test_clickhouse_health_failure_enters_backoff(self):
+        store = F1ClickHouseStore(enabled=True)
+        store._query = AsyncMock(side_effect=RuntimeError("clickhouse down"))
+
+        first = await store.health()
+        second = await store.health()
+
+        self.assertFalse(first["available"])
+        self.assertIn("clickhouse down", first["last_error"])
+        self.assertFalse(second["available"])
+        self.assertIn("backoff_seconds", second)
+        self.assertEqual(1, store._query.await_count)
+        await store.close()
+
     async def test_clickhouse_insert_failure_returns_status_not_exception(self):
         store = F1ClickHouseStore(enabled=True)
         store._query = AsyncMock(side_effect=RuntimeError("clickhouse down"))
@@ -126,6 +193,44 @@ class F1ClickHouseSoftFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["ok"])
         self.assertIn("clickhouse down", status["reason"])
         await store.close()
+
+
+class _FakeRedisHealth:
+    def __init__(self):
+        self.calls = 0
+
+    def health(self):
+        self.calls += 1
+        return {"available": True, "kind": "redis"}
+
+
+class _FakeClickHouseHealth:
+    def __init__(self):
+        self.calls = 0
+
+    async def health(self):
+        self.calls += 1
+        return {"available": True, "kind": "clickhouse"}
+
+    async def close(self):
+        return None
+
+
+class _SlowFakeClickHouseHealth:
+    database = "f1_analytics"
+
+    def __init__(self):
+        self.calls = 0
+        self._disabled_until = 0.0
+        self._last_error = None
+
+    async def health(self):
+        self.calls += 1
+        await asyncio.sleep(1)
+        return {"available": True, "kind": "clickhouse"}
+
+    async def close(self):
+        return None
 
 
 if __name__ == "__main__":

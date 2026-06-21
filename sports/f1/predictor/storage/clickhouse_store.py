@@ -14,6 +14,7 @@ import httpx
 
 DEFAULT_CLICKHOUSE_URL = "http://localhost:8123"
 DEFAULT_DATABASE = "f1_analytics"
+DEFAULT_TIMEOUT_SECONDS = 0.5
 
 
 class F1ClickHouseStore:
@@ -33,7 +34,8 @@ class F1ClickHouseStore:
         self.password = password or os.getenv("F1_CLICKHOUSE_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD")
         raw_enabled = os.getenv("F1_CLICKHOUSE_ENABLED")
         self.enabled = bool(enabled) if enabled is not None else str(raw_enabled or "true").lower() not in {"0", "false", "no"}
-        self._client = httpx.AsyncClient(timeout=2.0)
+        timeout = float(os.getenv("F1_CLICKHOUSE_TIMEOUT_SECONDS") or DEFAULT_TIMEOUT_SECONDS)
+        self._client = httpx.AsyncClient(timeout=timeout)
         self._initialized = False
         self._last_error: str | None = None
         self._disabled_until = 0.0
@@ -58,7 +60,15 @@ class F1ClickHouseStore:
             return {"available": True, "enabled": True, "url": self.url, "database": self.database, "last_error": None}
         except Exception as exc:  # pragma: no cover - depends on local service
             self._last_error = str(exc)
-            return {"available": False, "enabled": True, "url": self.url, "database": self.database, "last_error": self._last_error}
+            self._disabled_until = monotonic() + 30.0
+            return {
+                "available": False,
+                "enabled": True,
+                "url": self.url,
+                "database": self.database,
+                "last_error": self._last_error,
+                "backoff_seconds": 30.0,
+            }
 
     async def ensure_schema(self) -> dict[str, Any]:
         if not self.enabled:

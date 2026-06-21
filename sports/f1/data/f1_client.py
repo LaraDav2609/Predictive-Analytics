@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -18,6 +19,8 @@ from sports.f1.models.f1 import Driver, Constructor, Race, RaceResult, RacePredi
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.jolpi.ca/ergast/f1"
+ROUND_RESULT_CACHE_TTL_SECONDS = 120.0
+RACE_SESSION_CACHE_TTL_SECONDS = 300.0
 
 CONSTRUCTOR_TITLE_FALLBACKS = {
     "ferrari": [1961, 1964, 1975, 1976, 1977, 1979, 1982, 1983, 1999, 2000, 2001, 2002, 2003, 2004, 2007, 2008],
@@ -107,6 +110,8 @@ class F1Client(SportsDataClient):
         self._season_results_cache: dict[int, list[dict]] = {}
         self._season_qualifying_cache: dict[int, list[dict]] = {}
         self._prediction_features_cache: dict[tuple[int, int], dict] = {}
+        self._round_results_cache: dict[tuple[int, int, str], tuple[float, list[dict]]] = {}
+        self._race_sessions_cache: dict[tuple[int, int], tuple[float, list[dict]]] = {}
         self._weather_client = OpenMeteoClient()
 
     def get_sport(self) -> Sport:
@@ -132,6 +137,8 @@ class F1Client(SportsDataClient):
         async with self._refresh_lock:
             self._season_results_cache.pop(self._season, None)
             self._prediction_features_cache.clear()
+            self._round_results_cache.clear()
+            self._race_sessions_cache.clear()
             await self._fetch_driver_standings()
             await self._fetch_constructor_standings()
             await self._fetch_race_calendar()
@@ -262,10 +269,13 @@ class F1Client(SportsDataClient):
         if cached:
             return cached
 
-        current_races = await self._fetch_season_results(self._season)
-        previous_races = []
-        for season in range(self._season - 1, max(2022, self._season - 3), -1):
-            previous_races.extend(await self._fetch_season_results(season))
+        previous_seasons = list(range(self._season - 1, max(2022, self._season - 3), -1))
+        season_results = await asyncio.gather(
+            self._fetch_season_results(self._season),
+            *(self._fetch_season_results(season) for season in previous_seasons),
+        )
+        current_races = season_results[0]
+        previous_races = [race for races in season_results[1:] for race in races]
         races_data = current_races
         all_races = current_races + previous_races
 
@@ -504,10 +514,12 @@ class F1Client(SportsDataClient):
         if race.status == "SCHEDULED" and predictor:
             race.prediction = predictor.predict_race(race)
 
-        round_results = await self._fetch_round_results(round_num, "results")
-        qualifying = await self._fetch_round_results(round_num, "qualifying")
-        sprint = await self._fetch_round_results(round_num, "sprint")
-        sessions = await self._fetch_race_sessions(round_num, race)
+        round_results, qualifying, sprint, sessions = await asyncio.gather(
+            self._fetch_round_results(round_num, "results"),
+            self._fetch_round_results(round_num, "qualifying"),
+            self._fetch_round_results(round_num, "sprint"),
+            self._fetch_race_sessions(round_num, race),
+        )
 
         return {
             "ok": True,
@@ -804,6 +816,10 @@ class F1Client(SportsDataClient):
             return []
 
     async def _fetch_race_sessions(self, round_num: int, race: Race) -> list[dict]:
+        cache_key = (self._season, int(round_num))
+        cached = _get_expiring_list_cache(self._race_sessions_cache, cache_key, RACE_SESSION_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
         try:
             resp = await self._client.get(f"/{self._season}/{round_num}.json")
             resp.raise_for_status()
@@ -847,27 +863,36 @@ class F1Client(SportsDataClient):
                 "status": status,
                 "note": note,
             })
+        _set_expiring_list_cache(self._race_sessions_cache, cache_key, sessions)
         return sessions
 
     async def _fetch_round_results(self, round_num: int, result_type: str) -> list[dict]:
+        endpoint = {
+            "results": "results",
+            "qualifying": "qualifying",
+            "sprint": "sprint",
+        }.get(result_type, "results")
+        cache_key = (self._season, int(round_num), endpoint)
+        cached = _get_expiring_list_cache(self._round_results_cache, cache_key, ROUND_RESULT_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
         try:
-            endpoint = {
-                "results": "results",
-                "qualifying": "qualifying",
-                "sprint": "sprint",
-            }.get(result_type, "results")
             resp = await self._client.get(f"/{self._season}/{round_num}/{endpoint}.json?limit=1000")
             resp.raise_for_status()
             data = resp.json()
             races_data = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
             if not races_data:
+                _set_expiring_list_cache(self._round_results_cache, cache_key, [])
                 return []
             race = races_data[0]
             if result_type == "qualifying":
-                return _parse_qualifying_results(race)
-            if result_type == "sprint":
-                return _parse_sprint_results(race)
-            return _parse_race_results(race)
+                parsed = _parse_qualifying_results(race)
+            elif result_type == "sprint":
+                parsed = _parse_sprint_results(race)
+            else:
+                parsed = _parse_race_results(race)
+            _set_expiring_list_cache(self._round_results_cache, cache_key, parsed)
+            return parsed
         except (httpx.HTTPError, KeyError, ValueError) as e:
             logger.warning("Failed to fetch F1 %s for round %s: %s", result_type, round_num, e)
             return []
@@ -930,14 +955,14 @@ class F1Client(SportsDataClient):
     async def _resolve_driver_photo(self, driver_id: str, profile_url: str | None, number: int | None, code: str | None) -> str | None:
         if driver_id in self._photo_cache:
             return self._photo_cache[driver_id]
-        openf1_photo = await self._resolve_openf1_photo(number, code)
-        if openf1_photo:
-            self._photo_cache[driver_id] = openf1_photo
-            return openf1_photo
         fallback_photo = F1_HEADSHOT_FALLBACKS.get((code or "").upper())
         if fallback_photo:
             self._photo_cache[driver_id] = fallback_photo
             return fallback_photo
+        openf1_photo = await self._resolve_openf1_photo(number, code)
+        if openf1_photo:
+            self._photo_cache[driver_id] = openf1_photo
+            return openf1_photo
         if not profile_url:
             self._photo_cache[driver_id] = None
             return None
@@ -1108,6 +1133,21 @@ def _track_key_from_raw_race(race: dict) -> str:
     if "gilles" in normalized or "canadian" in normalized:
         return "gilles"
     return normalized[:32] or "default"
+
+
+def _get_expiring_list_cache(cache: dict[tuple, tuple[float, list[dict]]], key: tuple, ttl_seconds: float) -> list[dict] | None:
+    entry = cache.get(key)
+    if not entry:
+        return None
+    cached_at, rows = entry
+    if monotonic() - cached_at > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return [dict(row) for row in rows]
+
+
+def _set_expiring_list_cache(cache: dict[tuple, tuple[float, list[dict]]], key: tuple, rows: list[dict]) -> None:
+    cache[key] = (monotonic(), [dict(row) for row in rows])
 
 
 def _track_history_features(track_results: dict[str, dict[str, list[dict]]]) -> dict[str, dict]:

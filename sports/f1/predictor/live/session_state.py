@@ -54,7 +54,13 @@ class F1LiveSessionEngine:
 
         try:
             session_features = await self._openf1.get_session_features(race, session_key, drivers, live=True)
-            track = await self._openf1.get_track_data(race, drivers, session=session_key, live=True)
+            track = await self._openf1.get_track_data(
+                race,
+                drivers,
+                session=session_key,
+                live=True,
+                static_only=not _has_timing_rows(session_features),
+            )
         except Exception as exc:
             state = self._unavailable_state(race, session_key, f"openf1_refresh_failed: {exc}")
             recorded = load_fastf1_recorded_state(race, drivers, session_key)
@@ -363,6 +369,11 @@ def _state_mode(openf1_session: dict[str, Any], track: dict[str, Any], live_posi
     if track.get("source") == "estimated":
         return "estimated"
     return "unavailable"
+
+
+def _has_timing_rows(openf1_session: dict[str, Any]) -> bool:
+    raw_counts = (openf1_session or {}).get("raw_counts") or {}
+    return any(int(raw_counts.get(key) or 0) > 0 for key in ["positions", "laps", "intervals"])
 
 
 def _driver_status(position: dict[str, Any], lap: dict[str, Any], location: dict[str, Any]) -> str:

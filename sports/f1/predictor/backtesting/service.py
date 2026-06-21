@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -60,6 +61,7 @@ class F1BacktestService:
         allow_partial: bool = False,
         model_id: str | None = None,
         stage: str = "pre_weekend",
+        _compact: bool = False,
     ) -> dict[str, Any]:
         model_id = model_id or PRODUCTION_MODEL_ID
         stage = _stage_key(stage)
@@ -73,13 +75,21 @@ class F1BacktestService:
                 "partial": True,
             }
 
-        cache_key = ("season", season, include_races, allow_partial, model_id, stage)
+        cache_key = ("season", season, include_races, allow_partial, model_id, stage, _compact)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         races = await self._loader.load_season(season)
         completed = [race for race in races if race.get("Results")]
-        race_rows = [self.backtest_race_from_rows(season, races, int(race.get("round") or 0), model_id=model_id, stage=stage) for race in completed]
+        race_rows = await asyncio.to_thread(
+            self._backtest_completed_races,
+            season,
+            races,
+            completed,
+            model_id,
+            stage,
+            _compact,
+        )
         summary = summarize_races(race_rows)
         result = {
             "ok": True,
@@ -117,7 +127,14 @@ class F1BacktestService:
         seasons = []
         all_races = []
         for season in range(start_season, end_season + 1):
-            season_result = await self.backtest_season(season, include_races=True, allow_partial=allow_partial, model_id=model_id, stage=stage)
+            season_result = await self.backtest_season(
+                season,
+                include_races=True,
+                allow_partial=allow_partial,
+                model_id=model_id,
+                stage=stage,
+                _compact=not include_races,
+            )
             if not season_result.get("ok"):
                 seasons.append(season_result)
                 continue
@@ -172,6 +189,7 @@ class F1BacktestService:
                 allow_partial=allow_partial,
                 model_id=model["model_id"],
                 stage=stage,
+                _compact=not include_races,
             )
             models.append(result)
         return _comparison_result({"season": season}, models)
@@ -185,18 +203,102 @@ class F1BacktestService:
         stage: str = "pre_weekend",
     ) -> dict[str, Any]:
         stage = _stage_key(stage)
+        start_season = int(start_season)
+        end_season = int(end_season)
+        if end_season < start_season:
+            start_season, end_season = end_season, start_season
+        cache_key = ("compare_summary", start_season, end_season, include_races, allow_partial, stage)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        current_season = int(getattr(self._client, "season", datetime.now(timezone.utc).year))
+        season_rows: dict[int, list[dict[str, Any]]] = {}
+        season_errors: list[dict[str, Any]] = []
+        for season in range(start_season, end_season + 1):
+            if season >= current_season and not allow_partial:
+                season_errors.append({
+                    "ok": False,
+                    "season": season,
+                    "partial": True,
+                    "reason": "Current in-progress season backtests require allow_partial=true",
+                })
+                continue
+            season_rows[season] = await self._loader.load_season(season)
+
         models = []
         for model in F1ModelRegistry.list_models():
-            result = await self.backtest_summary(
-                start_season=start_season,
-                end_season=end_season,
-                include_races=include_races,
-                allow_partial=allow_partial,
-                model_id=model["model_id"],
+            model_id = model["model_id"]
+            seasons = list(season_errors)
+            all_races: list[dict[str, Any]] = []
+            for season, races in season_rows.items():
+                completed = [race for race in races if race.get("Results")]
+                race_rows = await asyncio.to_thread(
+                    self._backtest_completed_races,
+                    season,
+                    races,
+                    completed,
+                    model_id,
+                    stage,
+                    not include_races,
+                )
+                all_races.extend(race_rows)
+                summary = summarize_races(race_rows)
+                season_result = {
+                    "ok": True,
+                    "season": season,
+                    "partial": False,
+                    "model_version": _model_version(race_rows),
+                    "model_id": model_id,
+                    "stage": stage,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    **summary,
+                    "fallback_coverage": _fallback_coverage_summary(race_rows),
+                    "leakage_status": _leakage_status_summary(race_rows),
+                    "recommended_weights": recommend_weight_adjustments(summary),
+                }
+                if include_races:
+                    season_result["races"] = race_rows
+                seasons.append(season_result)
+
+            summary = summarize_races(all_races)
+            models.append({
+                "ok": True,
+                "start_season": start_season,
+                "end_season": end_season,
+                "model_id": model_id,
+                "stage": stage,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                **summary,
+                "fallback_coverage": _fallback_coverage_summary(all_races),
+                "leakage_status": _leakage_status_summary(all_races),
+                "recommended_weights": recommend_weight_adjustments(summary),
+                "seasons": seasons,
+            })
+
+        result = _comparison_result({"start_season": start_season, "end_season": end_season}, models)
+        self._cache[cache_key] = result
+        return result
+
+    def _backtest_completed_races(
+        self,
+        season: int,
+        races: list[dict[str, Any]],
+        completed: list[dict[str, Any]],
+        model_id: str,
+        stage: str,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        return [
+            self.backtest_race_from_rows(
+                season,
+                races,
+                int(race.get("round") or 0),
+                model_id=model_id,
                 stage=stage,
+                compact=compact,
             )
-            models.append(result)
-        return _comparison_result({"start_season": start_season, "end_season": end_season}, models)
+            for race in completed
+        ]
 
     async def deep_backtest(
         self,
@@ -350,13 +452,52 @@ class F1BacktestService:
         self._cache[cache_key] = result
         return result
 
-    def backtest_race_from_rows(self, season: int, races: list[dict[str, Any]], round_num: int, model_id: str | None = None, stage: str = "pre_weekend") -> dict[str, Any]:
+    def backtest_race_from_rows(self, season: int, races: list[dict[str, Any]], round_num: int, model_id: str | None = None, stage: str = "pre_weekend", compact: bool = False) -> dict[str, Any]:
         model_id = model_id or PRODUCTION_MODEL_ID
         stage = _stage_key(stage)
         replay = self._builder.build(season, races, round_num, stage=stage)
         service = F1PredictionService(model_id=model_id)
         service.load(replay.drivers, replay.constructors, replay.features, sentiment={})
         baseline_prediction = service.predict_race(replay.race)
+        if compact:
+            metrics = evaluate_race(baseline_prediction, replay.actual_results)
+            return {
+                "season": season,
+                "round": round_num,
+                "model_id": model_id,
+                "stage": replay.stage,
+                "race_name": replay.race.name,
+                "circuit": replay.race.circuit,
+                "country": replay.race.country,
+                "track_key": replay.race.circuit_id,
+                "track_segments": [],
+                "track_traits": {},
+                "completed_races_before": replay.features.get("completed_races", 0),
+                "replay_evidence": {
+                    "stage": replay.stage,
+                    "source_coverage": replay.features.get("source_coverage") or {},
+                    "backtest": replay.features.get("backtest") or {},
+                },
+                "actual_winner": metrics["actual_winner"],
+                "predicted_winner": metrics["predicted_winner"],
+                "actual_podium": metrics["actual_podium"],
+                "predicted_top3": metrics["predicted_top3"],
+                "probability_distribution": _probability_distribution(baseline_prediction),
+                "probability_audit": {},
+                "calibration_profile": {},
+                "probability_governance": {},
+                "model_confidence": baseline_prediction.confidence,
+                "model_input_metadata": _model_input_metadata(baseline_prediction),
+                "fallback_coverage": _fallback_coverage_race(baseline_prediction),
+                "leakage_status": _leakage_status_race(replay),
+                "missing_feature_groups": [],
+                "feature_sources": {"sentiment": "disabled_for_backtest_v1"},
+                "component_scores": _component_audit(baseline_prediction),
+                "metrics": metrics,
+                "model_version": baseline_prediction.model_version,
+                "baseline_model_version": baseline_prediction.model_version,
+                "compact_backtest": True,
+            }
         snapshot = service.build_features(replay.race, "race")
         profile = _replay_profile(replay)
         truth = _replay_truth(replay)

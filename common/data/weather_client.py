@@ -18,7 +18,8 @@ class OpenMeteoClient:
     def __init__(self) -> None:
         self._forecast = httpx.AsyncClient(base_url=FORECAST_BASE_URL, timeout=20.0)
         self._historical = httpx.AsyncClient(base_url=HISTORICAL_FORECAST_BASE_URL, timeout=25.0)
-        self._cache: dict[tuple[float, float, str, str], dict[str, Any]] = {}
+        self._cache: dict[tuple[float, float, bool, str], dict[str, Any]] = {}
+        self._payload_cache: dict[tuple[float, float, bool, str, str], dict[str, Any]] = {}
 
     async def close(self) -> None:
         await self._forecast.aclose()
@@ -43,12 +44,17 @@ class OpenMeteoClient:
         at_utc = at.astimezone(timezone.utc) if at.tzinfo else at.replace(tzinfo=timezone.utc)
         date_key = at_utc.date().isoformat()
         hour_key = at_utc.replace(minute=0, second=0, microsecond=0).isoformat()
-        cache_key = (round(float(latitude), 4), round(float(longitude), 4), hour_key, _session_key(session))
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
+        lat_key = round(float(latitude), 4)
+        lon_key = round(float(longitude), 4)
         now = datetime.now(timezone.utc)
         historical = at_utc.date() < now.date()
+        cache_key = (lat_key, lon_key, historical, hour_key)
+        if cache_key in self._cache:
+            cached = dict(self._cache[cache_key])
+            cached["session"] = _session_key(session)
+            cached["requested_at"] = at_utc.isoformat()
+            return cached
+
         client = self._historical if historical else self._forecast
         path = "/forecast"
         params = {
@@ -74,16 +80,28 @@ class OpenMeteoClient:
             params.pop("end_date", None)
 
         try:
-            response = await client.get(path, params=params)
-            response.raise_for_status()
-            result = _parse_open_meteo(response.json(), at_utc, historical)
+            payload_key = (
+                lat_key,
+                lon_key,
+                historical,
+                date_key if historical else "forecast_16d",
+                ",".join(params["hourly"].split(",")),
+            )
+            payload = self._payload_cache.get(payload_key)
+            if payload is None:
+                response = await client.get(path, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                self._payload_cache[payload_key] = payload
+            result = _parse_open_meteo(payload, at_utc, historical)
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             logger.warning("Open-Meteo request failed for %.4f, %.4f at %s: %s", latitude, longitude, date_key, exc)
             result = _fallback("open_meteo_unavailable")
 
+        self._cache[cache_key] = dict(result)
+        result = dict(result)
         result["session"] = _session_key(session)
         result["requested_at"] = at_utc.isoformat()
-        self._cache[cache_key] = result
         return result
 
 
