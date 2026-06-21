@@ -18,8 +18,10 @@ from sports.f1.data.f1_sentiment import read_f1_sentiment, refresh_f1_sentiment
 from common.api import common_routes
 from sports.f1.api import f1_routes
 from sports.baseball.api import baseball_routes, baseball_history_routes
-from games.csgo.data.csgo_client import StubCsgoClient
+from games.csgo.data.csgo_client import CsgoDataClient
+from games.csgo.data.factory import build_csgo_client
 from games.csgo.analytics.csgo_predictor import CsgoPredictor
+from games.csgo.analytics.pipeline import CsgoModelPipeline
 from games.csgo.api import csgo_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 _f1_client: F1Client | None = None
 _mlb_client: MLBClient | None = None
 _mlb_historical_client: MLBHistoricalClient | None = None
+_csgo_client: CsgoDataClient | None = None
 _startup_tasks: set[asyncio.Task] = set()
 
 
@@ -95,9 +98,18 @@ async def _load_mlb_data(client: MLBClient, predictor: BaseballPredictor) -> Non
     logger.info("MLB data loaded successfully")
 
 
+async def _load_csgo_data(client: CsgoDataClient, model: CsgoModelPipeline) -> None:
+    await client.refresh()
+    model.fit(client.get_past_matches(), client.get_teams())
+    logger.info(
+        "CSGO data loaded: %d teams, %d matches",
+        len(client.get_teams()), len(client.get_matches()),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _f1_client, _mlb_client, _mlb_historical_client
+    global _f1_client, _mlb_client, _mlb_historical_client, _csgo_client
 
     # Startup: initialize data clients and load data
     logger.info("Starting sports predictions service...")
@@ -115,16 +127,18 @@ async def lifespan(app: FastAPI):
     baseball_routes.init(_mlb_client, baseball_pred)
     baseball_history_routes.init(_mlb_historical_client, pybaseball_client)
 
-    # CSGO (game category) — stubbed data source; team ratings load synchronously.
-    csgo_client = StubCsgoClient()
-    csgo_pred = CsgoPredictor()
-    csgo_routes.init(csgo_client, csgo_pred)
-    csgo_pred.load_teams(csgo_client.get_teams())
+    # CSGO (game category) — provider selected from env (PandaScore or stub).
+    # The pipeline (ratings → features → ensemble) drives /matches predictions.
+    _csgo_client = build_csgo_client()
+    csgo_model = CsgoModelPipeline()
+    csgo_routes.init(_csgo_client, csgo_model)
+    csgo_model.load_teams(_csgo_client.get_teams())  # immediate (stub data, or empty until fit)
 
     # Initial data loads are intentionally non-blocking. Some upstream sports/F1
     # APIs can be slow or unavailable, and the dashboard should still boot.
     _track_startup_task("F1", _load_f1_data(_f1_client, f1_pred))
     _track_startup_task("MLB", _load_mlb_data(_mlb_client, baseball_pred))
+    _track_startup_task("CSGO", _load_csgo_data(_csgo_client, csgo_model))
 
     yield
 
@@ -140,6 +154,8 @@ async def lifespan(app: FastAPI):
         await _mlb_client.close()
     if _mlb_historical_client:
         await _mlb_historical_client.close()
+    if _csgo_client is not None and hasattr(_csgo_client, "close"):
+        await _csgo_client.close()
     logger.info("Sports predictions service stopped")
 
 

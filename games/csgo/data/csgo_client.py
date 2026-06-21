@@ -10,7 +10,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 
-from games.csgo.models.csgo import CsgoMatch, CsgoTeam
+from games.csgo.identity import build_aliases
+from games.csgo.models.csgo import CsgoMatch, CsgoPlayer, CsgoTeam, MapScore
 
 
 class CsgoDataClient(ABC):
@@ -31,6 +32,19 @@ class CsgoDataClient(ABC):
     @abstractmethod
     def is_available(self) -> bool: ...
 
+    def get_past_matches(self) -> list[CsgoMatch]:
+        """Finished matches with results, for backtesting. Default: none."""
+        return []
+
+    def get_team(self, team_id: int) -> CsgoTeam | None:
+        return next((t for t in self.get_teams() if t.id == team_id), None)
+
+    def get_players(self, team_id: int) -> list[CsgoPlayer]:
+        return []
+
+    def get_player(self, player_id: int) -> CsgoPlayer | None:
+        return None
+
 
 _SAMPLE_TEAMS = [
     CsgoTeam(id=1, name="Natus Vincere", abbreviation="NAVI", region="EU", world_rank=1, rating=1920.0),
@@ -46,8 +60,44 @@ class StubCsgoClient(CsgoDataClient):
     """In-memory sample data so the architecture runs end-to-end without a feed."""
 
     def __init__(self) -> None:
-        self._teams = list(_SAMPLE_TEAMS)
+        self._teams = [
+            t.model_copy(update={
+                "aliases": build_aliases(t.name, t.abbreviation),
+                "source_ids": {"stub": str(t.id)},
+            })
+            for t in _SAMPLE_TEAMS
+        ]
+        self._players, self._team_players = self._build_players()
         self._matches = self._build_matches()
+        self._history = self._build_history()
+
+    def _build_players(self) -> tuple[dict[int, CsgoPlayer], dict[int, list[int]]]:
+        roles = ["awper", "igl", "rifler", "entry", "support"]
+        players: dict[int, CsgoPlayer] = {}
+        team_players: dict[int, list[int]] = {}
+        new_teams: list[CsgoTeam] = []
+        for t in self._teams:
+            ids: list[int] = []
+            for i, role in enumerate(roles, start=1):
+                pid = t.id * 100 + i
+                ids.append(pid)
+                players[pid] = CsgoPlayer(
+                    id=pid, name=f"{t.abbreviation.lower()}_p{i}", real_name=f"Player {i}",
+                    nationality=t.region, role=role, team_id=t.id,
+                    rating=round(1.20 - 0.02 * i + (t.rating - 1850) / 1000.0, 2),
+                    kd=round(1.15 - 0.03 * i, 2), adr=round(85.0 - 2 * i, 1),
+                    kast=round(74.0 - i, 1), maps_played=200 - 5 * i,
+                )
+            team_players[t.id] = ids
+            new_teams.append(t.model_copy(update={"roster": ids}))
+        self._teams = new_teams
+        return players, team_players
+
+    def get_players(self, team_id: int) -> list[CsgoPlayer]:
+        return [self._players[pid] for pid in self._team_players.get(team_id, []) if pid in self._players]
+
+    def get_player(self, player_id: int) -> CsgoPlayer | None:
+        return self._players.get(player_id)
 
     def _build_matches(self) -> list[CsgoMatch]:
         by_id = {t.id: t for t in self._teams}
@@ -61,10 +111,55 @@ class StubCsgoClient(CsgoDataClient):
                 team1=ta.name, team2=tb.name,
                 team1_id=ta.id, team2_id=tb.id,
                 team1_abbrev=ta.abbreviation, team2_abbrev=tb.abbreviation,
+                team1_aliases=build_aliases(ta.name, ta.abbreviation),
+                team2_aliases=build_aliases(tb.name, tb.abbreviation),
                 date=base + timedelta(hours=3 * i),
-                event="IEM Katowice 2026", best_of=3,
+                event="IEM Katowice 2026", event_slug="iem-katowice-2026", best_of=3,
+                source_ids={"stub": f"{ta.id}-{tb.id}"},
             ))
         return matches
+
+    def _build_history(self) -> list[CsgoMatch]:
+        """Synthetic finished-match history so the backtest endpoint returns real
+        (deterministic) metrics without an external feed. Higher-rated teams win
+        ~2/3 of the time; periodic upsets keep it non-trivial."""
+        teams = list(self._teams)
+        pool = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis"]
+        base = datetime(2026, 2, 1, 17, 0, tzinfo=timezone.utc)
+        out: list[CsgoMatch] = []
+        idx = 0
+        for rnd in range(6):
+            for i in range(len(teams)):
+                for j in range(i + 1, len(teams)):
+                    ta, tb = teams[i], teams[j]
+                    higher, lower = (ta, tb) if ta.rating >= tb.rating else (tb, ta)
+                    upset = (rnd + ta.id + tb.id) % 3 == 0
+                    winner, loser = (lower, higher) if upset else (higher, lower)
+                    ws, ls = 2, idx % 2  # 2-0 or 2-1
+                    maps: list[MapScore] = []
+                    order = 1
+                    for _ in range(ws):
+                        maps.append(MapScore(order=order, map_name=pool[order % len(pool)], winner_id=winner.id)); order += 1
+                    for _ in range(ls):
+                        maps.append(MapScore(order=order, map_name=pool[order % len(pool)], winner_id=loser.id)); order += 1
+                    out.append(CsgoMatch(
+                        id=f"hist-{idx}", team1=ta.name, team2=tb.name,
+                        team1_id=ta.id, team2_id=tb.id,
+                        team1_abbrev=ta.abbreviation, team2_abbrev=tb.abbreviation,
+                        team1_aliases=build_aliases(ta.name, ta.abbreviation),
+                        team2_aliases=build_aliases(tb.name, tb.abbreviation),
+                        date=base + timedelta(days=idx),
+                        event="Stub League", event_slug="stub-league", best_of=3, status="FINAL",
+                        team1_score=ws if winner.id == ta.id else ls,
+                        team2_score=ws if winner.id == tb.id else ls,
+                        winner_id=winner.id, winner_code=winner.abbreviation,
+                        map_scores=maps, source_ids={"stub": f"hist-{idx}"},
+                    ))
+                    idx += 1
+        return out
+
+    def get_past_matches(self) -> list[CsgoMatch]:
+        return list(self._history)
 
     def get_teams(self) -> list[CsgoTeam]:
         return list(self._teams)
