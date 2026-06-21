@@ -125,6 +125,18 @@ async def backtest(calibrate: bool = False):
     return {"ok": True, **result}
 
 
+@router.get("/replay/{match_id}")
+async def replay(match_id: str):
+    """Single-game replay (click-through from the Backtest tab): the leak-free pre-game
+    prediction for one finished match, the actual result, and the map-by-map series
+    win-probability trajectory the live model would have shown."""
+    from games.csgo.analytics.backtest import replay_match
+
+    past = client.get_past_matches()
+    teams_by_id = {t.id: t for t in client.get_teams()}
+    return replay_match(match_id, past, teams_by_id=teams_by_id)
+
+
 class LiveUpdateRequest(BaseModel):
     pregame_team1_prob: float
     state: LiveMatchState
