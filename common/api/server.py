@@ -133,6 +133,12 @@ async def lifespan(app: FastAPI):
     csgo_model = CsgoModelPipeline()
     csgo_routes.init(_csgo_client, csgo_model)
     csgo_model.load_teams(_csgo_client.get_teams())  # immediate (stub data, or empty until fit)
+    # Light up the live csgo:prob:* bridge for GSI updates (lazy Redis; best-effort).
+    import os as _os
+    from common.ml.bridge.outcome_publisher import OutcomePublisher
+    csgo_routes.set_publisher(OutcomePublisher(
+        host=_os.getenv("REDIS_HOST", "localhost"),
+        port=int(_os.getenv("REDIS_PORT", "6379"))))
 
     # Initial data loads are intentionally non-blocking. Some upstream sports/F1
     # APIs can be slow or unavailable, and the dashboard should still boot.
