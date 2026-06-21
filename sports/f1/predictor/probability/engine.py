@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from sports.f1.predictor.models.configs import get_model_config
 from sports.f1.predictor.probability.calibration import apply_temperature, build_calibration_profile
+from sports.f1.predictor.probability.empirical_calibration import (
+    CALIBRATION_ARTIFACT_ENV,
+    EmpiricalCalibrator,
+    load_default as _load_empirical_calibrator,
+)
 from sports.f1.predictor.probability.stage import detect_stage
+
+
+_EMPIRICAL_STATE = None
+
+
+def _get_empirical_calibrator() -> EmpiricalCalibrator:
+    """Lazily load the serve-time empirical calibrator, reloading if the
+    configured artifact path changes. Identity (no-op) when unconfigured."""
+    global _EMPIRICAL_STATE
+    path = os.environ.get(CALIBRATION_ARTIFACT_ENV)
+    if _EMPIRICAL_STATE is None or _EMPIRICAL_STATE[0] != path:
+        _EMPIRICAL_STATE = (path, _load_empirical_calibrator())
+    return _EMPIRICAL_STATE[1]
 
 
 def build_probability_audit(
@@ -40,6 +59,19 @@ def build_probability_audit(
     normalized_raw = {driver_id: round(value / raw_total, 4) for driver_id, value in raw.items()}
     governed_raw, governance = _apply_evidence_governance(normalized_raw, detected_stage, truth)
     calibrated = apply_temperature(governed_raw, calibration.temperature)
+    # Real (data-fit) calibration on top of temperature scaling. No-op unless a
+    # fitted artifact is configured (F1_CALIBRATION_ARTIFACT), so serving is
+    # unchanged until a calibrator is explicitly trained and provided.
+    empirical = _get_empirical_calibrator()
+    empirical_meta: dict[str, Any] = {"applied": False}
+    if not empirical.is_identity():
+        calibrated = empirical.calibrate_field(calibrated, normalize_to=1.0)
+        empirical_meta = {
+            "applied": True,
+            "method": empirical.method,
+            "source": empirical.source,
+            "sample_count": empirical.sample_count,
+        }
 
     enriched = []
     finish_distribution = {}
@@ -78,6 +110,7 @@ def build_probability_audit(
         "raw_probabilities": normalized_raw,
         "governed_probabilities": governed_raw,
         "calibrated_probabilities": calibrated,
+        "empirical_calibration": empirical_meta,
         "finish_distribution": finish_distribution,
         "probabilities": enriched,
         "confidence": confidence,
