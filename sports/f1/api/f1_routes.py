@@ -24,9 +24,13 @@ from sports.f1.analytics.f1_predictor import F1Predictor
 from sports.f1.analytics.f1_simulator import build_session_simulation
 from sports.f1.ml.live_runner import LiveRunnerConfig, run_live_once
 from sports.f1.ml.markets.edge_service import F1EdgeRequest, RaceQuote, compute_race_edges, probability_map_from_records
+from sports.f1.ml.markets.bet_ledger import run_bet_ledger
+from sports.f1.ml.markets.synthetic_market import build_synthetic_decisions
 from sports.f1.predictor.features.market_consensus import build_market_consensus
 from sports.f1.predictor.features.track_archetype import archetype_fit_score, archetype_ratings, archetypes_for_track
 from sports.f1.predictor.features.penalties import build_penalty_report
+from sports.f1.predictor.features.strategy_analysis import analyze_race_strategy, driver_strategy_delta
+from sports.f1.predictor.features.upgrade_impact import build_upgrade_impacts, load_upgrade_calendar
 from sports.f1.predictor.backtesting import F1BacktestService
 from sports.f1.predictor.backtesting.evidence_cache import (
     WeekendEvidenceCacheWriter,
@@ -3892,6 +3896,75 @@ async def get_f1_race_archetype_fit(round_num: int):
     }
 
 
+@router.post("/backtest/ledger")
+async def post_f1_ledger_backtest(body: dict):
+    """Run the model-vs-market bet-ledger over supplied decisions (or samples →
+    synthetic market). Returns P&L / ROI / drawdown / hit-rate / CLV / edge-bucket
+    calibration. Paper-only analysis — no real F1 market history exists yet, so a
+    synthetic market is partly circular; use it to validate the ledger, not the edge."""
+    body = body or {}
+    decisions = body.get("decisions")
+    synthetic = bool(not decisions and body.get("samples"))
+    if synthetic:
+        decisions = build_synthetic_decisions(
+            body.get("samples") or [],
+            market_bias=float(body.get("market_bias", 0.0)),
+            overround=float(body.get("overround", 0.04)),
+            spread=float(body.get("spread", 0.02)),
+        )
+    if not decisions:
+        return {"ok": False, "reason": "decisions or samples required", "code": "missing_decisions"}
+    ledger = run_bet_ledger(
+        decisions,
+        bankroll_usd=float(body.get("bankroll_usd", 1000.0)),
+        min_edge_bps=float(body.get("min_edge_bps", 200.0)),
+        shrinkage=float(body.get("shrinkage", 0.25)),
+        max_per_market_pct=float(body.get("max_per_market_pct", 0.05)),
+        default_fee_bps=float(body.get("fee_bps", 0.0)),
+    )
+    return {"ok": True, "synthetic": synthetic, **ledger}
+
+
+@router.get("/races/{round_num}/strategy")
+async def get_f1_race_strategy(round_num: int):
+    """Compound-aware stint-strategy analysis: optimal pit window, undercut/overcut
+    value, safety-car pit value, 1-vs-2-stop, and a per-driver tactic. Analytic over
+    the real per-circuit pit-loss/tire-stress + tire-degradation features. Read-only."""
+    race = client.get_race_by_round(round_num) if client else None
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    features = (predictor._features if predictor else {}) or {}
+    track = TrackFeatureProvider(features).get_features(race)
+    tires = TireFeatureProvider().get_features(track=track)
+    base = analyze_race_strategy(
+        laps=track.get("laps") or 57,
+        pit_loss_s=track.get("pit_loss") or 22.0,
+        tire_stress=track.get("tire_stress") or 0.5,
+        degradation_rate=tires.get("degradation_rate") or 0.5,
+        undercut_strength=tires.get("undercut_strength") or 0.5,
+        overcut_strength=tires.get("overcut_strength") or 0.4,
+        safety_car_probability=track.get("safety_car_probability") or 0.3,
+        overtaking_difficulty=track.get("overtaking_difficulty") or 0.5,
+        compound_set=tires.get("compound_set"),
+    )
+    profile = await _race_profile_for_round(round_num)
+    drivers_by_id = {str(d.id): d for d in (client.get_drivers() or [])}
+    grid_drivers = _grid_evidence(profile, drivers_by_id).get("drivers") or {}
+    driver_strategies = []
+    for did, gitem in grid_drivers.items():
+        delta = driver_strategy_delta(base, grid_position=gitem.get("grid_position"))
+        driver_strategies.append({"driver_id": did, "driver_code": gitem.get("driver_code"), **delta})
+    driver_strategies.sort(key=lambda x: -(x.get("estimated_gain_s") or 0.0))
+    return {
+        "ok": True,
+        "round": round_num,
+        "track_key": track.get("track_key"),
+        "tire_source": tires.get("source"),
+        "strategy": base,
+        "drivers": driver_strategies,
+    }
+
+
 @router.get("/races/{round_num}/penalties")
 async def get_f1_race_penalties(round_num: int):
     """Structured grid penalties, pit-lane starts, and disqualifications for a race,
@@ -3906,6 +3979,30 @@ async def get_f1_race_penalties(round_num: int):
     grid_evidence = _grid_evidence(profile, drivers_by_id)
     report = build_penalty_report(grid_evidence, profile.get("results") or [])
     return {"ok": True, "round": round_num, **report}
+
+
+@router.post("/races/{round_num}/upgrade-impact")
+async def post_f1_upgrade_impact(round_num: int, body: dict):
+    """Estimate car-upgrade impact via a manual upgrade calendar + diff-in-diff on
+    field-relative pace. Body: {calendar?, pace_history, cap?, min_post?}. With no
+    calendar configured (and none posted) it returns no impacts — honest by
+    construction; it does NOT fabricate an 'upgrade impact' from the sentiment signal."""
+    body = body or {}
+    calendar = body.get("calendar") or load_upgrade_calendar()
+    pace_history = body.get("pace_history") or {}
+    impacts = build_upgrade_impacts(
+        calendar, pace_history, current_round=round_num,
+        cap=float(body.get("cap", 0.06)), min_post=int(body.get("min_post", 2)),
+    )
+    applied = [i for i in impacts if i.get("applied")]
+    return {
+        "ok": True,
+        "round": round_num,
+        "calendar_entries": len(calendar),
+        "impacts": impacts,
+        "applied_count": len(applied),
+        "note": "No structured upgrade feed exists; treatment is a manual calendar (F1_UPGRADE_CALENDAR). Empty calendar → no impacts.",
+    }
 
 
 @router.post("/refresh")
