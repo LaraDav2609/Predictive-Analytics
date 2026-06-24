@@ -26,6 +26,10 @@ from sports.f1.ml.live_runner import LiveRunnerConfig, run_live_once
 from sports.f1.ml.markets.edge_service import F1EdgeRequest, RaceQuote, compute_race_edges, probability_map_from_records
 from sports.f1.ml.markets.bet_ledger import run_bet_ledger
 from sports.f1.ml.markets.synthetic_market import build_synthetic_decisions
+from sports.f1.predictor.probability.empirical_calibration import (
+    CALIBRATION_ARTIFACT_ENV, MIN_POSITIVES, MIN_SAMPLES,
+    brier_score, fit_winner_calibrator, winner_pairs_from_runs,
+)
 from sports.f1.predictor.features.market_consensus import build_market_consensus
 from sports.f1.predictor.features.track_archetype import archetype_fit_score, archetype_ratings, archetypes_for_track
 from sports.f1.predictor.features.penalties import build_penalty_report
@@ -4056,6 +4060,94 @@ async def post_f1_upgrade_impact(round_num: int, body: dict):
         "impacts": impacts,
         "applied_count": len(applied),
         "note": "No structured upgrade feed exists; treatment is a manual calendar (F1_UPGRADE_CALENDAR). Empty calendar → no impacts.",
+    }
+
+
+@router.get("/backtest/calibration")
+async def get_f1_calibration_state():
+    """Current empirical-calibrator state (enabled / method / source / fit counts)."""
+    import os
+    from sports.f1.predictor.probability.engine import _get_empirical_calibrator
+    cal = _get_empirical_calibrator()
+    return {
+        "ok": True,
+        "enabled": not cal.is_identity(),
+        "method": cal.method,
+        "source": cal.source,
+        "sample_count": getattr(cal, "sample_count", 0),
+        "positive_count": getattr(cal, "positive_count", 0),
+        "artifact_env": CALIBRATION_ARTIFACT_ENV,
+        "artifact_configured": bool(os.environ.get(CALIBRATION_ARTIFACT_ENV)),
+        "breakpoints": [[round(x, 4), round(y, 4)] for x, y in getattr(cal, "breakpoints", [])[:14]],
+    }
+
+
+@router.post("/backtest/calibration/fit")
+async def post_f1_fit_calibration(
+    start_season: int = 2024,
+    end_season: int = 2026,
+    method: str = "isotonic",
+    stage: str = "pre_weekend",
+    path: str | None = None,
+):
+    """Fit the empirical winner-market calibrator on historical backtest outcomes and
+    enable it (sets F1_CALIBRATION_ARTIFACT for this process; applied on the next
+    prediction). When the range spans >1 season, fits on all but the last season and
+    reports HELD-OUT Brier on the last; otherwise reports in-sample Brier."""
+    import os
+    bt = _backtester()
+    fit_runs, eval_runs, seasons_used = [], [], []
+    multi = int(end_season) > int(start_season)
+    for season in range(int(start_season), int(end_season) + 1):
+        try:
+            result = await bt.backtest_season(season, include_races=True, allow_partial=True, model_id=None, stage=stage)
+        except Exception:
+            continue
+        races = result.get("races") if result.get("ok") else None
+        if not races:
+            continue
+        seasons_used.append(season)
+        if multi and season == int(end_season):
+            eval_runs.extend(races)
+        else:
+            fit_runs.extend(races)
+
+    fit_pairs = winner_pairs_from_runs(fit_runs)
+    positives = sum(1 for _, y in fit_pairs if y >= 0.5)
+    if len(fit_pairs) < MIN_SAMPLES or positives < MIN_POSITIVES:
+        return {"ok": False, "reason": "insufficient_data", "fit_samples": len(fit_pairs),
+                "fit_positives": positives, "min_samples": MIN_SAMPLES, "min_positives": MIN_POSITIVES,
+                "seasons_used": seasons_used}
+
+    calibrator = fit_winner_calibrator(fit_runs, method=method, source=f"backtest:{start_season}-{end_season}:{method}")
+    if calibrator.is_identity():
+        return {"ok": False, "reason": "fit_returned_identity", "fit_samples": len(fit_pairs), "seasons_used": seasons_used}
+
+    eval_pairs = winner_pairs_from_runs(eval_runs) if eval_runs else fit_pairs
+    eval_kind = "held_out" if eval_runs else "in_sample"
+    ep = [p for p, _ in eval_pairs]
+    eo = [y for _, y in eval_pairs]
+    brier_raw = brier_score(ep, eo)
+    brier_cal = brier_score([calibrator.apply(p) for p in ep], eo)
+
+    target = path or os.environ.get(CALIBRATION_ARTIFACT_ENV) or os.path.join(os.getcwd(), "artifacts", "f1_winner_calibrator.json")
+    calibrator.save(target)
+    os.environ[CALIBRATION_ARTIFACT_ENV] = target
+    _clear_static_response_caches()
+
+    return {
+        "ok": True,
+        "method": calibrator.method,
+        "seasons_used": seasons_used,
+        "fit_sample_count": calibrator.sample_count,
+        "fit_positive_count": calibrator.positive_count,
+        "evaluation": eval_kind,
+        "brier": {"raw": round(brier_raw, 6), "calibrated": round(brier_cal, 6), "improvement": round(brier_raw - brier_cal, 6)},
+        "breakpoints": [[round(x, 4), round(y, 4)] for x, y in calibrator.breakpoints[:14]],
+        "artifact_path": target,
+        "enabled": True,
+        "note": "Applied on the next prediction (caches cleared). "
+                + ("Held-out Brier on the last season." if eval_runs else "In-sample Brier (single season)."),
     }
 
 
