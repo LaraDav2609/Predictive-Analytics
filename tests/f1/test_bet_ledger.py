@@ -73,5 +73,47 @@ class LedgerRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["code"], "missing_decisions")
 
 
+class _FakeBacktester:
+    async def backtest_season(self, season, include_races=False, allow_partial=False, model_id=None, stage="pre_weekend"):
+        return {"ok": True, "season": season, "model_id": "production_v1", "races": [
+            {"round": 1, "actual_winner": "VER", "probability_distribution": [
+                {"driver_id": "VER", "win_probability": 0.6},
+                {"driver_id": "HAM", "win_probability": 0.2},
+                {"driver_id": "NOR", "win_probability": 0.1},
+            ]},
+            {"round": 2, "actual_winner": "NOR", "probability_distribution": [
+                {"driver_id": "VER", "win_probability": 0.5},
+                {"driver_id": "NOR", "win_probability": 0.3},
+            ]},
+        ]}
+
+
+class SeasonLedgerRouteTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._bt = f1_routes._backtester
+        f1_routes._backtester = lambda: _FakeBacktester()
+
+    def tearDown(self):
+        f1_routes._backtester = self._bt
+
+    async def test_season_ledger_runs_over_backtest_rows(self):
+        res = await f1_routes.get_f1_season_ledger(2025, market_shrink=0.3, min_edge_bps=100)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["races_evaluated"], 2)
+        self.assertEqual(res["samples"], 5)        # 3 + 2 drivers
+        self.assertTrue(res["synthetic"])
+        self.assertIn("roi", res)
+        self.assertIn("calibration_by_edge_bucket", res)
+
+    async def test_season_ledger_handles_backtest_failure(self):
+        class _FailBt:
+            async def backtest_season(self, season, include_races=False, allow_partial=False, model_id=None, stage="pre_weekend"):
+                return {"ok": False, "reason": "no_data"}
+        f1_routes._backtester = lambda: _FailBt()
+        res = await f1_routes.get_f1_season_ledger(2099)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "no_data")
+
+
 if __name__ == "__main__":
     unittest.main()

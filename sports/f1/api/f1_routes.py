@@ -3896,6 +3896,60 @@ async def get_f1_race_archetype_fit(round_num: int):
     }
 
 
+@router.get("/backtest/ledger/{season}")
+async def get_f1_season_ledger(
+    season: int,
+    model_id: str | None = None,
+    stage: str = "pre_weekend",
+    bankroll_usd: float = 1000.0,
+    min_edge_bps: float = 200.0,
+    market_shrink: float = 0.25,
+    overround: float = 0.04,
+    spread: float = 0.02,
+    allow_partial: bool = True,
+):
+    """Run the bet-ledger over a season's historical backtest (winner market) against a
+    SYNTHETIC market — each driver's market price is the model probability shrunk toward
+    the race's field mean by ``market_shrink`` (so the model has edge on its sharp picks).
+    Paper-only and partly circular: validates the ledger pipeline, not real edge (no real
+    F1 market history yet — enable F1OddsSnapshotService for that)."""
+    bt = _backtester()
+    result = await bt.backtest_season(season, include_races=True, allow_partial=allow_partial,
+                                      model_id=model_id, stage=stage)
+    if not result.get("ok", False):
+        return {"ok": False, "season": season, "reason": result.get("reason", "backtest_failed")}
+
+    samples = []
+    for row in result.get("races") or []:
+        winner = row.get("actual_winner")
+        dist = [it for it in (row.get("probability_distribution") or []) if float(it.get("win_probability") or 0.0) > 0]
+        if not dist:
+            continue
+        field_mean = sum(float(it["win_probability"]) for it in dist) / len(dist)
+        for item in dist:
+            prob = float(item.get("win_probability") or 0.0)
+            samples.append({
+                "model_prob": prob,
+                "outcome": 1 if item.get("driver_id") == winner else 0,
+                "market_ref": (1.0 - market_shrink) * prob + market_shrink * field_mean,
+                "label": f"R{row.get('round')}:{item.get('driver_id')}",
+            })
+
+    decisions = build_synthetic_decisions(samples, overround=overround, spread=spread)
+    ledger = run_bet_ledger(decisions, bankroll_usd=bankroll_usd, min_edge_bps=min_edge_bps)
+    return {
+        "ok": True,
+        "season": season,
+        "stage": stage,
+        "model_id": result.get("model_id"),
+        "races_evaluated": len(result.get("races") or []),
+        "samples": len(samples),
+        "synthetic": True,
+        "market_shrink": market_shrink,
+        **ledger,
+    }
+
+
 @router.post("/backtest/ledger")
 async def post_f1_ledger_backtest(body: dict):
     """Run the model-vs-market bet-ledger over supplied decisions (or samples →
