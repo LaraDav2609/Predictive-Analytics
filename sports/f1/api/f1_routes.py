@@ -15,13 +15,18 @@ from fastapi import APIRouter
 import redis
 
 from common.ml.bridge.outcome_publisher import OutcomePublisher
-from common.ml.types import OutcomeProbability
+from common.ml.bridge.ops_publisher import OpsEventPublisher
+from common.ml.types import OutcomeProbability, OpsEvent
 from sports.f1.data.f1_client import F1Client
 from sports.f1.data.openf1_client import OpenF1Client
 from sports.f1.data.f1_sentiment import DEFAULT_RSS_FEEDS, read_f1_sentiment, refresh_f1_sentiment
 from sports.f1.analytics.f1_predictor import F1Predictor
 from sports.f1.analytics.f1_simulator import build_session_simulation
 from sports.f1.ml.live_runner import LiveRunnerConfig, run_live_once
+from sports.f1.ml.markets.edge_service import F1EdgeRequest, RaceQuote, compute_race_edges, probability_map_from_records
+from sports.f1.predictor.features.market_consensus import build_market_consensus
+from sports.f1.predictor.features.track_archetype import archetype_fit_score, archetype_ratings, archetypes_for_track
+from sports.f1.predictor.features.penalties import build_penalty_report
 from sports.f1.predictor.backtesting import F1BacktestService
 from sports.f1.predictor.backtesting.evidence_cache import (
     WeekendEvidenceCacheWriter,
@@ -42,10 +47,11 @@ from sports.f1.predictor.features.sentiment import build_race_sentiment_impact
 from sports.f1.predictor.features.tires import TireFeatureProvider
 from sports.f1.predictor.features.track import TrackFeatureProvider
 from sports.f1.predictor.features.weather import WeatherFeatureProvider
-from sports.f1.predictor.features.weekend import build_weekend_evidence, normalize_weekend_session
+from sports.f1.predictor.features.weekend import _grid_evidence, build_weekend_evidence, normalize_weekend_session
 from sports.f1.predictor.probability import detect_stage, enrich_probability_payload
 from sports.f1.predictor.probability.calibration import build_calibration_profile
 from sports.f1.predictor.data_quality import attach_data_quality, build_data_quality_report
+from sports.f1.predictor.data_quality.freshness import alert_key, build_freshness_alerts, summarize_alerts
 from sports.f1.assistant import AssistantActionRequest, AssistantChatRequest, F1AssistantService
 
 router = APIRouter(prefix="/f1", tags=["f1"])
@@ -72,6 +78,17 @@ _race_profile_tasks: dict[tuple[int], asyncio.Task] = {}
 _live_state_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _outcome_publisher_override = None
 _last_bridge_publish_status: dict = {"ok": None, "reason": "not_requested", "record_count": 0}
+# Pipeline-monitor state: ops-event publisher (wired in server.py), an in-process
+# ring buffer of recent events for the /pipeline/health snapshot, and the trust
+# state of the most recent live prediction run.
+_ops_publisher_override = None
+_recent_ops_events: list[dict] = []
+_RECENT_OPS_EVENTS_MAX = 50
+_last_pipeline_run: dict = {"source_mode": None, "reason": "no_run_yet"}
+_active_freshness_alert_keys: set = set()
+# Per-round market-implied consensus supplied by the dashboard; consumed as a
+# bounded feature on the next prediction for that round.
+_market_consensus_by_round: dict = {}
 
 _WEEKEND_SESSION_LABELS = {
     "fp1": "Practice 1",
@@ -454,6 +471,98 @@ def _simulation_rows_to_outcome_probabilities(
     return probabilities
 
 
+def set_ops_publisher(publisher) -> None:
+    """Install the process-wide ops-event publisher (wired in server.py lifespan).
+    Tests can inject an InMemoryOpsPublisher here."""
+    global _ops_publisher_override
+    _ops_publisher_override = publisher
+
+
+def _emit_ops_event(event_type: str, *, severity: str = "info", message: str = "",
+                    entity_id: str | None = None, **detail) -> dict:
+    """Record a pipeline ops/health event: append to the in-process ring buffer
+    (read by /pipeline/health) and best-effort publish to the Redis ops bridge
+    (f1:ops:{event_type}) for the live monitor feed. Never raises."""
+    event = OpsEvent(
+        domain="f1",
+        event_type=event_type,
+        severity=severity,
+        message=message,
+        entity_id=entity_id,
+        detail=detail,
+        emitted_at=datetime.now(timezone.utc),
+    )
+    record = event.model_dump(mode="json")
+    _recent_ops_events.append(record)
+    if len(_recent_ops_events) > _RECENT_OPS_EVENTS_MAX:
+        del _recent_ops_events[:-_RECENT_OPS_EVENTS_MAX]
+    try:
+        publisher = _ops_publisher_override or OpsEventPublisher(domain="f1")
+        publisher.publish(event)
+    except Exception:
+        # Monitoring must never break the pipeline; the in-process buffer still
+        # holds the event for the next /pipeline/health poll.
+        pass
+    return record
+
+
+def _record_pipeline_run(payload: dict, simulation: dict, truth: dict, bridge_records: list) -> None:
+    """Capture the trust state of the most recent live prediction run (source mode,
+    confidence, provenance) for /pipeline/health, and emit a degraded/recovered
+    ops event when the live source quality transitions."""
+    global _last_pipeline_run
+    truth = truth or {}
+    simulation = simulation or {}
+    source_mode = truth.get("source_mode") or payload.get("source_mode") or "unknown"
+    previous_mode = _last_pipeline_run.get("source_mode")
+    entity_id = bridge_records[0].entity_id if bridge_records else None
+    _last_pipeline_run = {
+        "source_mode": source_mode,
+        "confidence": truth.get("confidence"),
+        "confidence_ceiling": truth.get("confidence_ceiling"),
+        "confidence_reason": truth.get("confidence_reason"),
+        "trained_artifacts_used": bool(simulation.get("trained_artifacts_used")),
+        "ml_input_source": simulation.get("ml_input_source"),
+        "fallback_reason": simulation.get("ml_fallback_reason") or truth.get("fallback_reason"),
+        "simulator_iterations": simulation.get("simulator_iterations"),
+        "model_version": simulation.get("prediction_model_version") or simulation.get("model_id"),
+        "generated_at": simulation.get("generated_at"),
+        "entity_id": entity_id,
+        "bridge_record_count": len(bridge_records),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    degraded_modes = {"estimated", "synthetic", "unavailable", "recording_pending"}
+    if source_mode in degraded_modes and source_mode != previous_mode:
+        _emit_ops_event(
+            "degraded", severity="warn",
+            message=f"Live source degraded to '{source_mode}' (confidence ceiling {truth.get('confidence_ceiling')})",
+            entity_id=entity_id, source_mode=source_mode, confidence=truth.get("confidence"),
+        )
+    elif previous_mode in degraded_modes and source_mode not in degraded_modes:
+        _emit_ops_event(
+            "recovered", severity="info",
+            message=f"Live source recovered to '{source_mode}'",
+            entity_id=entity_id, source_mode=source_mode,
+        )
+
+
+def _emit_freshness_alert_transitions(alerts: list[dict]) -> None:
+    """Emit an ops event when a warn/error freshness alert newly appears or clears,
+    so the f1:ops feed (and the monitor) shows transitions without spamming on every
+    poll of /pipeline/health."""
+    global _active_freshness_alert_keys
+    current = {alert_key(a) for a in alerts if a.get("severity") in {"warn", "error"}}
+    by_key = {alert_key(a): a for a in alerts}
+    for key in current - _active_freshness_alert_keys:
+        a = by_key[key]
+        _emit_ops_event("freshness_alert", severity=a["severity"], message=a["message"],
+                        source=a["source"], status=a["status"])
+    for key in _active_freshness_alert_keys - current:
+        _emit_ops_event("freshness_cleared", severity="info",
+                        message=f"Freshness alert cleared: {key}", alert_key=key)
+    _active_freshness_alert_keys = current
+
+
 def _publish_outcome_probabilities(records: list[OutcomeProbability]) -> dict:
     global _last_bridge_publish_status
     if not records:
@@ -463,12 +572,26 @@ def _publish_outcome_probabilities(records: list[OutcomeProbability]) -> dict:
         publisher = _outcome_publisher_override or OutcomePublisher()
         publisher.publish_batch(records)
         _last_bridge_publish_status = {"ok": True, "reason": "published", "record_count": len(records)}
+        _emit_ops_event(
+            "prediction_ready",
+            message=f"Published {len(records)} probability records to the bridge",
+            entity_id=records[0].entity_id,
+            record_count=len(records),
+            markets=sorted({r.market for r in records}),
+        )
     except Exception as exc:
         _last_bridge_publish_status = {
             "ok": False,
             "reason": f"{exc.__class__.__name__}: {exc}",
             "record_count": len(records),
         }
+        _emit_ops_event(
+            "publish_failed",
+            severity="error",
+            message=f"Bridge publish failed: {exc.__class__.__name__}: {exc}",
+            entity_id=records[0].entity_id if records else None,
+            record_count=len(records),
+        )
     return _last_bridge_publish_status
 
 
@@ -2165,6 +2288,97 @@ async def get_f1_health():
             }.items()
             if enabled
         ],
+        "freshness_alerts": build_freshness_alerts(
+            features=features, last_run=_last_pipeline_run, storage_health=storage_health,
+            service={"predictor_loaded": predictor is not None, "openf1": openf1 is not None},
+        ),
+    }
+
+
+@router.get("/pipeline/health")
+async def get_f1_pipeline_health():
+    """Snapshot of the F1 ML pipeline's *trust state* for the monitor page:
+    model provenance (trained vs heuristic fallback), calibration status, live
+    source mode + confidence ceilings, market coverage, bridge/Redis health, the
+    last run's trust state, and recent ops events. Pairs with the f1:ops:* live
+    feed pushed over SignalR."""
+    import os
+    from sports.f1.predictor.probability.empirical_calibration import CALIBRATION_ARTIFACT_ENV
+    from sports.f1.predictor.probability.engine import _get_empirical_calibrator
+
+    artifact_path = os.environ.get("F1_ML_ARTIFACT_PATH")
+    artifact_configured = bool(artifact_path)
+    artifact_present = bool(artifact_path and os.path.exists(artifact_path))
+
+    calibrator = _get_empirical_calibrator()
+    is_identity = calibrator.is_identity()
+    calibration = {
+        "empirical_active": not is_identity,
+        "method": None if is_identity else calibrator.method,
+        "source": None if is_identity else calibrator.source,
+        "sample_count": getattr(calibrator, "sample_count", 0),
+        "artifact_env": CALIBRATION_ARTIFACT_ENV,
+        "artifact_configured": bool(os.environ.get(CALIBRATION_ARTIFACT_ENV)),
+        "temperature_scaling": "active (heuristic stage table)",
+    }
+
+    storage_health = await storage.health() if storage else {
+        "redis": {"available": False, "last_error": "storage_unavailable"},
+        "clickhouse": {"available": False, "last_error": "storage_unavailable"},
+    }
+    redis_available = bool(storage_health.get("redis", {}).get("available"))
+
+    features = (predictor._features if predictor else {}) or {}
+    service_block = {
+        "predictor_loaded": predictor is not None,
+        "client_loaded": client is not None,
+        "season": getattr(client, "season", None),
+        "active_model": predictor._version if predictor else None,
+        "live_engine": live_engine is not None,
+        "openf1": openf1 is not None,
+    }
+    freshness_alerts = build_freshness_alerts(
+        features=features, last_run=_last_pipeline_run,
+        storage_health=storage_health, service=service_block,
+    )
+    _emit_freshness_alert_transitions(freshness_alerts)
+
+    return {
+        "ok": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "service": service_block,
+        "freshness_alerts": freshness_alerts,
+        "freshness_summary": summarize_alerts(freshness_alerts),
+        "provenance": {
+            "mode": "trained" if artifact_present else "heuristic_fallback",
+            "trained_artifacts_configured": artifact_configured,
+            "trained_artifacts_present": artifact_present,
+            "artifact_env": "F1_ML_ARTIFACT_PATH",
+            "fallback_reason": None if artifact_present else "trained_ml_artifacts_unavailable",
+            "note": "Monte-Carlo simulation over heuristic inputs until a trained artifact is deployed.",
+        },
+        "calibration": calibration,
+        "confidence_ceilings": {
+            "unavailable": 0.05, "estimated": 0.25, "recording_pending": 0.25,
+            "recent": 0.55, "historical": 0.65, "recorded": 0.75,
+            "recorded_confident": 0.85, "live": 0.90,
+        },
+        "market_coverage": {
+            "computed": ["winner", "podium", "top_k", "h2h", "fastest_lap", "safety_car", "dnf"],
+            "published_live": ["winner", "podium", "top5", "fastest_lap", "dnf"],
+            "published_route": ["winner", "podium", "top5", "points", "dnf"],
+            "computed_not_published": ["h2h", "safety_car"],
+        },
+        "bridge": {
+            "publisher": "common.ml.bridge.outcome_publisher.OutcomePublisher",
+            "domain": "f1",
+            "prob_channel_pattern": "f1:prob:{entity_id}:{entity_code}:{market}",
+            "ops_channel_pattern": "f1:ops:{event_type}",
+            "redis_available": redis_available,
+            "last_publish": _last_bridge_publish_status,
+        },
+        "last_run": _last_pipeline_run,
+        "recent_events": list(reversed(_recent_ops_events))[:25],
     }
 
 
@@ -2775,7 +2989,7 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
         live_state=live_state,
     )
     weekend_evidence = truth.get("weekend_evidence") or {}
-    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}}
+    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}, "market_signals": _market_consensus_by_round.get(round_num) or {}}
     sentiment, sentiment_impact = await _sentiment_with_race_impact(round_num, session=session)
     prediction_payload = {}
     if race.status == "SCHEDULED":
@@ -2912,6 +3126,7 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
     )
     payload["bridge_record_count"] = len(bridge_records)
     payload["bridge_publish"] = _publish_outcome_probabilities(bridge_records)
+    _record_pipeline_run(payload, simulation, truth, bridge_records)
     response_payload = _compact_live_probability_payload(payload) if compact else payload
     _set_ttl_cache(_live_probability_response_cache, cache_key, response_payload, _LIVE_RESPONSE_CACHE_TTL_SECONDS, "live_probabilities")
     return response_payload
@@ -3282,7 +3497,7 @@ async def get_race_features(round_num: int, session: str = "race", live: bool = 
         live_state=features.get("live_state"),
     )
     weekend_evidence = truth.get("weekend_evidence") or {}
-    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}}
+    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}, "market_signals": _market_consensus_by_round.get(round_num) or {}}
     sentiment, sentiment_impact = await _sentiment_with_race_impact(round_num, session=session)
     if predictor:
         predictor.load_drivers(client.get_drivers(), client.get_constructors(), features, sentiment)
@@ -3391,7 +3606,7 @@ async def get_race_simulation(
         live_state=live_state,
     )
     weekend_evidence = truth.get("weekend_evidence") or {}
-    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}}
+    features = {**features, "race_truth": truth, "weekend_evidence": weekend_evidence, "car_model": truth.get("car_model") or {}, "market_signals": _market_consensus_by_round.get(round_num) or {}}
     sentiment, sentiment_impact = await _sentiment_with_race_impact(round_num, session=session)
     prediction_payload = {}
     if race.status == "SCHEDULED":
@@ -3556,8 +3771,146 @@ async def get_race_track(round_num: int, session: str = "race", live: bool = Fal
     return track
 
 
+@router.post("/races/{round_num}/edges")
+async def post_f1_race_edges(
+    round_num: int,
+    body: F1EdgeRequest,
+    session: str = "race",
+    live: bool = False,
+    model_id: str | None = None,
+):
+    """ANALYSIS-ONLY: join the round's model probabilities to posted venue quotes,
+    returning de-vigged edges + fractional-Kelly stakes. Does NOT place orders —
+    the F1 model is still uncalibrated heuristic Monte-Carlo (see /pipeline/health),
+    so paper-trade until calibration is proven."""
+    race = client.get_race_by_round(round_num) if client else None
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+
+    simulation = await get_race_simulation(round_num, session=session, live=live, model_id=model_id)
+    rows = (simulation or {}).get("simulations") or []
+    records = _simulation_rows_to_outcome_probabilities(
+        season=client.season,
+        race=race,
+        rows=rows,
+        model_version=str(
+            (simulation or {}).get("prediction_model_version")
+            or (simulation or {}).get("model_id")
+            or PRODUCTION_MODEL_ID
+        ),
+        generated_at=(simulation or {}).get("generated_at"),
+    )
+    prob_map = probability_map_from_records(records)
+    quotes = [RaceQuote.from_input(q) for q in body.quotes]
+    edges = compute_race_edges(
+        prob_map, quotes,
+        bankroll_usd=body.bankroll_usd,
+        min_edge_bps=body.min_edge_bps,
+        shrinkage=body.shrinkage,
+        max_per_market_pct=body.max_per_market_pct,
+    )
+    tradeable = [e for e in edges if e.get("tradeable")]
+    return {
+        "ok": True,
+        "round": round_num,
+        "entity_id": _race_entity_id(client.season, race),
+        "session": (session or "race").lower(),
+        "bankroll_usd": body.bankroll_usd,
+        "min_edge_bps": body.min_edge_bps,
+        "model_markets": sorted({market for (_code, market) in prob_map.keys()}),
+        "edges": edges,
+        "tradeable_count": len(tradeable),
+        "count": len(edges),
+        "disclaimer": "Analysis-only. Model is uncalibrated heuristic Monte-Carlo (see /pipeline/health); paper-trade until calibration is proven.",
+    }
+
+
+@router.post("/races/{round_num}/market-consensus")
+async def post_f1_market_consensus(round_num: int, body: dict):
+    """Supply venue-implied per-driver win probabilities for a round. Builds the
+    governed (capped) market-consensus signal and caches it so the next prediction
+    for this round incorporates it as a bounded feature (≤ 0.045 influence). The
+    market informs but cannot dominate, and this does not place orders."""
+    race = client.get_race_by_round(round_num) if client else None
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    driver_implied = (body or {}).get("driver_implied") or (body or {}).get("drivers") or {}
+    if not isinstance(driver_implied, dict) or not driver_implied:
+        return {"ok": False, "reason": "driver_implied map required", "code": "missing_driver_implied"}
+    driver_team = {str(d.id): d.team for d in (client.get_drivers() or [])}
+    consensus = build_market_consensus(
+        {str(k): v for k, v in driver_implied.items()},
+        driver_team=driver_team,
+        confidence=float((body or {}).get("confidence") or 0.58),
+    )
+    _market_consensus_by_round[round_num] = consensus
+    _clear_static_response_caches()
+    return {"ok": True, "round": round_num, "consensus": consensus}
+
+
+@router.get("/races/{round_num}/market-consensus")
+async def get_f1_market_consensus(round_num: int):
+    return {"ok": True, "round": round_num, "consensus": _market_consensus_by_round.get(round_num)}
+
+
+@router.get("/races/{round_num}/archetype-fit")
+async def get_f1_race_archetype_fit(round_num: int):
+    """Per-driver circuit-archetype ratings + fit for this race, from historical
+    teammate-context track performance (the existing per-track scores grouped by
+    archetype). Read-only analysis."""
+    race = client.get_race_by_round(round_num) if client else None
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    features = (predictor._features if predictor else {}) or {}
+    track_history = features.get("track_history") or {}
+    race_name = " ".join(str(x) for x in [
+        getattr(race, "name", ""),
+        getattr(race, "circuit", "") or getattr(race, "circuit_id", ""),
+        getattr(race, "country", ""),
+    ] if x)
+    is_sprint = bool(getattr(race, "has_sprint", False) or getattr(race, "sprint", False))
+    race_archetypes = archetypes_for_track(race_name, is_sprint=is_sprint)
+    ratings = archetype_ratings(track_history)
+    drivers = []
+    for d in (client.get_drivers() or []):
+        did = str(d.id)
+        drivers.append({
+            "driver_id": did,
+            "driver_code": getattr(d, "code", None),
+            "team": getattr(d, "team", None),
+            "archetype_fit_score": archetype_fit_score(ratings.get(did), race_archetypes),
+            "archetype_ratings": ratings.get(did) or {},
+        })
+    drivers.sort(key=lambda x: (x["archetype_fit_score"] if x["archetype_fit_score"] is not None else -1.0), reverse=True)
+    return {
+        "ok": True,
+        "round": round_num,
+        "race_archetypes": race_archetypes,
+        "drivers": drivers,
+        "source": "archetype_fit (historical teammate-context track scores)",
+        "missing_data": not bool(track_history),
+    }
+
+
+@router.get("/races/{round_num}/penalties")
+async def get_f1_race_penalties(round_num: int):
+    """Structured grid penalties, pit-lane starts, and disqualifications for a race,
+    from official Jolpica qualifying-vs-grid deltas + result status. Penalty reasons
+    and component/PU changes are not in any structured feed and are omitted (not
+    guessed). Read-only."""
+    race = client.get_race_by_round(round_num) if client else None
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    profile = await _race_profile_for_round(round_num)
+    drivers_by_id = {str(d.id): d for d in (client.get_drivers() or [])}
+    grid_evidence = _grid_evidence(profile, drivers_by_id)
+    report = build_penalty_report(grid_evidence, profile.get("results") or [])
+    return {"ok": True, "round": round_num, **report}
+
+
 @router.post("/refresh")
 async def refresh():
+    _emit_ops_event("refresh_started", message="Catalog + feature refresh started")
     _clear_static_response_caches()
     await client.refresh()
     features = await client.get_prediction_features()
@@ -3574,7 +3927,7 @@ async def refresh():
             features,
             sentiment,
         )
-    return {
+    result = {
         "ok": True,
         "drivers": len(client.get_drivers()),
         "constructors": len(client.get_constructors()),
@@ -3585,3 +3938,10 @@ async def refresh():
         "sentiment_configured_sources": sentiment.get("configured_sources", 0),
         "prediction_model": "f1-live-historical-sentiment-v4",
     }
+    _emit_ops_event(
+        "refresh_completed",
+        message=f"Refresh complete — {result['drivers']} drivers, {result['completed_races']} completed races",
+        drivers=result["drivers"],
+        completed_races=result["completed_races"],
+    )
+    return result

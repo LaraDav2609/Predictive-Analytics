@@ -13,6 +13,7 @@ from sports.f1.predictor.probability.empirical_calibration import (
     load_default as _load_empirical_calibrator,
 )
 from sports.f1.predictor.probability.stage import detect_stage
+from sports.f1.predictor.probability.uncertainty import assess_conviction, driver_uncertainty
 
 
 _EMPIRICAL_STATE = None
@@ -101,6 +102,22 @@ def build_probability_audit(
 
     enriched.sort(key=lambda item: item["calibrated_probability"], reverse=True)
     confidence = _confidence(truth, calibration.confidence_scale)
+    # Second pass: attach per-driver uncertainty bands + trade conviction now that
+    # the overall confidence and governance caps are known. Derived from the MC
+    # finish distribution already on each row — no simulator change.
+    iterations = int(simulation.get("simulator_iterations") or simulation.get("iterations") or 0)
+    capped_ids = {str(x) for x in (governance.get("capped_driver_ids") or [])}
+    for item in enriched:
+        item["uncertainty"] = driver_uncertainty(
+            item["finish_distribution"], item["calibrated_probability"], confidence, iterations,
+        )
+        item["conviction"] = assess_conviction(
+            win_prob=item["calibrated_probability"],
+            confidence=confidence,
+            uncertainty=item["uncertainty"],
+            governance_capped=str(item["driver_id"]) in capped_ids,
+        )
+        item["do_not_trade"] = item["conviction"]["do_not_trade"]
     return {
         "ok": True,
         "stage": detected_stage,

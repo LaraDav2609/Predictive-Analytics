@@ -8,6 +8,7 @@ it without any domain-specific knowledge — see `common.ml.bridge.outcome_publi
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -29,3 +30,24 @@ class OutcomeProbability(BaseModel):
     probability: float = Field(ge=0.0, le=1.0)
     knowable_as_of: datetime    # point-in-time stamp for leak-free backtests
     model_version: str
+
+
+class OpsEvent(BaseModel):
+    """One pipeline operations / health event, for live monitoring dashboards.
+
+    Where `OutcomeProbability` carries a *prediction*, `OpsEvent` carries
+    *pipeline state*: a refresh starting/finishing, a prediction being
+    published, a bridge-publish failure, the live source degrading to
+    estimated, etc. Routed by the shared Redis ops bridge to
+    `{domain}:ops:{event_type}` — see `common.ml.bridge.ops_publisher`. The
+    .NET dashboard subscribes to `{domain}:ops:*` and fans these out to the
+    pipeline-monitor page over SignalR.
+    """
+
+    domain: str                              # "f1", "baseball", "csgo", ...
+    event_type: str                          # "refresh_started", "prediction_ready", "publish_failed", "degraded", ...
+    severity: str = "info"                   # "info" | "warn" | "error"
+    message: str = ""                        # human-readable one-liner
+    entity_id: str | None = None             # optional event id (race / game / match) the event concerns
+    detail: dict[str, Any] = Field(default_factory=dict)  # structured extra fields
+    emitted_at: datetime                     # UTC timestamp

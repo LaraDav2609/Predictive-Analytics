@@ -139,6 +139,12 @@ async def lifespan(app: FastAPI):
     csgo_routes.set_publisher(OutcomePublisher(
         host=_os.getenv("REDIS_HOST", "localhost"),
         port=int(_os.getenv("REDIS_PORT", "6379"))))
+    # Light up the f1:ops:* pipeline-monitor bridge (lazy Redis; best-effort).
+    from common.ml.bridge.ops_publisher import OpsEventPublisher
+    f1_routes.set_ops_publisher(OpsEventPublisher(
+        domain="f1",
+        host=_os.getenv("REDIS_HOST", "localhost"),
+        port=int(_os.getenv("REDIS_PORT", "6379"))))
 
     # Initial data loads are intentionally non-blocking. Some upstream sports/F1
     # APIs can be slow or unavailable, and the dashboard should still boot.

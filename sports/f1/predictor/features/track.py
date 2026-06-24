@@ -10,12 +10,15 @@ class TrackFeatureProvider:
         self._features = features or {}
 
     def get_features(self, race: Race | None) -> dict:
+        # Local import avoids a module-load cycle (track_archetype imports TRACK_TRAITS).
+        from sports.f1.predictor.features.track_archetype import classify_archetypes
         text = f"{getattr(race, 'name', '')} {getattr(race, 'circuit', '')} {getattr(race, 'country', '')}".lower()
         key = _track_key(text)
         registry = TRACK_TRAITS.get(key) or _fallback_traits(text)
         history = ((self._features.get("track_history") or {}).get(key) or {})
         return {
             **registry,
+            "archetypes": classify_archetypes(registry),
             "track_key": key,
             "circuit_id": getattr(race, "circuit_id", None),
             "latitude": getattr(race, "latitude", None),

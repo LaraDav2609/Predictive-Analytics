@@ -8,6 +8,7 @@ from typing import Any
 from sports.f1.models.f1 import Constructor, Driver, Race
 from sports.f1.predictor.config import SESSION_SIMULATION_VERSION
 from sports.f1.predictor.features.car_model import build_car_model_analysis
+from sports.f1.predictor.features.market_consensus import market_strength_modifier
 from sports.f1.predictor.features.practice import apply_practice_pace_adjustments
 from sports.f1.predictor.features.reliability import ReliabilityFeatureProvider
 from sports.f1.predictor.features.tires import TireFeatureProvider
@@ -39,6 +40,9 @@ def build_session_projection(
     prediction_items = (prediction or {}).get("driver_predictions") or {}
     driver_features = (features or {}).get("drivers") or {}
     constructor_features = (features or {}).get("constructors") or {}
+    # Optional market-implied consensus (supplied via the dashboard → /market-consensus,
+    # injected into features by the route). Absent by default → zero effect.
+    market_signals = (features or {}).get("market_signals") or {}
     openf1_session = (features or {}).get("openf1_session") or {}
     driver_features = apply_practice_pace_adjustments(
         drivers,
@@ -206,6 +210,9 @@ def build_session_projection(
                 + 0.02 * sentiment_factor(sentiment)
             )
         live_strength_multiplier = float(live_dynamic.get("strength_multiplier") or 1.0)
+        # Bounded market-consensus nudge (≤ ±0.045); 1.0 when no market data supplied.
+        market_modifier = market_strength_modifier(driver.id, market_signals)
+        market_implied = (market_signals.get("drivers") or {}).get(str(driver.id))
         strength = max(
             0.001,
             strength
@@ -214,6 +221,7 @@ def build_session_projection(
             * max(0.94, min(1.06, car_model_modifier))
             * car_trait_fit["modifier"]
             * grid_context["modifier"]
+            * market_modifier
             * live_strength_multiplier,
         )
 
@@ -249,6 +257,8 @@ def build_session_projection(
                 "team_pace": round(team, 4),
                 "car_model": round(car_model_score, 4),
                 "car_model_modifier": round(max(0.94, min(1.06, car_model_modifier)), 4),
+                "market_modifier": round(market_modifier, 4),
+                "market_implied": round(float(market_implied), 4) if market_implied is not None else None,
                 "car_model_confidence": round(float(car_profile.get("confidence") or 0.0), 4),
                 "car_model_scores": car_profile.get("scores") or {},
                 "car_model_missing_data": car_profile.get("missing_data") or [],
