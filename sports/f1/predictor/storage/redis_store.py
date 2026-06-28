@@ -34,6 +34,9 @@ class F1RedisKeys:
     def probability_channel(self, season: int, round_num: int, session: str, model_id: str) -> str:
         return f"{self.prefix}:pub:prob:{season}:{round_num}:{_session(session)}:{model_id or 'production_v1'}"
 
+    def telemetry_latest(self, season: int, round_num: int, session: str, model_id: str) -> str:
+        return f"{self.prefix}:telemetry:{season}:{round_num}:{_session(session)}:{model_id or 'telemetry_simulator_v1'}:latest"
+
     def racehub(self, round_num: int, tab: str, payload_hash: str) -> str:
         return f"{self.prefix}:racehub:{round_num}:{tab}:{payload_hash}"
 
@@ -125,6 +128,9 @@ class F1RedisStore:
             else:
                 status["publish_ok"] = True
         return status
+
+    def set_telemetry_snapshot(self, season: int, round_num: int, session: str, model_id: str, payload: dict[str, Any], ttl_seconds: int = 900) -> dict[str, Any]:
+        return self._set_json(self.keys.telemetry_latest(season, round_num, session, model_id), payload, ttl_seconds)
 
     def set_racehub_cache(self, round_num: int, tab: str, payload: dict[str, Any], ttl_seconds: int = 180) -> dict[str, Any]:
         payload_hash = sha1(json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")).hexdigest()[:16]

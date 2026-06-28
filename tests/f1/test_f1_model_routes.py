@@ -1,4 +1,7 @@
+import json
+import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from common.ml.bridge.outcome_publisher import InMemoryOutcomePublisher
@@ -6,10 +9,24 @@ from sports.f1.api import f1_routes
 from sports.f1.predictor.backtesting.evidence_cache import WeekendEvidenceCacheWriter
 from sports.f1.analytics.f1_predictor import F1Predictor
 from sports.f1.models.f1 import Constructor, Driver, Race
+from sports.f1.ml.telemetry.types import TelemetryFeaturePayload, TelemetryFeatureVector
 
 
 class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self._old_telemetry_env = {
+            key: os.environ.get(key)
+            for key in (
+                "F1_TELEMETRY_CACHE_DIR",
+                "F1_TELEMETRY_ARTIFACT_PATH",
+                "F1_TELEMETRY_MODEL_ENABLED",
+                "F1_TELEMETRY_MODEL_WARN_ONLY",
+                "F1_TELEMETRY_MIN_CONFIDENCE",
+                "F1_TELEMETRY_SOURCE",
+            )
+        }
+        self._telemetry_cache_tmp = TemporaryDirectory()
+        os.environ["F1_TELEMETRY_CACHE_DIR"] = self._telemetry_cache_tmp.name
         self.client = _FakeF1Client()
         self.predictor = F1Predictor()
         self.sentiment = {
@@ -23,10 +40,19 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         f1_routes.openf1 = None
         f1_routes.live_engine = None
         f1_routes.live_recorder = None
+        f1_routes.fastf1_telemetry = None
         f1_routes.storage = None
         f1_routes._outcome_publisher_override = None
         f1_routes._last_bridge_publish_status = {"ok": None, "reason": "not_requested", "record_count": 0}
         f1_routes._clear_static_response_caches()
+
+    def tearDown(self):
+        for key, value in self._old_telemetry_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._telemetry_cache_tmp.cleanup()
 
     async def test_models_endpoint_lists_registry(self):
         result = await f1_routes.get_f1_models()
@@ -34,6 +60,7 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("production_v1", result["default_model_id"])
         self.assertGreaterEqual(len(result["models"]), 3)
+        self.assertIn("telemetry_simulator_v1", {model["model_id"] for model in result["models"]})
 
     async def test_health_endpoint_reports_missing_sources(self):
         self.predictor.load_drivers(self.client.get_drivers(), self.client.get_constructors(), self.client.features, sentiment={})
@@ -43,7 +70,24 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sentiment", result["fallback_heavy"])
         self.assertIn("live", result["fallback_heavy"])
         self.assertEqual("unavailable", result["sources"]["live"]["latest_mode"])
+        self.assertEqual("deterministic_v0", result["sources"]["telemetry"]["status"])
+        self.assertFalse(result["sources"]["telemetry"]["artifact_ready"])
         self.assertEqual(2, result["drivers"])
+
+    async def test_health_endpoint_reports_incomplete_telemetry_artifact(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metadata.json"
+            path.write_text(json.dumps({
+                "artifact_id": "partial-telemetry",
+                "heads": {"pace_delta": {"intercept": 0.0, "coefficients": {}}},
+            }), encoding="utf-8")
+            os.environ["F1_TELEMETRY_ARTIFACT_PATH"] = str(tmp)
+
+            result = await f1_routes.get_f1_health()
+
+        self.assertEqual("artifact_incomplete", result["sources"]["telemetry"]["status"])
+        self.assertIn("telemetry_artifact", result["fallback_heavy"])
+        self.assertIn("dnf_hazard", result["sources"]["telemetry"]["artifact_missing_heads"])
 
     async def test_existing_race_prediction_shape_still_exists(self):
         race = self.client.get_race_by_round(1)
@@ -70,6 +114,27 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ml_simulator_v1", result["model_id"])
         self.assertEqual("ml_simulator_v1", result["selected_model_id"])
         self.assertIn("ml_input_source", result)
+
+    async def test_simulation_accepts_telemetry_simulator_model_id(self):
+        result = await f1_routes.get_race_simulation(1, model_id="telemetry_simulator_v1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("telemetry_simulator_v1", result["model_id"])
+        self.assertEqual("telemetry_simulator_v1", result["selected_model_id"])
+        self.assertIn("telemetry_model_used", result)
+        self.assertIn("telemetry_leakage_guard_status", result)
+
+    async def test_simulation_honors_telemetry_warn_only_flag(self):
+        os.environ["F1_TELEMETRY_MODEL_WARN_ONLY"] = "true"
+        f1_routes._clear_static_response_caches()
+
+        result = await f1_routes.get_race_simulation(1, model_id="telemetry_simulator_v1")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["telemetry_model_used"])
+        self.assertTrue(result["telemetry_warn_only"])
+        self.assertEqual("telemetry_warn_only", result["telemetry_fallback_reason"])
+        self.assertTrue(result["telemetry_policy"]["warn_only"])
 
     async def test_simulation_rejects_unknown_model_id(self):
         result = await f1_routes.get_race_simulation(1, model_id="not_real")
@@ -150,6 +215,97 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("1:30.900", result["results"][0]["best_time"])
         self.assertEqual(7, result["results"][0]["laps"])
 
+    async def test_telemetry_features_endpoint_uses_openf1_summary(self):
+        f1_routes.openf1 = _FakeOpenF1()
+
+        result = await f1_routes.get_race_telemetry_features(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        features = result["telemetry_features"]
+        self.assertEqual("openf1_historical", features["source_mode"])
+        self.assertIn("LEC", features["driver_features"])
+
+    async def test_telemetry_model_endpoint_returns_adjustments(self):
+        f1_routes.openf1 = _FakeOpenF1()
+
+        result = await f1_routes.get_race_telemetry_model(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("telemetry_simulator_v1", result["model_id"])
+        self.assertEqual("telemetry_simulator_v1", result["selected_model_id"])
+        self.assertEqual("telemetry_simulator_v1.v0", result["model_version"])
+        model = result["telemetry_model"]
+        self.assertEqual("telemetry_simulator_v1", model["model_id"])
+        self.assertIn("LEC", model["driver_adjustments"])
+
+    async def test_telemetry_model_endpoint_accepts_artifact_manifest(self):
+        f1_routes.openf1 = _FakeOpenF1()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metadata.json"
+            path.write_text(json.dumps({
+                "artifact_id": "telemetry-route-fixture",
+                "artifact_version": "v1",
+                "heads": {
+                    "pace_delta": {"path": "pace.pkl"},
+                    "pace_quantile": {"path": "quantile.pkl"},
+                    "dnf_hazard": {"path": "dnf.pkl"},
+                    "overtake": {"path": "overtake.pkl"},
+                    "pit_value": {"path": "pit.pkl"},
+                },
+            }), encoding="utf-8")
+
+            result = await f1_routes.get_race_telemetry_model(1, "fp1", artifact_path=tmp)
+
+        self.assertTrue(result["ok"])
+        status = result["telemetry_model"]["metadata"]["learned_artifact_status"]
+        self.assertTrue(status["ok"])
+        self.assertEqual("telemetry-route-fixture", status["artifact_id"])
+
+    async def test_telemetry_model_endpoint_persists_audit_snapshot(self):
+        f1_routes.openf1 = _FakeOpenF1()
+        f1_routes.storage = _FakeTelemetryStorage()
+
+        result = await f1_routes.get_race_telemetry_model(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["storage"]["redis"]["ok"])
+        self.assertEqual(1, len(f1_routes.storage.calls))
+        self.assertEqual("telemetry_simulator_v1", f1_routes.storage.calls[0]["model_id"])
+
+    async def test_telemetry_features_endpoint_can_fallback_to_fastf1_bridge(self):
+        f1_routes.openf1 = _UnavailableOpenF1()
+        f1_routes.fastf1_telemetry = _FakeFastF1TelemetryBridge()
+
+        result = await f1_routes.get_race_telemetry_features(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        features = result["telemetry_features"]
+        self.assertEqual("fastf1_historical_raw", features["source_mode"])
+        self.assertIn("LEC", features["driver_features"])
+        self.assertEqual("fastf1", result["telemetry_snapshot"]["source"])
+        self.assertEqual(3, result["telemetry_snapshot"]["raw_counts"]["trace_points"])
+
+    async def test_telemetry_segments_endpoint_returns_ranked_segments(self):
+        f1_routes.openf1 = _FakeOpenF1()
+
+        result = await f1_routes.get_race_telemetry_segments(1, "fp1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("fp1", result["session"])
+        self.assertGreaterEqual(len(result["segments"]), 1)
+        self.assertIn(result["segments"][0]["driver_code"], {"LEC", "VER"})
+        self.assertIn("model_adjustment", result["segments"][0])
+
+    async def test_telemetry_lap_comparison_endpoint_returns_driver_deltas(self):
+        f1_routes.openf1 = _FakeOpenF1()
+
+        result = await f1_routes.get_race_telemetry_lap_comparison(1, "fp1", driver_a="LEC", driver_b="VER")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(["LEC", "VER"], [row["driver_code"] for row in result["drivers"]])
+        self.assertGreaterEqual(len(result["deltas"]), 1)
+        self.assertEqual("LEC", result["deltas"][0]["driver_a"])
+
     async def test_session_result_reports_unavailable_when_no_rows_exist(self):
         result = await f1_routes.get_race_session_result(1, "fp2")
 
@@ -180,6 +336,23 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["recommendations"])
         self.assertTrue(result["load_strategy"]["upstream_calls_minimized"])
         self.assertEqual(1, self.client.historical_race_loads)
+
+    async def test_telemetry_model_evaluation_endpoint_returns_coverage_buckets(self):
+        result = await f1_routes.get_f1_telemetry_model_evaluation(
+            start_season=2025,
+            end_season=2025,
+            allow_partial=True,
+            stage="practice_available",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("telemetry_simulator_v1", result["model_id"])
+        self.assertIn("coverage", result)
+        self.assertIn("confidence_buckets", result)
+        self.assertTrue(result["feature_importance"])
+        self.assertIn("rollout_policy", result)
+        self.assertIn("learned_artifact_status", result)
+        self.assertIn("avg_brier_score", result["deltas"])
 
     async def test_backtest_evidence_cache_endpoint_builds_diagnostic_payload(self):
         f1_routes.openf1 = _FakeOpenF1()
@@ -414,6 +587,65 @@ class _FakeOpenF1:
             "stints": {"drivers": {}},
             "pits": {"drivers": {}},
             "raw_counts": {"laps": 12},
+        }
+
+
+class _UnavailableOpenF1:
+    async def get_session_features(self, race, session="race", drivers=None, live=False):
+        return {"ok": False, "source": "openf1", "reason": "openf1_fixture_unavailable", "raw_counts": {}}
+
+
+class _FakeFastF1TelemetryBridge:
+    def telemetry_features(self, race, season, round_num, session="race", live=False):
+        payload = TelemetryFeaturePayload(
+            race_id=f"{season}-{round_num:02d}-TEST",
+            session=session,
+            source_mode="fastf1_historical_raw",
+            confidence=0.72,
+            driver_features={
+                "LEC": TelemetryFeatureVector(
+                    race_id=f"{season}-{round_num:02d}-TEST",
+                    session=session,
+                    driver_code="LEC",
+                    source="fastf1",
+                    clean_air_pace_delta_s=-0.25,
+                    pace_sigma_delta=0.08,
+                    confidence=0.76,
+                    samples=3,
+                )
+            },
+            segment_features=[{"driver_code": "LEC", "kind": "pace_delta", "magnitude": 0.25, "label": "faster"}],
+            raw_counts={"trace_points": 3},
+            data_quality={"raw_trace": True},
+        )
+        snapshot = {
+            "ok": True,
+            "source": "fastf1",
+            "raw_counts": {"trace_points": 3},
+            "cache": {"hit": False},
+            "manifest": {"schema_version": "f1_telemetry_cache_v1"},
+        }
+        return payload, snapshot
+
+
+class _FakeTelemetryStorage:
+    def __init__(self):
+        self.calls = []
+
+    async def persist_truth_snapshot(self, season, race, session, truth):
+        return {"redis": {"ok": True, "key": "truth"}, "clickhouse": {"ok": True, "rows": 0}}
+
+    async def persist_telemetry_snapshot(self, season, race, session, payload, model_id="telemetry_simulator_v1"):
+        self.calls.append({
+            "season": season,
+            "round": getattr(race, "round", None),
+            "session": session,
+            "model_id": model_id,
+            "payload": payload,
+        })
+        return {
+            "redis": {"ok": True, "key": "fixture"},
+            "clickhouse": {"ok": True, "rows": len((payload.get("telemetry_model") or {}).get("driver_adjustments") or {})},
         }
 
 

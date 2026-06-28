@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
@@ -19,6 +20,16 @@ from sports.f1.ml.common.types import Lap, Race as MLSimRace, SessionType, TireC
 from sports.f1.ml.markets.mapper import dnf_probabilities, winner_probabilities
 from sports.f1.ml.simulator.model_contract import PaceDistribution, SimulatorModelBundle
 from sports.f1.ml.simulator.race_sim import SimConfig, simulate_race
+from sports.f1.ml.telemetry import (
+    build_telemetry_artifact_manifest,
+    export_telemetry_training_rows,
+    load_telemetry_artifact_manifest,
+    load_telemetry_label_rows,
+    load_telemetry_training_rows,
+    load_telemetry_training_payloads,
+    save_telemetry_artifact_manifest,
+)
+from sports.f1.ml.telemetry.types import TelemetryFeaturePayload, TelemetryFeatureVector
 from sports.f1.models.f1 import Constructor, Driver, Race
 from sports.f1.predictor.models.baseline import BaselineRaceModel
 from sports.f1.predictor.models.registry import F1ModelRegistry
@@ -235,6 +246,278 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertEqual("ml_simulator_v1", loaded.model_id)
         self.assertTrue(loaded.drivers)
 
+    def test_telemetry_artifact_builder_writes_complete_manifest(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metadata.json"
+            manifest = build_telemetry_artifact_manifest(artifact_id="telemetry-test")
+            result = save_telemetry_artifact_manifest(path, manifest)
+            loaded = load_telemetry_artifact_manifest(path)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(loaded["ok"])
+        self.assertEqual("telemetry-test", loaded["artifact_id"])
+        self.assertEqual([], loaded["missing_heads"])
+        self.assertEqual({"pace_delta", "pace_quantile", "dnf_hazard", "overtake", "pit_value"}, set(loaded["trained_heads"]))
+
+    def test_telemetry_artifact_builder_fits_supervised_head_rows(self):
+        rows = [
+            {"features": {"clean_air_pace_delta_s": 0.0}, "targets": {"pace_delta": 0.10}},
+            {"features": {"clean_air_pace_delta_s": 1.0}, "targets": {"pace_delta": 0.68}},
+            {"features": {"clean_air_pace_delta_s": 2.0}, "targets": {"pace_delta": 1.20}},
+        ]
+        manifest = build_telemetry_artifact_manifest(artifact_id="telemetry-supervised-test", training_rows=rows)
+        pace = manifest["heads"]["pace_delta"]
+
+        self.assertEqual("supervised_linear", manifest["calibration"]["kind"])
+        self.assertEqual(["pace_delta"], manifest["metrics"]["supervised_heads_trained"])
+        self.assertEqual("supervised_ridge_linear", pace["calibration"]["kind"])
+        self.assertGreater(pace["coefficients"]["clean_air_pace_delta_s"], 0.3)
+
+    def test_cli_train_telemetry_artifacts_writes_manifest(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "telemetry"
+            result = CliRunner().invoke(app, ["train-telemetry-artifacts", "--output", str(path), "--artifact-id", "telemetry-cli-test"])
+            loaded = load_telemetry_artifact_manifest(path)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertTrue(loaded["ok"])
+        self.assertEqual("telemetry-cli-test", loaded["artifact_id"])
+        self.assertIn("telemetry artifact written:", result.output)
+
+    def test_cli_train_telemetry_artifacts_accepts_supervised_rows(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            row_path = Path(tmp) / "rows.json"
+            row_path.write_text(json.dumps({
+                "training_rows": [
+                    {"features": {"clean_air_pace_delta_s": 0.0}, "targets": {"pace_delta": 0.10}},
+                    {"features": {"clean_air_pace_delta_s": 1.0}, "targets": {"pace_delta": 0.68}},
+                    {"features": {"clean_air_pace_delta_s": 2.0}, "targets": {"pace_delta": 1.20}},
+                ]
+            }), encoding="utf-8")
+            output_path = Path(tmp) / "telemetry"
+            result = CliRunner().invoke(app, [
+                "train-telemetry-artifacts",
+                "--output", str(output_path),
+                "--artifact-id", "telemetry-cli-supervised",
+                "--training-row-path", str(row_path),
+            ])
+            loaded = load_telemetry_artifact_manifest(output_path)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertTrue(loaded["ok"])
+        self.assertEqual("supervised_ridge_linear", loaded["head_definitions"]["pace_delta"]["calibration"]["kind"])
+        self.assertIn("supervised heads: pace_delta", result.output)
+
+    def test_cli_train_telemetry_artifacts_can_join_features_and_labels(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            feature_path = Path(tmp) / "features.json"
+            label_path = Path(tmp) / "labels.json"
+            output_path = Path(tmp) / "telemetry"
+            feature_path.write_text(json.dumps([
+                _telemetry_payload_fixture("LEC", 0.0).model_dump(mode="json"),
+                _telemetry_payload_fixture("VER", 1.0).model_dump(mode="json"),
+                _telemetry_payload_fixture("HAM", 2.0).model_dump(mode="json"),
+            ]), encoding="utf-8")
+            label_path.write_text(json.dumps({
+                "label_rows": [
+                    {"race_id": "2026-01-TEST", "session": "fp1", "driver_code": "LEC", "pace_delta": 0.10},
+                    {"race_id": "2026-01-TEST", "session": "fp1", "driver_code": "VER", "pace_delta": 0.68},
+                    {"race_id": "2026-01-TEST", "session": "fp1", "driver_code": "HAM", "pace_delta": 1.20},
+                ]
+            }), encoding="utf-8")
+
+            result = CliRunner().invoke(app, [
+                "train-telemetry-artifacts",
+                "--output", str(output_path),
+                "--artifact-id", "telemetry-cli-joined",
+                "--feature-payload-path", str(feature_path),
+                "--label-path", str(label_path),
+            ])
+            loaded = load_telemetry_artifact_manifest(output_path)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertTrue(loaded["ok"])
+        self.assertEqual("supervised_ridge_linear", loaded["head_definitions"]["pace_delta"]["calibration"]["kind"])
+        self.assertIn("joined labels: 3 rows: 3", result.output)
+
+    def test_export_telemetry_training_rows_joins_features_and_labels(self):
+        payload = _telemetry_payload_fixture()
+        rows = export_telemetry_training_rows(
+            [payload],
+            [{
+                "race_id": "2026-01-TEST",
+                "session": "fp1",
+                "driver_code": "LEC",
+                "targets": {"pace_delta": -0.18, "overtake": 0.04},
+            }],
+        )
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("LEC", rows[0]["driver_code"])
+        self.assertAlmostEqual(0.25, rows[0]["features"]["clean_air_pace_delta_s"])
+        self.assertEqual({"pace_delta": -0.18, "overtake": 0.04}, rows[0]["targets"])
+
+    def test_cli_export_telemetry_training_rows_writes_joined_rows(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            feature_path = Path(tmp) / "features.json"
+            label_path = Path(tmp) / "labels.json"
+            output_path = Path(tmp) / "training_rows.json"
+            feature_path.write_text(_telemetry_payload_fixture().model_dump_json(), encoding="utf-8")
+            label_path.write_text(json.dumps({
+                "label_rows": [{
+                    "race_id": "2026-01-TEST",
+                    "session": "fp1",
+                    "driver_code": "LEC",
+                    "pace_delta": -0.18,
+                    "overtake": 0.04,
+                }]
+            }), encoding="utf-8")
+
+            result = CliRunner().invoke(app, [
+                "export-telemetry-training-rows",
+                "--feature-payload-path", str(feature_path),
+                "--label-path", str(label_path),
+                "--output", str(output_path),
+            ])
+            rows = load_telemetry_training_rows(output_path)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("LEC", rows[0]["driver_code"])
+        self.assertIn("rows: 1", result.output)
+
+    def test_telemetry_training_loaders_accept_utf8_bom_files(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature_path = root / "features.json"
+            label_path = root / "labels.json"
+            row_path = root / "rows.json"
+            _write_bom_json(feature_path, [_telemetry_payload_fixture().model_dump(mode="json")])
+            _write_bom_json(label_path, {
+                "label_rows": [{
+                    "race_id": "2026-01-TEST",
+                    "session": "fp1",
+                    "driver_code": "LEC",
+                    "pace_delta": -0.18,
+                    "overtake": 0.04,
+                }]
+            })
+            _write_bom_json(row_path, {
+                "training_rows": [{
+                    "features": {"clean_air_pace_delta_s": 0.25},
+                    "targets": {"pace_delta": -0.18},
+                }]
+            })
+
+            payloads = load_telemetry_training_payloads(feature_path)
+            labels = load_telemetry_label_rows(label_path)
+            rows = load_telemetry_training_rows(row_path)
+
+        self.assertEqual(1, len(payloads))
+        self.assertEqual(1, len(labels))
+        self.assertEqual(1, len(rows))
+        self.assertEqual("LEC", next(iter(payloads[0].driver_features.keys())))
+        self.assertEqual("LEC", labels[0]["driver_code"])
+        self.assertAlmostEqual(-0.18, rows[0]["targets"]["pace_delta"])
+
+    def test_cli_export_telemetry_training_rows_accepts_utf8_bom_inputs(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature_path = root / "features.json"
+            label_path = root / "labels.json"
+            output_path = root / "training_rows.json"
+            _write_bom_json(feature_path, [_telemetry_payload_fixture().model_dump(mode="json")])
+            _write_bom_json(label_path, {
+                "label_rows": [{
+                    "race_id": "2026-01-TEST",
+                    "session": "fp1",
+                    "driver_code": "LEC",
+                    "pace_delta": -0.18,
+                    "overtake": 0.04,
+                }]
+            })
+
+            result = CliRunner().invoke(app, [
+                "export-telemetry-training-rows",
+                "--feature-payload-path", str(feature_path),
+                "--label-path", str(label_path),
+                "--output", str(output_path),
+            ])
+            rows = load_telemetry_training_rows(output_path)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(1, len(rows))
+        self.assertIn("payloads: 1 labels: 1 rows: 1", result.output)
+
+    def test_cli_export_telemetry_training_rows_fails_when_no_rows_join(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature_path = root / "features.json"
+            label_path = root / "labels.json"
+            output_path = root / "training_rows.json"
+            feature_path.write_text(_telemetry_payload_fixture("LEC").model_dump_json(), encoding="utf-8")
+            label_path.write_text(json.dumps({
+                "label_rows": [{
+                    "race_id": "2026-01-TEST",
+                    "session": "fp1",
+                    "driver_code": "VER",
+                    "pace_delta": -0.18,
+                }]
+            }), encoding="utf-8")
+
+            result = CliRunner().invoke(app, [
+                "export-telemetry-training-rows",
+                "--feature-payload-path", str(feature_path),
+                "--label-path", str(label_path),
+                "--output", str(output_path),
+            ])
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn("no telemetry training rows exported", result.output)
+        self.assertFalse(output_path.exists())
+
+    def test_cli_train_telemetry_artifacts_fails_when_supplied_labels_do_not_join(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature_path = root / "features.json"
+            label_path = root / "labels.json"
+            output_path = root / "telemetry"
+            feature_path.write_text(_telemetry_payload_fixture("LEC").model_dump_json(), encoding="utf-8")
+            label_path.write_text(json.dumps({
+                "label_rows": [{
+                    "race_id": "2026-01-TEST",
+                    "session": "race",
+                    "driver_code": "VER",
+                    "pace_delta": -0.18,
+                }]
+            }), encoding="utf-8")
+
+            result = CliRunner().invoke(app, [
+                "train-telemetry-artifacts",
+                "--output", str(output_path),
+                "--artifact-id", "telemetry-empty-join",
+                "--feature-payload-path", str(feature_path),
+                "--label-path", str(label_path),
+            ])
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn("no telemetry training rows found", result.output)
+        self.assertFalse((output_path / "metadata.json").exists())
+
     def test_fastf1_artifact_builder_produces_metadata_from_fixture_provider(self):
         provider = _FixtureTelemetryProvider()
         races = provider.list_races(2025)
@@ -301,6 +584,40 @@ class F1MLArtifactTests(unittest.TestCase):
             "driver_dnf_rate_per_lap": [0.0001, 0.0001],
             "total_laps": 12,
         }
+
+
+def _telemetry_payload_fixture(driver_code: str = "LEC", pace_delta: float = 0.25):
+    driver_code = driver_code.upper()
+    return TelemetryFeaturePayload(
+        race_id="2026-01-TEST",
+        session="fp1",
+        source_mode="fixture",
+        confidence=0.82,
+        driver_features={
+            driver_code: TelemetryFeatureVector(
+                race_id="2026-01-TEST",
+                session="fp1",
+                driver_code=driver_code,
+                source="fixture",
+                clean_air_pace_delta_s=pace_delta,
+                pace_sigma_delta=0.04,
+                top_speed_delta_kph=3.0,
+                corner_min_speed_delta_kph=1.5,
+                traction_score=0.72,
+                stability_score=0.88,
+                tire_deg_slope_delta=0.01,
+                traffic_penalty_s=0.03,
+                overtake_pressure=0.42,
+                dnf_hazard_multiplier=1.05,
+                confidence=0.80,
+                samples=24,
+            )
+        },
+    )
+
+
+def _write_bom_json(path: Path, payload) -> None:
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
 
 
 class _FakePaceAdapter:

@@ -6,6 +6,7 @@ from sports.f1.models.f1 import Constructor, Driver, Race, RacePrediction
 from sports.f1.predictor.models.baseline import BaselineRaceModel
 from sports.f1.predictor.models.configs import PRODUCTION_MODEL_ID, get_model_config, list_model_configs
 from sports.f1.predictor.models.ml_simulator import MLSimulatorRaceModel
+from sports.f1.predictor.models.telemetry_simulator import TelemetrySimulatorRaceModel
 
 
 class F1ModelRegistry:
@@ -36,6 +37,8 @@ class F1ModelRegistry:
         return self._model.predict(race, drivers, constructors, features, sentiment)
 
     def _build_model(self, baseline: BaselineRaceModel | None):
+        if self._model_id == "telemetry_simulator_v1":
+            return TelemetrySimulatorRaceModel(config=self._model_config)
         if self._model_id == "ml_simulator_v1":
             return MLSimulatorRaceModel(config=self._model_config)
         return baseline or BaselineRaceModel(config=self._model_config)

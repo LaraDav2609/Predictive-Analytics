@@ -77,6 +77,22 @@ class F1Storage:
         )
         return {"redis": redis_status, "clickhouse": clickhouse_status}
 
+    async def persist_telemetry_snapshot(self, season: int, race: Any, session: str, payload: dict[str, Any], model_id: str = "telemetry_simulator_v1") -> dict[str, Any]:
+        model = payload.get("telemetry_model") or payload.get("model") or payload
+        resolved_model_id = model_id or model.get("model_id") or "telemetry_simulator_v1"
+        payload = {
+            **payload,
+            "generated_at": payload.get("generated_at") or model.get("generated_at") or datetime.now(timezone.utc).isoformat(),
+            "model_id": resolved_model_id,
+        }
+        round_num = int(getattr(race, "round", payload.get("round", 0)) or 0)
+        redis_status = self.redis.set_telemetry_snapshot(season, round_num, session, resolved_model_id, payload, ttl_seconds=900)
+        clickhouse_status = await self._clickhouse_best_effort(
+            lambda: self.clickhouse.append_telemetry_snapshot(season, race, session, payload),
+            "f1_telemetry_model_outputs",
+        )
+        return {"redis": redis_status, "clickhouse": clickhouse_status}
+
     async def persist_simulation_run(self, season: int, race: Any, session: str, payload: dict[str, Any], live: bool = False) -> dict[str, Any]:
         clickhouse_status = await self._clickhouse_best_effort(
             lambda: self.clickhouse.append_simulation_run(season, race, session, payload, live=live),

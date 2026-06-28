@@ -338,6 +338,95 @@ def train_artifacts(
     typer.echo(f"fallback groups: {bundle.source_metadata.get('fallback_groups') or []}")
 
 
+@app.command("train-telemetry-artifacts")
+def train_telemetry_artifacts(
+    output: str = typer.Option("artifacts/f1_telemetry/metadata.json", help="Telemetry artifact metadata.json path or output directory."),
+    feature_payload_path: str = typer.Option("", help="Optional JSON file/directory of telemetry feature payloads for coverage metadata."),
+    label_path: str = typer.Option("", help="Optional JSON file/directory of realized telemetry labels to join with feature payloads."),
+    training_row_path: str = typer.Option("", help="Optional JSON file/directory of supervised telemetry rows with features and targets."),
+    artifact_id: str = typer.Option("telemetry-bootstrap-linear-v1", help="Artifact id written to metadata."),
+    season_start: int | None = typer.Option(None, help="First season included in artifact metadata."),
+    season_end: int | None = typer.Option(None, help="Last season included in artifact metadata."),
+) -> None:
+    """Build a portable telemetry learned-head artifact manifest."""
+    from sports.f1.ml.telemetry.training import (
+        build_telemetry_artifact_manifest,
+        export_telemetry_training_rows,
+        load_telemetry_label_rows,
+        load_telemetry_training_rows,
+        load_telemetry_training_payloads,
+        save_telemetry_artifact_manifest,
+    )
+
+    payloads = load_telemetry_training_payloads(feature_payload_path or None)
+    training_rows = load_telemetry_training_rows(training_row_path or None)
+    joined_label_count = 0
+    supplied_supervised_inputs = bool(training_row_path or (label_path and feature_payload_path))
+    if not training_rows and label_path and feature_payload_path:
+        labels = load_telemetry_label_rows(label_path)
+        joined_label_count = len(labels)
+        training_rows = export_telemetry_training_rows(payloads, labels)
+    if supplied_supervised_inputs and not training_rows:
+        typer.echo(
+            "no telemetry training rows found; check feature payloads, labels, driver codes, race_id, and session values.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    manifest = build_telemetry_artifact_manifest(
+        artifact_id=artifact_id,
+        payloads=payloads,
+        training_rows=training_rows,
+        season_start=season_start,
+        season_end=season_end,
+    )
+    result = save_telemetry_artifact_manifest(output, manifest)
+    metrics = manifest.get("metrics") or {}
+    typer.echo(f"telemetry artifact written: {result['path']}")
+    typer.echo(f"artifact id: {result['artifact_id']}")
+    typer.echo(f"validation: {'ok' if result['ok'] else result.get('fallback_reason')}")
+    typer.echo(f"heads: {','.join(result.get('trained_heads') or [])}")
+    typer.echo(
+        "coverage: "
+        f"payloads={metrics.get('payload_count', 0)} "
+        f"drivers={metrics.get('driver_feature_count', 0)} "
+        f"samples={metrics.get('trace_sample_count', 0)}"
+    )
+    if metrics.get("supervised_heads_trained"):
+        typer.echo(f"supervised heads: {','.join(metrics.get('supervised_heads_trained') or [])}")
+    if label_path:
+        typer.echo(f"joined labels: {joined_label_count} rows: {len(training_rows)}")
+
+
+@app.command("export-telemetry-training-rows")
+def export_telemetry_training_rows_command(
+    feature_payload_path: str = typer.Option(..., help="JSON file/directory of telemetry feature payloads."),
+    label_path: str = typer.Option(..., help="JSON file/directory of realized telemetry labels."),
+    output: str = typer.Option("artifacts/f1_telemetry/training_rows.json", help="Output JSON path for supervised telemetry rows."),
+) -> None:
+    """Join telemetry feature payloads and realized labels into supervised rows."""
+    from sports.f1.ml.telemetry.training import (
+        export_telemetry_training_rows,
+        load_telemetry_label_rows,
+        load_telemetry_training_payloads,
+        save_telemetry_training_rows,
+    )
+
+    payloads = load_telemetry_training_payloads(feature_payload_path)
+    labels = load_telemetry_label_rows(label_path)
+    rows = export_telemetry_training_rows(payloads, labels)
+    if not rows:
+        typer.echo(
+            f"no telemetry training rows exported: payloads={len(payloads)} labels={len(labels)}; "
+            "check feature payloads, labels, driver codes, race_id, and session values.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    result = save_telemetry_training_rows(output, rows)
+    typer.echo(f"telemetry training rows written: {result['path']}")
+    typer.echo(f"payloads: {len(payloads)} labels: {len(labels)} rows: {result['row_count']}")
+    typer.echo(f"target counts: {result['target_counts']}")
+
+
 @app.command()
 def live(
     race: str = typer.Option(..., help="Race id. Synthetic smoke accepts SYN-2026-01 or synthetic_2026_r01."),

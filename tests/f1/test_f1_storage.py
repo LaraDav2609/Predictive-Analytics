@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from time import monotonic
@@ -10,6 +11,7 @@ from sports.f1.predictor.storage.clickhouse_store import (
     live_state_rows,
     probability_rows,
     sentiment_item_rows,
+    telemetry_model_rows,
     track_geometry_row,
 )
 from sports.f1.predictor.storage.manager import F1Storage
@@ -23,6 +25,7 @@ class F1StorageMappingTests(unittest.TestCase):
         self.assertEqual(keys.live_state(2026, 4, "Race"), "f1:live:2026:4:race:state")
         self.assertEqual(keys.probability_latest(2026, 4, "qualies", "production_v1"), "f1:prob:2026:4:qualifying:production_v1:latest")
         self.assertEqual(keys.probability_channel(2026, 4, "sprint", "m1"), "f1:pub:prob:2026:4:sprint:m1")
+        self.assertEqual(keys.telemetry_latest(2026, 4, "race", "telemetry_simulator_v1"), "f1:telemetry:2026:4:race:telemetry_simulator_v1:latest")
         self.assertTrue(keys.racehub(4, "simulation", "abc").startswith("f1:racehub:4:simulation:"))
         self.assertEqual(keys.sentiment_latest(), "f1:sentiment:latest")
 
@@ -80,6 +83,41 @@ class F1StorageMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["driver_id"], "leclerc")
         self.assertAlmostEqual(rows[0]["win_probability"], 0.2)
         self.assertAlmostEqual(rows[0]["expected_finish"], 3.2)
+
+    def test_telemetry_model_rows_preserve_adjustments_and_factors(self):
+        race = SimpleNamespace(round=4)
+        payload = {
+            "telemetry_features": {"source_mode": "openf1_historical", "missing_groups": ["location"]},
+            "telemetry_model": {
+                "generated_at": "2026-05-03T19:00:00+00:00",
+                "model_id": "telemetry_simulator_v1",
+                "model_version": "telemetry_simulator_v1.v0",
+                "source_mode": "openf1_historical",
+                "driver_adjustments": {
+                    "LEC": {
+                        "clean_air_pace_shift_s": -0.12,
+                        "pace_sigma_multiplier": 0.92,
+                        "tire_deg_slope_delta": 0.01,
+                        "dnf_hazard_multiplier": 1.05,
+                        "overtake_score_delta": 0.02,
+                        "pit_window_value_s": 0.08,
+                        "confidence": 0.66,
+                    }
+                },
+                "probability_delta_explanations": [
+                    {"driver_code": "LEC", "factors": [{"label": "Clean-air pace", "impact": 0.12}]}
+                ],
+                "missing_groups": ["location"],
+            },
+        }
+
+        rows = telemetry_model_rows(2026, race, "race", payload)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["driver_code"], "LEC")
+        self.assertAlmostEqual(rows[0]["clean_air_pace_shift_s"], -0.12)
+        self.assertEqual(json.loads(rows[0]["feature_factors_json"])[0]["label"], "Clean-air pace")
+        self.assertEqual(json.loads(rows[0]["missing_groups_json"]), ["location"])
 
     def test_track_sentiment_and_backtest_rows_are_compact_audit_rows(self):
         race = SimpleNamespace(round=20, season=2026, circuit="Las Vegas")

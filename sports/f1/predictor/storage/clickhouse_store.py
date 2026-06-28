@@ -96,6 +96,10 @@ class F1ClickHouseStore:
         rows = probability_rows(season, race, session, model_id, payload)
         return await self._insert_rows("f1_probability_snapshots", rows)
 
+    async def append_telemetry_snapshot(self, season: int, race: Any, session: str, payload: dict[str, Any]) -> dict[str, Any]:
+        rows = telemetry_model_rows(season, race, session, payload)
+        return await self._insert_rows("f1_telemetry_model_outputs", rows)
+
     async def append_simulation_run(self, season: int, race: Any, session: str, payload: dict[str, Any], live: bool = False) -> dict[str, Any]:
         rows = simulation_run_rows(season, race, session, payload, live=live)
         return await self._insert_rows("f1_simulation_runs", rows)
@@ -188,6 +192,42 @@ def probability_rows(season: int, race: Any, session: str, model_id: str, payloa
             "confidence": _float(item.get("confidence") if item.get("confidence") is not None else payload.get("confidence")),
             "component_scores_json": _json(item.get("component_scores") or item.get("components") or {}),
             "payload_json": _json(item),
+        })
+    return rows
+
+
+def telemetry_model_rows(season: int, race: Any, session: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    model = payload.get("telemetry_model") or payload.get("model") or payload
+    features = payload.get("telemetry_features") or {}
+    generated_at = _timestamp(model.get("generated_at") or payload.get("generated_at"))
+    explanations = model.get("probability_delta_explanations") or []
+    factors_by_driver = {
+        str(item.get("driver_code") or "").upper(): item.get("factors") or []
+        for item in explanations
+        if isinstance(item, dict)
+    }
+    rows = []
+    for driver_code, adjustment in (model.get("driver_adjustments") or {}).items():
+        code = str(driver_code or "").upper()
+        rows.append({
+            "generated_at": generated_at,
+            "season": int(season),
+            "round": _round(race),
+            "session": _session(session),
+            "model_id": str(model.get("model_id") or payload.get("model_id") or "telemetry_simulator_v1"),
+            "model_version": str(model.get("model_version") or ""),
+            "source_mode": str(model.get("source_mode") or features.get("source_mode") or ""),
+            "confidence": _float(adjustment.get("confidence") if isinstance(adjustment, dict) else None),
+            "driver_code": code,
+            "clean_air_pace_shift_s": _float(adjustment.get("clean_air_pace_shift_s") if isinstance(adjustment, dict) else None),
+            "pace_sigma_multiplier": _float(adjustment.get("pace_sigma_multiplier") if isinstance(adjustment, dict) else None),
+            "tire_deg_slope_delta": _float(adjustment.get("tire_deg_slope_delta") if isinstance(adjustment, dict) else None),
+            "dnf_hazard_multiplier": _float(adjustment.get("dnf_hazard_multiplier") if isinstance(adjustment, dict) else None),
+            "overtake_score_delta": _float(adjustment.get("overtake_score_delta") if isinstance(adjustment, dict) else None),
+            "pit_window_value_s": _float(adjustment.get("pit_window_value_s") if isinstance(adjustment, dict) else None),
+            "feature_factors_json": _json(factors_by_driver.get(code) or []),
+            "missing_groups_json": _json(model.get("missing_groups") or features.get("missing_groups") or []),
+            "payload_json": _json({"adjustment": adjustment, "model": model, "features": features}),
         })
     return rows
 
@@ -388,6 +428,30 @@ def _table_ddls(database: str) -> list[str]:
             payload_json String CODEC(ZSTD(3))
         ) ENGINE = MergeTree
         ORDER BY (season, round, session, model_id, generated_at, run_id)
+        TTL generated_at + INTERVAL 1825 DAY DELETE
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {db}.f1_telemetry_model_outputs (
+            generated_at DateTime64(3, 'UTC'),
+            season UInt16,
+            round UInt8,
+            session LowCardinality(String),
+            model_id LowCardinality(String),
+            model_version String,
+            source_mode LowCardinality(String),
+            confidence Nullable(Float64),
+            driver_code LowCardinality(String),
+            clean_air_pace_shift_s Nullable(Float64),
+            pace_sigma_multiplier Nullable(Float64),
+            tire_deg_slope_delta Nullable(Float64),
+            dnf_hazard_multiplier Nullable(Float64),
+            overtake_score_delta Nullable(Float64),
+            pit_window_value_s Nullable(Float64),
+            feature_factors_json String CODEC(ZSTD(3)),
+            missing_groups_json String CODEC(ZSTD(3)),
+            payload_json String CODEC(ZSTD(3))
+        ) ENGINE = MergeTree
+        ORDER BY (season, round, session, model_id, generated_at, driver_code)
         TTL generated_at + INTERVAL 1825 DAY DELETE
         """,
         f"""

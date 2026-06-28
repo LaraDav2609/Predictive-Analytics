@@ -51,6 +51,17 @@ class RacePrediction(BaseModel):
     pace_adapter_source: str | None = None
     dnf_adapter_source: str | None = None
     rating_adapter_source: str | None = None
+    telemetry_model_used: bool | None = None
+    telemetry_model_id: str | None = None
+    telemetry_model_version: str | None = None
+    telemetry_confidence: float | None = None
+    telemetry_source_mode: str | None = None
+    telemetry_missing_groups: list[str] = Field(default_factory=list)
+    telemetry_fallback_reason: str | None = None
+    telemetry_warn_only: bool | None = None
+    telemetry_policy: dict = Field(default_factory=dict)
+    telemetry_leakage_guard_status: dict = Field(default_factory=dict)
+    telemetry_probability_deltas: list[dict] = Field(default_factory=list)
 
 
 class DriverRacePrediction(BaseModel):
