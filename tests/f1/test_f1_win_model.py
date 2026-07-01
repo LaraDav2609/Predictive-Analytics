@@ -3,10 +3,15 @@
 import random
 import unittest
 
+import os
+import tempfile
+
 from sports.f1.ml.training.win_model import (
     FEATURES,
+    ServeWinModel,
     TrainedWinModel,
     build_field,
+    fit_serve_win_model,
     walk_forward_train_eval,
 )
 
@@ -98,6 +103,41 @@ class WalkForwardTrainEvalTests(unittest.TestCase):
         self.assertIn("folds", report)
         self.assertIn("verdict", report["gate"])
         self.assertGreaterEqual(report["fold_count"], 1)
+
+
+class ServeWinModelTests(unittest.TestCase):
+    def test_serve_applier_matches_sklearn(self):
+        """The pure-Python serve applier must reproduce the fitted sklearn model."""
+        rows = _season_rows(30, winner_feature=True)
+        trained = TrainedWinModel("logistic").fit(rows)
+        serve = ServeWinModel.from_dict(trained.linear_artifact())
+        self.assertFalse(serve.is_identity())
+        row = rows[0]
+        sk_field = trained.predict_field(row)
+        comps = {d: f for d, f in (row.get("component_scores") or {}).items()}
+        serve_field = serve.apply_field(comps)
+        for d in sk_field:
+            self.assertAlmostEqual(sk_field[d], serve_field[d], places=4)
+
+    def test_roundtrip_save_load(self):
+        rows = _season_rows(30, winner_feature=True)
+        serve = fit_serve_win_model(rows, source="test")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "win.json")
+            serve.save(path)
+            loaded = ServeWinModel.load(path)
+        self.assertEqual(loaded.features, serve.features)
+        self.assertEqual(len(loaded.weights), len(FEATURES))
+        self.assertAlmostEqual(loaded.intercept, serve.intercept, places=6)
+
+    def test_gbm_has_no_linear_artifact(self):
+        rows = _season_rows(30, winner_feature=True)
+        self.assertIsNone(TrainedWinModel("gbm").fit(rows).linear_artifact())
+
+    def test_identity_returns_uniform_field(self):
+        serve = ServeWinModel.identity()
+        field = serve.apply_field({"a": {}, "b": {}, "c": {}})
+        self.assertEqual(field, {"a": 1 / 3, "b": 1 / 3, "c": 1 / 3})
 
 
 if __name__ == "__main__":

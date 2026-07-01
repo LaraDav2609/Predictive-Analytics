@@ -18,10 +18,15 @@ the heuristic before anything depends on it.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from sports.f1.predictor.backtesting.validation import sort_rows
+
+WIN_MODEL_ARTIFACT_ENV = "F1_WIN_MODEL_ARTIFACT"
 
 # Leakage-safe pre-race features exposed per driver in backtest component_scores.
 # NB: 'performance' is excluded — it is the heuristic's own output (would leak).
@@ -126,6 +131,137 @@ class TrainedWinModel:
                 {"driver_id": d, "win_probability": p} for d, p in field.items()
             ],
         }
+
+    def linear_artifact(self, source: str | None = None) -> dict[str, Any] | None:
+        """Serialise a fitted **logistic** model as plain linear coefficients.
+
+        The logistic model is just intercept + weights on the features, so it can
+        be applied at serve time with a pure-Python sigmoid — no sklearn, no
+        pickle, versionless JSON (mirrors the empirical calibrator artifact).
+        Returns None for unfitted or non-logistic (e.g. gbm) models.
+        """
+        if self.kind != "logistic" or not self._fitted:
+            return None
+        return {
+            "method": "logistic",
+            "features": list(FEATURES),
+            "weights": [float(w) for w in self._est.coef_[0]],
+            "intercept": float(self._est.intercept_[0]),
+            "source": source,
+        }
+
+
+@dataclass
+class ServeWinModel:
+    """Pure-Python serve-time applier for the trained win model.
+
+    Applies the linear (logistic) model to each driver's features and normalises
+    the field to sum to 1 (winner market) — identical to
+    ``TrainedWinModel.predict_field`` but with no sklearn dependency at serve time.
+    Safe by default: an empty/identity model leaves probabilities unchanged.
+    """
+
+    features: list[str] = field(default_factory=list)
+    weights: list[float] = field(default_factory=list)
+    intercept: float = 0.0
+    method: str = "identity"
+    source: str | None = None
+
+    def is_identity(self) -> bool:
+        return not self.weights
+
+    def _win_score(self, feats: dict[str, Any]) -> float:
+        z = self.intercept
+        for name, weight in zip(self.features, self.weights):
+            z += weight * _num((feats or {}).get(name))
+        z = max(-60.0, min(60.0, z))
+        return 1.0 / (1.0 + math.exp(-z))  # sigmoid
+
+    def apply_field(self, components_by_driver: dict[str, dict[str, Any]]) -> dict[str, float]:
+        """{driver_id: components} -> {driver_id: normalised win probability}."""
+        if self.is_identity() or not components_by_driver:
+            n = max(len(components_by_driver), 1)
+            return {d: 1.0 / n for d in components_by_driver}
+        scores = {d: self._win_score(f) for d, f in components_by_driver.items()}
+        total = sum(scores.values())
+        if total <= 0:
+            n = max(len(scores), 1)
+            return {d: 1.0 / n for d in scores}
+        return {d: v / total for d, v in scores.items()}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "features": list(self.features),
+            "weights": [round(float(w), 8) for w in self.weights],
+            "intercept": round(float(self.intercept), 8),
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ServeWinModel":
+        weights = [float(w) for w in (data.get("weights") or [])]
+        return cls(
+            features=[str(f) for f in (data.get("features") or [])],
+            weights=weights,
+            intercept=float(data.get("intercept") or 0.0),
+            method=str(data.get("method") or ("logistic" if weights else "identity")),
+            source=data.get("source"),
+        )
+
+    @classmethod
+    def identity(cls) -> "ServeWinModel":
+        return cls()
+
+    def save(self, path: str) -> str:
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "ServeWinModel":
+        with open(path, encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
+
+
+def fit_serve_win_model(rows: Sequence[dict[str, Any]], *, source: str | None = None) -> ServeWinModel:
+    """Fit a logistic win model on backtest rows and return a serve applier."""
+    artifact = TrainedWinModel("logistic").fit(rows).linear_artifact(source=source)
+    if not artifact:
+        return ServeWinModel.identity()
+    return ServeWinModel.from_dict(artifact)
+
+
+_default_win_model: ServeWinModel | None = None
+
+
+def load_default_win_model() -> ServeWinModel:
+    """Load the serve win model from ``F1_WIN_MODEL_ARTIFACT`` (identity if unset).
+
+    Cached; call :func:`reset_default_win_model` after (re)fitting to reload.
+    """
+    global _default_win_model
+    if _default_win_model is not None:
+        return _default_win_model
+    path = os.environ.get(WIN_MODEL_ARTIFACT_ENV)
+    if not path:
+        _default_win_model = ServeWinModel.identity()
+        return _default_win_model
+    try:
+        model = ServeWinModel.load(path)
+        model.source = model.source or path
+        _default_win_model = model
+    except Exception:
+        _default_win_model = ServeWinModel.identity()
+    return _default_win_model
+
+
+def reset_default_win_model() -> None:
+    global _default_win_model
+    _default_win_model = None
 
 
 # --------------------------------------------------------------------------

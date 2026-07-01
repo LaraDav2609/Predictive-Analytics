@@ -144,7 +144,31 @@ def enrich_probability_payload(
     stage: str | None = "auto",
     live: bool = False,
     model_id: str | None = None,
+    win_model: Any | None = None,
 ) -> dict[str, Any]:
+    # Trained win model (A5): when a serve caller passes a fitted model, overwrite
+    # each driver's raw win probability from its features BEFORE the audit reads it,
+    # so the trained probabilities flow through governance + calibration. Guarded and
+    # off by default; the backtest calls this without ``win_model`` so its evaluation
+    # stays a pure comparison against the heuristic.
+    if win_model is not None and not win_model.is_identity():
+        _rows = payload.get("simulations") or payload.get("probabilities") or []
+        _comps = {str(r.get("driver_id")): (r.get("components") or {}) for r in _rows if r.get("driver_id")}
+        _field = win_model.apply_field(_comps) if _comps else {}
+        _applied = 0
+        for _row in _rows:
+            _did = str(_row.get("driver_id") or "")
+            if _did in _field:
+                _row["heuristic_win_probability"] = _row.get("win_probability")
+                _row["win_probability"] = _field[_did]
+                _applied += 1
+        if _applied:
+            payload["win_model_applied"] = {
+                "method": getattr(win_model, "method", "logistic"),
+                "source": getattr(win_model, "source", None),
+                "drivers": _applied,
+            }
+
     audit = build_probability_audit(
         payload,
         profile=profile,

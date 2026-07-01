@@ -724,6 +724,11 @@ def _apply_probability_audit(
     stage: str | None = "auto",
     live: bool = False,
 ) -> dict:
+    try:
+        from sports.f1.ml.training.win_model import load_default_win_model
+        _serve_win_model = load_default_win_model()
+    except Exception:
+        _serve_win_model = None
     enriched = enrich_probability_payload(
         payload,
         profile=profile,
@@ -731,6 +736,7 @@ def _apply_probability_audit(
         stage=stage,
         live=live,
         model_id=payload.get("model_id") or payload.get("model_version") or "production_v1",
+        win_model=_serve_win_model,
     )
     data_quality = _data_quality_report(
         truth=truth or payload.get("truth") or {},
@@ -4238,6 +4244,80 @@ async def get_f1_trained_model_eval(
     report["seasons_used"] = seasons_used
     report["stage"] = stage
     return report
+
+
+@router.post("/backtest/train/fit")
+async def post_f1_fit_win_model(
+    start_season: int = 2023,
+    end_season: int = 2025,
+    stage: str = "pre_weekend",
+    path: str | None = None,
+):
+    """Fit the trained win model (A1) on historical races and ENABLE it at serve
+    time (roadmap A5). Reports the walk-forward out-of-sample gain vs the heuristic
+    before committing, saves a plain-JSON logistic artifact, sets
+    F1_WIN_MODEL_ARTIFACT, and clears caches so the next prediction uses it."""
+    import os
+    from sports.f1.ml.training.win_model import (
+        WIN_MODEL_ARTIFACT_ENV, fit_serve_win_model, reset_default_win_model, walk_forward_train_eval,
+    )
+
+    bt = _backtester()
+    rows: list[dict] = []
+    seasons_used: list[int] = []
+    for season in range(int(start_season), int(end_season) + 1):
+        try:
+            res = await bt.backtest_season(season, include_races=True, allow_partial=True, model_id=None, stage=stage, _compact=False)
+        except Exception:
+            continue
+        races = res.get("races") if res.get("ok") else None
+        if not races:
+            continue
+        seasons_used.append(season)
+        rows.extend(races)
+    rows = [r for r in rows if r.get("component_scores")]
+    if len(rows) < 20:
+        return {"ok": False, "reason": "insufficient_data", "races": len(rows), "seasons_used": seasons_used}
+
+    evaluation = walk_forward_train_eval(rows, model_kind="logistic")
+    model = fit_serve_win_model(rows, source=f"backtest:{start_season}-{end_season}")
+    if model.is_identity():
+        return {"ok": False, "reason": "fit_returned_identity", "races": len(rows), "seasons_used": seasons_used}
+
+    target = path or os.environ.get(WIN_MODEL_ARTIFACT_ENV) or os.path.join(os.getcwd(), "artifacts", "f1_win_model.json")
+    model.save(target)
+    os.environ[WIN_MODEL_ARTIFACT_ENV] = target
+    reset_default_win_model()
+    _clear_static_response_caches()
+    return {
+        "ok": True,
+        "enabled": True,
+        "artifact_path": target,
+        "seasons_used": seasons_used,
+        "races": len(rows),
+        "feature_count": len(model.features),
+        "walk_forward": evaluation.get("aggregate"),
+        "gate": evaluation.get("gate"),
+        "note": "Trained win model saved and enabled; applied on the next serve prediction (caches cleared). "
+                "Serving now uses the trained win market; backtest/eval stays on the heuristic.",
+    }
+
+
+@router.get("/models/win-model")
+async def get_f1_win_model_state():
+    """Current trained-win-model serve state (enabled / features / source)."""
+    import os
+    from sports.f1.ml.training.win_model import WIN_MODEL_ARTIFACT_ENV, load_default_win_model
+    model = load_default_win_model()
+    return {
+        "ok": True,
+        "enabled": not model.is_identity(),
+        "method": model.method,
+        "source": model.source,
+        "feature_count": len(model.features),
+        "artifact_env": WIN_MODEL_ARTIFACT_ENV,
+        "artifact_configured": bool(os.environ.get(WIN_MODEL_ARTIFACT_ENV)),
+    }
 
 
 @router.post("/refresh")
