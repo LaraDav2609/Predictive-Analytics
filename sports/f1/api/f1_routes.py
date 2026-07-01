@@ -4151,6 +4151,51 @@ async def post_f1_fit_calibration(
     }
 
 
+@router.get("/backtest/validation")
+async def get_f1_walk_forward_validation(
+    start_season: int = 2023,
+    end_season: int = 2026,
+    stage: str = "pre_weekend",
+    method: str = "isotonic",
+    model_id: str | None = None,
+    min_train_races: int = 20,
+    val_block: int = 5,
+):
+    """Walk-forward, out-of-sample validation of the served win-probability model.
+
+    Gathers backtest race rows across [start_season, end_season], builds expanding-
+    window folds (each trains only on prior races), and reports pooled HELD-OUT
+    Brier / log loss / winner accuracy against a uniform baseline, plus a pass/fail
+    gate. This is the A7 go/no-go check: the model must beat the baseline
+    out-of-sample before its probabilities (and the edges derived from them) can be
+    trusted for trading. Also reports whether empirical calibration helps OOS."""
+    from sports.f1.predictor.backtesting.validation import run_walk_forward_validation
+
+    bt = _backtester()
+    rows: list[dict] = []
+    seasons_used: list[int] = []
+    for season in range(int(start_season), int(end_season) + 1):
+        try:
+            result = await bt.backtest_season(
+                season, include_races=True, allow_partial=True, model_id=model_id, stage=stage
+            )
+        except Exception:
+            continue
+        races = result.get("races") if result.get("ok") else None
+        if not races:
+            continue
+        seasons_used.append(season)
+        rows.extend(races)
+
+    report = run_walk_forward_validation(
+        rows, method=method, min_train_races=int(min_train_races), val_block=int(val_block)
+    )
+    report["seasons_used"] = seasons_used
+    report["stage"] = stage
+    report["model_id"] = model_id or "production_v1"
+    return report
+
+
 @router.post("/refresh")
 async def refresh():
     _emit_ops_event("refresh_started", message="Catalog + feature refresh started")
