@@ -132,13 +132,15 @@ class TrainedWinModel:
             ],
         }
 
-    def linear_artifact(self, source: str | None = None) -> dict[str, Any] | None:
+    def linear_artifact(self, source: str | None = None, stage: str = "pre_weekend") -> dict[str, Any] | None:
         """Serialise a fitted **logistic** model as plain linear coefficients.
 
         The logistic model is just intercept + weights on the features, so it can
         be applied at serve time with a pure-Python sigmoid — no sklearn, no
         pickle, versionless JSON (mirrors the empirical calibrator artifact).
-        Returns None for unfitted or non-logistic (e.g. gbm) models.
+        ``stage`` records the weekend stage the model was trained/validated at, so
+        serving can gate it to that stage. Returns None for unfitted or
+        non-logistic (e.g. gbm) models.
         """
         if self.kind != "logistic" or not self._fitted:
             return None
@@ -148,6 +150,7 @@ class TrainedWinModel:
             "weights": [float(w) for w in self._est.coef_[0]],
             "intercept": float(self._est.intercept_[0]),
             "source": source,
+            "stage": stage,
         }
 
 
@@ -166,9 +169,24 @@ class ServeWinModel:
     intercept: float = 0.0
     method: str = "identity"
     source: str | None = None
+    stage: str = "pre_weekend"
 
     def is_identity(self) -> bool:
         return not self.weights
+
+    def applies_to_stage(self, serve_stage: str | None) -> bool:
+        """Whether to apply the model at a given serve-time weekend stage.
+
+        The model is validated (A7) only at its training ``stage``, so by default
+        it applies **only** at that stage — at later stages the heuristic has the
+        fresher grid/live data. ``F1_WIN_MODEL_STAGES`` (comma list) can widen the
+        allowed set for advanced use.
+        """
+        if self.is_identity():
+            return False
+        override = os.environ.get("F1_WIN_MODEL_STAGES")
+        allowed = {s.strip().lower() for s in override.split(",") if s.strip()} if override else {self.stage}
+        return str(serve_stage or "").lower() in allowed
 
     def _win_score(self, feats: dict[str, Any]) -> float:
         z = self.intercept
@@ -196,6 +214,7 @@ class ServeWinModel:
             "weights": [round(float(w), 8) for w in self.weights],
             "intercept": round(float(self.intercept), 8),
             "source": self.source,
+            "stage": self.stage,
         }
 
     @classmethod
@@ -207,6 +226,7 @@ class ServeWinModel:
             intercept=float(data.get("intercept") or 0.0),
             method=str(data.get("method") or ("logistic" if weights else "identity")),
             source=data.get("source"),
+            stage=str(data.get("stage") or "pre_weekend"),
         )
 
     @classmethod
@@ -227,9 +247,9 @@ class ServeWinModel:
             return cls.from_dict(json.load(handle))
 
 
-def fit_serve_win_model(rows: Sequence[dict[str, Any]], *, source: str | None = None) -> ServeWinModel:
+def fit_serve_win_model(rows: Sequence[dict[str, Any]], *, source: str | None = None, stage: str = "pre_weekend") -> ServeWinModel:
     """Fit a logistic win model on backtest rows and return a serve applier."""
-    artifact = TrainedWinModel("logistic").fit(rows).linear_artifact(source=source)
+    artifact = TrainedWinModel("logistic").fit(rows).linear_artifact(source=source, stage=stage)
     if not artifact:
         return ServeWinModel.identity()
     return ServeWinModel.from_dict(artifact)

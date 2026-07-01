@@ -3451,6 +3451,7 @@ async def get_race_probability_audit(
         "source_mode": truth.get("source_mode"),
         "confidence": audited.get("confidence"),
         "calibration_profile": audited.get("calibration_profile"),
+        "win_model_applied": audited.get("win_model_applied"),
         "probability_governance": audited.get("probability_governance") or audit.get("probability_governance") or {},
         "raw_probabilities": audited.get("raw_probabilities") or {},
         "governed_probabilities": audited.get("governed_probabilities") or {},
@@ -4280,7 +4281,7 @@ async def post_f1_fit_win_model(
         return {"ok": False, "reason": "insufficient_data", "races": len(rows), "seasons_used": seasons_used}
 
     evaluation = walk_forward_train_eval(rows, model_kind="logistic")
-    model = fit_serve_win_model(rows, source=f"backtest:{start_season}-{end_season}")
+    model = fit_serve_win_model(rows, source=f"backtest:{start_season}-{end_season}", stage=stage)
     if model.is_identity():
         return {"ok": False, "reason": "fit_returned_identity", "races": len(rows), "seasons_used": seasons_used}
 
@@ -4309,11 +4310,18 @@ async def get_f1_win_model_state():
     import os
     from sports.f1.ml.training.win_model import WIN_MODEL_ARTIFACT_ENV, load_default_win_model
     model = load_default_win_model()
+    stage_override = os.environ.get("F1_WIN_MODEL_STAGES")
+    applies_stages = (
+        [s.strip().lower() for s in stage_override.split(",") if s.strip()]
+        if stage_override else ([model.stage] if not model.is_identity() else [])
+    )
     return {
         "ok": True,
         "enabled": not model.is_identity(),
         "method": model.method,
         "source": model.source,
+        "trained_stage": getattr(model, "stage", None) if not model.is_identity() else None,
+        "applies_at_stages": applies_stages,
         "feature_count": len(model.features),
         "artifact_env": WIN_MODEL_ARTIFACT_ENV,
         "artifact_configured": bool(os.environ.get(WIN_MODEL_ARTIFACT_ENV)),

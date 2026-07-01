@@ -140,5 +140,37 @@ class ServeWinModelTests(unittest.TestCase):
         self.assertEqual(field, {"a": 1 / 3, "b": 1 / 3, "c": 1 / 3})
 
 
+class StageGatingTests(unittest.TestCase):
+    def _model(self, stage="pre_weekend"):
+        rows = _season_rows(30, winner_feature=True)
+        return fit_serve_win_model(rows, source="t", stage=stage)
+
+    def test_applies_only_at_trained_stage_by_default(self):
+        model = self._model("pre_weekend")
+        self.assertTrue(model.applies_to_stage("pre_weekend"))
+        self.assertFalse(model.applies_to_stage("post_qualifying"))
+        self.assertFalse(model.applies_to_stage("live"))
+        self.assertFalse(model.applies_to_stage(None))
+
+    def test_stage_survives_roundtrip(self):
+        model = self._model("post_qualifying")
+        self.assertEqual(model.stage, "post_qualifying")
+        restored = ServeWinModel.from_dict(model.to_dict())
+        self.assertEqual(restored.stage, "post_qualifying")
+        self.assertTrue(restored.applies_to_stage("post_qualifying"))
+
+    def test_env_override_widens_allowed_stages(self):
+        model = self._model("pre_weekend")
+        os.environ["F1_WIN_MODEL_STAGES"] = "pre_weekend,post_qualifying"
+        try:
+            self.assertTrue(model.applies_to_stage("post_qualifying"))
+            self.assertFalse(model.applies_to_stage("live"))
+        finally:
+            del os.environ["F1_WIN_MODEL_STAGES"]
+
+    def test_identity_never_applies(self):
+        self.assertFalse(ServeWinModel.identity().applies_to_stage("pre_weekend"))
+
+
 if __name__ == "__main__":
     unittest.main()

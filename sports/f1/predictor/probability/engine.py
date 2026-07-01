@@ -152,21 +152,35 @@ def enrich_probability_payload(
     # off by default; the backtest calls this without ``win_model`` so its evaluation
     # stays a pure comparison against the heuristic.
     if win_model is not None and not win_model.is_identity():
-        _rows = payload.get("simulations") or payload.get("probabilities") or []
-        _comps = {str(r.get("driver_id")): (r.get("components") or {}) for r in _rows if r.get("driver_id")}
-        _field = win_model.apply_field(_comps) if _comps else {}
-        _applied = 0
-        for _row in _rows:
-            _did = str(_row.get("driver_id") or "")
-            if _did in _field:
-                _row["heuristic_win_probability"] = _row.get("win_probability")
-                _row["win_probability"] = _field[_did]
-                _applied += 1
-        if _applied:
+        _serve_stage = detect_stage(profile, truth, live=live, requested_stage=stage)
+        _trained_stage = getattr(win_model, "stage", "pre_weekend")
+        if win_model.applies_to_stage(_serve_stage):
+            _rows = payload.get("simulations") or payload.get("probabilities") or []
+            _comps = {str(r.get("driver_id")): (r.get("components") or {}) for r in _rows if r.get("driver_id")}
+            _field = win_model.apply_field(_comps) if _comps else {}
+            _applied = 0
+            for _row in _rows:
+                _did = str(_row.get("driver_id") or "")
+                if _did in _field:
+                    _row["heuristic_win_probability"] = _row.get("win_probability")
+                    _row["win_probability"] = _field[_did]
+                    _applied += 1
             payload["win_model_applied"] = {
+                "applied": _applied > 0,
                 "method": getattr(win_model, "method", "logistic"),
                 "source": getattr(win_model, "source", None),
+                "stage": _serve_stage,
+                "trained_stage": _trained_stage,
                 "drivers": _applied,
+            }
+        else:
+            # Off-stage: the trained model is only validated at its training stage;
+            # keep the heuristic (fresher grid/live data) at other stages.
+            payload["win_model_applied"] = {
+                "applied": False,
+                "stage": _serve_stage,
+                "trained_stage": _trained_stage,
+                "reason": "serve stage is outside the win model's validated stage(s); using heuristic",
             }
 
     audit = build_probability_audit(
