@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from common.data.http import make_async_client
 from sports.f1.models.f1 import Driver, Race
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ OPENF1_STATIC_SESSION_FEATURES_TTL_SECONDS = 60
 
 class OpenF1Client:
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(base_url=OPENF1_BASE_URL, timeout=35.0)
+        self._client = make_async_client(base_url=OPENF1_BASE_URL, timeout=35.0)
         self._session_cache: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
         self._trace_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._svg_trace_cache: dict[str, dict[str, Any]] = {}

@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 import httpx
 import redis
 
+from common.data.http import make_async_client
 from sports.f1.models.f1 import Constructor, Driver
 
 logger = logging.getLogger(__name__)
@@ -426,7 +427,7 @@ def aggregate_f1_sentiment(items: list[dict], drivers: list[Driver], constructor
 
 async def _collect_live_items(season: int, max_rss_items: int) -> list[dict]:
     items: list[dict] = []
-    async with httpx.AsyncClient(headers={"User-Agent": "F1DashboardLiveSentiment/1.0"}, timeout=20.0, follow_redirects=True) as http:
+    async with make_async_client(headers={"User-Agent": "F1DashboardLiveSentiment/1.0"}, timeout=20.0, follow_redirects=True) as http:
         for path, builder in [
             (f"{season}/driverstandings.json", _build_driver_standings_items),
             (f"{season}/constructorstandings.json", _build_constructor_standings_items),

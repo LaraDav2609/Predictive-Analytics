@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from common.data.http import make_async_client
+
 logger = logging.getLogger(__name__)
 
 FORECAST_BASE_URL = "https://api.open-meteo.com/v1"
@@ -16,8 +18,8 @@ HISTORICAL_FORECAST_BASE_URL = "https://historical-forecast-api.open-meteo.com/v
 
 class OpenMeteoClient:
     def __init__(self) -> None:
-        self._forecast = httpx.AsyncClient(base_url=FORECAST_BASE_URL, timeout=20.0)
-        self._historical = httpx.AsyncClient(base_url=HISTORICAL_FORECAST_BASE_URL, timeout=25.0)
+        self._forecast = make_async_client(base_url=FORECAST_BASE_URL, timeout=20.0)
+        self._historical = make_async_client(base_url=HISTORICAL_FORECAST_BASE_URL, timeout=25.0)
         self._cache: dict[tuple[float, float, bool, str], dict[str, Any]] = {}
         self._payload_cache: dict[tuple[float, float, bool, str, str], dict[str, Any]] = {}
 

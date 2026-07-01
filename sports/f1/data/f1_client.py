@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from common.data.base_client import SportsDataClient
+from common.data.http import make_async_client
 from common.data.weather_client import OpenMeteoClient
 from common.models.sport import Sport, Competition
 from sports.f1.models.f1 import Driver, Constructor, Race, RaceResult, RacePrediction
@@ -97,7 +98,7 @@ F1_HEADSHOT_FALLBACKS = {
 class F1Client(SportsDataClient):
     def __init__(self):
         self._season = datetime.now(timezone.utc).year
-        self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=30.0)
+        self._client = make_async_client(base_url=BASE_URL, timeout=30.0)
         self._drivers: list[Driver] = []
         self._constructors: list[Constructor] = []
         self._races: list[Race] = []
