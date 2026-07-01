@@ -4196,6 +4196,50 @@ async def get_f1_walk_forward_validation(
     return report
 
 
+@router.get("/backtest/train-eval")
+async def get_f1_trained_model_eval(
+    start_season: int = 2023,
+    end_season: int = 2025,
+    stage: str = "pre_weekend",
+    model_kind: str = "logistic",
+    min_train_races: int = 20,
+    val_block: int = 5,
+):
+    """Walk-forward evaluation of a TRAINED win model (A1) vs the heuristic.
+
+    Gathers full backtest rows (with leakage-safe per-driver ``component_scores``)
+    across the season range, and for each walk-forward fold trains a model on prior
+    races and predicts the held-out block. Returns pooled out-of-sample Brier /
+    log-loss / winner-accuracy for the trained model, the heuristic, and a uniform
+    baseline, plus a gate: does the trained model beat the heuristic out-of-sample?
+    ``model_kind`` is ``logistic`` (default; robust on the small F1 sample) or
+    ``gbm``. Training/eval only — a winning model is wired into serving separately."""
+    from sports.f1.ml.training.win_model import walk_forward_train_eval
+
+    bt = _backtester()
+    rows: list[dict] = []
+    seasons_used: list[int] = []
+    for season in range(int(start_season), int(end_season) + 1):
+        try:
+            result = await bt.backtest_season(
+                season, include_races=True, allow_partial=True, model_id=None, stage=stage, _compact=False
+            )
+        except Exception:
+            continue
+        races = result.get("races") if result.get("ok") else None
+        if not races:
+            continue
+        seasons_used.append(season)
+        rows.extend(races)
+
+    report = walk_forward_train_eval(
+        rows, model_kind=model_kind, min_train_races=int(min_train_races), val_block=int(val_block)
+    )
+    report["seasons_used"] = seasons_used
+    report["stage"] = stage
+    return report
+
+
 @router.post("/refresh")
 async def refresh():
     _emit_ops_event("refresh_started", message="Catalog + feature refresh started")
