@@ -30,6 +30,7 @@ class BacktestRecord:
     home_score: int = 0
     away_score: int = 0
     components: dict = field(default_factory=dict)
+    features: dict = field(default_factory=dict)   # raw pre-weight signals for the blend
 
 
 def _finished(games) -> list:
@@ -80,6 +81,7 @@ def replay(games, *, min_games: int = 10, pitcher_era: dict | None = None,
                 game_id=g.id, date=g.date.isoformat() if hasattr(g.date, "isoformat") else str(g.date),
                 home=g.home_team, away=g.away_team, prob_home=pred["home_win_prob"], actual=actual,
                 home_score=int(g.home_score), away_score=int(g.away_score), components=pred["components"],
+                features=pred.get("features", {}),
             ))
         home.record_game(g.home_score, g.away_score)
         away.record_game(g.away_score, g.home_score)
@@ -122,6 +124,64 @@ def fit_serve_calibrator(games, *, min_games: int = 10, pitcher_era: dict | None
         "fit_brier_cal": round(float(fit_brier_cal), 4),
         "holdout": _calibration_report(records, holdout_fraction),
     }
+
+
+def _feature_matrix(records, feature_order):
+    X = np.array([[float(r.features.get(f, 0.0)) for f in feature_order] for r in records], dtype=float)
+    y = np.array([r.actual for r in records], dtype=float)
+    return X, y
+
+
+def fit_blend(games, *, min_games: int = 15, pitcher_era: dict | None = None,
+              rate_pitcher=None, holdout_fraction: float = 0.4) -> dict:
+    """Fit a logistic BLEND over the raw signals and compare it head-to-head with the
+    hand-tuned model on an honest earlier→later holdout. Returns learned weights plus
+    the holdout Brier / log-loss / Brier-skill for both models, so the caller can gate
+    on ``blend beats hand-tuned`` before enabling it at serve.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sports.baseball.analytics.blend_model import FEATURE_ORDER, apply_blend
+
+    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher)
+    n = len(records)
+    if n < 100:
+        return {"fitted": False, "reason": f"need >=100 scored games, have {n}"}
+
+    X, y = _feature_matrix(records, FEATURE_ORDER)
+    # Deployed weights: fit on ALL games (use every past game to weight the next).
+    full = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000).fit(X, y)
+    weights = {"intercept": float(full.intercept_[0]),
+               "coef": {f: float(c) for f, c in zip(FEATURE_ORDER, full.coef_[0])}}
+
+    # Honest holdout: fit on earlier window, score both models on the later window.
+    split = max(50, int(n * holdout_fraction))
+    holdout: dict = {"available": False, "reason": "insufficient holdout"}
+    if split < n - 30:
+        Xtr, ytr = X[:split], y[:split]
+        Xho = X[split:]
+        hy = y[split:]
+        hand = np.array([r.prob_home for r in records[split:]])
+        if len(np.unique(ytr)) >= 2:
+            wtr = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000).fit(Xtr, ytr)
+            w_ho = {"intercept": float(wtr.intercept_[0]),
+                    "coef": {f: float(c) for f, c in zip(FEATURE_ORDER, wtr.coef_[0])}}
+            bp = np.array([apply_blend({f: Xho[i, j] for j, f in enumerate(FEATURE_ORDER)}, w_ho)["value"]
+                           for i in range(len(Xho))])
+            base = brier_score(np.full(len(hy), hy.mean()), hy)
+            holdout = {
+                "available": True, "holdout_n": int(len(hy)), "train_n": int(split),
+                "base_rate_brier": round(base, 4),
+                "hand_tuned": {"brier": round(brier_score(hand, hy), 4),
+                               "log_loss": round(log_loss(hand, hy), 4),
+                               "brier_skill": round(1.0 - brier_score(hand, hy) / base, 4) if base > 0 else 0.0},
+                "blend": {"brier": round(brier_score(bp, hy), 4),
+                          "log_loss": round(log_loss(bp, hy), 4),
+                          "brier_skill": round(1.0 - brier_score(bp, hy) / base, 4) if base > 0 else 0.0},
+            }
+            holdout["blend_beats_hand_tuned"] = bool(holdout["blend"]["brier"] < holdout["hand_tuned"]["brier"])
+
+    return {"fitted": True, "model_version": "mlb-blend-v1", "n": n,
+            "feature_order": FEATURE_ORDER, "weights": weights, "holdout": holdout}
 
 
 def _row(r: BacktestRecord) -> dict:

@@ -62,18 +62,39 @@ async def _pitcher_rating_fn(season: int, games):
     return _rate, len(logs)
 
 
-def _apply_serve_calibration(pred: dict) -> dict:
-    """Apply the enabled serve calibrator to a prediction dict IN PLACE. Keeps the
-    additive waterfall honest: the named components still sum to the raw model
-    probability, and calibration is surfaced as a final ``calibration`` component
-    (adjustment = calibrated − model) plus a top-level ``calibration`` block. When
-    no calibrator is enabled the numbers are untouched (applied=False)."""
+def _apply_serve_adjustment(pred: dict) -> dict:
+    """Apply the best available serve model to a prediction IN PLACE.
+
+    Precedence: a **trained blend** (if enabled) supersedes everything — it learns
+    the signal weights and is self-calibrating. Otherwise, **Platt calibration** (if
+    enabled) nudges the hand-tuned probability. Either way the named components still
+    sum to the raw hand-tuned probability, and the adjustment is surfaced as a final
+    ``blend`` / ``calibration`` waterfall component so the waterfall reconciles to the
+    served headline."""
+    from sports.baseball.analytics.blend_model import blend as serve_blend
     from sports.baseball.analytics.serve_calibration import calibrate
 
-    raw = pred["home_win_prob"]
-    cal = calibrate(raw)
+    hand = pred["home_win_prob"]
+    pred["home_win_prob_model"] = round(hand, 4)
+
+    b = serve_blend(pred.get("features", {}))
+    if b.get("applied"):
+        val = b["value"]
+        pred["home_win_prob"] = val
+        pred["away_win_prob"] = round(1.0 - val, 4)
+        pred["model_version"] = b.get("model_version", "mlb-blend-v1")
+        pred["blend"] = b
+        pred["calibration"] = {"applied": False, "reason": "superseded by trained blend"}
+        pred.setdefault("components", {})["blend"] = {
+            "contribution": round(val - hand, 4),
+            "applied": True,
+            "detail": "Trained logistic blend — signal weights learned from past "
+                      "seasons (beats the hand-tuned weights out-of-sample)",
+        }
+        return pred
+
+    cal = calibrate(hand)
     pred["calibration"] = cal
-    pred["home_win_prob_model"] = round(raw, 4)
     if cal["applied"]:
         pred["home_win_prob"] = cal["value"]
         pred["away_win_prob"] = round(1.0 - cal["value"], 4)
@@ -85,6 +106,45 @@ def _apply_serve_calibration(pred: dict) -> dict:
                       "toward historically accurate probabilities",
         }
     return pred
+
+
+@router.get("/blend")
+async def get_blend():
+    """Current trained-blend state (learned weights, holdout comparison, enabled)."""
+    from sports.baseball.analytics.blend_model import state
+    return {"ok": True, **state()}
+
+
+@router.post("/blend/fit")
+async def fit_blend_route(season: int = 2023, min_games: int = 15, enable: bool = False):
+    """Fit the logistic blend on a season (leak-free walk-forward), compare it head to
+    head with the hand-tuned model on an honest holdout, persist, optionally enable."""
+    from sports.baseball.analytics.backtest import fit_blend
+    from sports.baseball.analytics.blend_model import save
+
+    games = await client.fetch_schedule_range(date(season, 3, 1), date(season, 11, 1))
+    rate, rated = await _pitcher_rating_fn(season, games)
+    fit = fit_blend(games, min_games=min_games, rate_pitcher=rate)
+    if not fit.get("fitted"):
+        return {"ok": False, **fit}
+    artifact = {
+        "model_version": fit["model_version"],
+        "feature_order": fit["feature_order"],
+        "weights": fit["weights"],
+        "enabled": bool(enable),
+        "fit_season": season,
+        "fit_n": fit["n"],
+        "pitchers_rated": rated,
+        "holdout": fit.get("holdout"),
+    }
+    return {"ok": True, "fit": fit, "state": save(artifact)}
+
+
+@router.post("/blend/enable")
+async def enable_blend_route(on: bool = True):
+    """Enable/disable the fitted blend at serve without refitting."""
+    from sports.baseball.analytics.blend_model import set_enabled
+    return {"ok": True, **set_enabled(on)}
 
 
 @router.get("/calibration")
@@ -201,7 +261,7 @@ async def game_analysis(game_pk: int):
         home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher,
         home_pitcher_era=h_rating, away_pitcher_era=a_rating,
     )
-    _apply_serve_calibration(pred)
+    _apply_serve_adjustment(pred)
     return {
         "ok": True,
         "game": {
@@ -249,11 +309,13 @@ async def pipeline_health():
     """Data-source + model health for the baseball pipeline monitor (mirrors the F1
     pipeline monitor). All sources are free."""
     from sports.baseball.analytics.serve_calibration import state as calib_state
+    from sports.baseball.analytics.blend_model import state as blend_state
     teams = client.get_teams()
     standings = client.get_standings()
     schedule = client.get_schedule()
     reachable = len(teams) > 0
     calib = calib_state()
+    blend = blend_state()
 
     sources = [
         {
@@ -273,7 +335,12 @@ async def pipeline_health():
         "sources": sources,
         "counts": {"teams": len(teams), "standings": len(standings), "scheduled_games": len(schedule)},
         "model": {
-            "version": "mlb-decomp-v2",
+            "version": "mlb-blend-v1" if blend.get("enabled") else "mlb-decomp-v2",
+            "serving": (
+                "trained logistic blend" if blend.get("enabled") else
+                "hand-tuned + Platt calibration" if calib.get("enabled") else
+                "hand-tuned"
+            ),
             "components": [
                 {"name": "team_strength", "modeled": True},
                 {"name": "home_field", "modeled": True},
@@ -287,13 +354,16 @@ async def pipeline_health():
                 "Platt available in backtest; not yet fitted for serve"
             ),
             "calibrator": calib,
+            "blend": blend,
         },
         "backtest": {"available": True, "endpoint": "/api/baseball/backtest", "kind": "leak-free walk-forward"},
         "notes": [
             "Data is free and real-time (MLB StatsAPI); no paid feed required.",
             "Starting pitcher now modeled via within-season FIP (shrunk toward prior-season ERA).",
-            ("Serve probabilities are Platt-calibrated." if calib.get("enabled")
-             else "Fit a serve calibrator via POST /api/baseball/calibration/fit?enable=true."),
+            ("Serve probabilities come from the trained logistic blend (beats hand-tuned out-of-sample)."
+             if blend.get("enabled") else
+             "Serve probabilities are Platt-calibrated." if calib.get("enabled")
+             else "Fit a serve model via POST /api/baseball/blend/fit?enable=true or /calibration/fit."),
         ],
     }
 

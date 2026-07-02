@@ -88,13 +88,16 @@ def predict_game(
     history (the model refuses to pretend it has a read)."""
     h_pyth, a_pyth = home.pythag_wpct(), away.pythag_wpct()
     strength = log5(h_pyth, a_pyth) - 0.5                       # matchup lean vs coin flip
-    form = _clamp((home.last10_pct() - away.last10_pct()) * FORM_WEIGHT, -FORM_CAP, FORM_CAP)
+    form_gap = home.last10_pct() - away.last10_pct()            # raw last-10 gap (pre-weight)
+    form = _clamp(form_gap * FORM_WEIGHT, -FORM_CAP, FORM_CAP)
     home_field = HOME_FIELD_EDGE
     # Starting pitcher: prior-season ERA gap (lower ERA is better → favours that team).
     pitcher = 0.0
     pitcher_modeled = False
+    pitcher_gap = 0.0
     if home_pitcher_era is not None and away_pitcher_era is not None:
-        pitcher = _clamp((float(away_pitcher_era) - float(home_pitcher_era)) * PITCHER_WEIGHT, -PITCHER_CAP, PITCHER_CAP)
+        pitcher_gap = float(away_pitcher_era) - float(home_pitcher_era)   # raw ERA/FIP gap
+        pitcher = _clamp(pitcher_gap * PITCHER_WEIGHT, -PITCHER_CAP, PITCHER_CAP)
         pitcher_modeled = True
 
     raw = 0.5 + strength + home_field + form + pitcher
@@ -140,5 +143,12 @@ def predict_game(
         "leak_free": enough,
         "baseline": 0.5,
         "components": components,
+        # Raw, pre-weight signals — the feature vector a trained blend learns over.
+        "features": {
+            "strength": round(strength, 6),
+            "form_gap": round(form_gap, 6),
+            "pitcher_gap": round(pitcher_gap, 6),
+            "pitcher_present": 1.0 if pitcher_modeled else 0.0,
+        },
         "model_version": "mlb-decomp-v1",
     }
