@@ -120,6 +120,50 @@ async def backtest(season: int = 2023, min_games: int = 15, calibrate: bool = Tr
     return {"ok": True, "season": season, **result}
 
 
+@router.get("/pipeline/health")
+async def pipeline_health():
+    """Data-source + model health for the baseball pipeline monitor (mirrors the F1
+    pipeline monitor). All sources are free."""
+    teams = client.get_teams()
+    standings = client.get_standings()
+    schedule = client.get_schedule()
+    reachable = len(teams) > 0
+
+    sources = [
+        {
+            "name": "MLB StatsAPI", "url": "statsapi.mlb.com", "kind": "primary",
+            "status": "ok" if reachable else "down", "free": True,
+            "detail": f"{len(teams)} teams · {len(standings)} standings · {len(schedule)} scheduled games",
+        },
+        {
+            "name": "pybaseball (FanGraphs / Baseball-Reference / Statcast)", "url": "pybaseball",
+            "kind": "advanced", "status": "optional", "free": True,
+            "detail": "Advanced metrics for the player pages; loaded on demand",
+        },
+    ]
+    return {
+        "ok": True,
+        "reachable": reachable,
+        "sources": sources,
+        "counts": {"teams": len(teams), "standings": len(standings), "scheduled_games": len(schedule)},
+        "model": {
+            "version": "mlb-decomp-v1",
+            "components": [
+                {"name": "team_strength", "modeled": True},
+                {"name": "home_field", "modeled": True},
+                {"name": "recent_form", "modeled": True},
+                {"name": "starting_pitcher", "modeled": False},
+            ],
+            "calibration": "Platt (fit in backtest; not yet applied at serve)",
+        },
+        "backtest": {"available": True, "endpoint": "/api/baseball/backtest", "kind": "leak-free walk-forward"},
+        "notes": [
+            "Data is free and real-time (MLB StatsAPI); no paid feed required.",
+            "Model ranks teams (accuracy > base rate) but Brier skill ~0 — the starting-pitcher model is the next lever.",
+        ],
+    }
+
+
 @router.post("/refresh")
 async def refresh():
     await client.refresh()
