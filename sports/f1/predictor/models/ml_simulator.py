@@ -285,6 +285,7 @@ def _map_result_to_prediction(
         evidence_groups_used=ml_metadata.get("evidence_groups_used") or [],
         ml_artifact_id=ml_metadata.get("ml_artifact_id"),
         ml_artifact_version=ml_metadata.get("ml_artifact_version"),
+        ml_artifact_readiness=ml_metadata.get("ml_artifact_readiness") or {},
         ml_model_contract_used=ml_metadata.get("ml_model_contract_used"),
         ml_model_adapters_used=ml_metadata.get("ml_model_adapters_used") or [],
         ml_model_fallback_reason=ml_metadata.get("ml_model_fallback_reason"),

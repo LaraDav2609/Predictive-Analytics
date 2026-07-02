@@ -354,6 +354,11 @@ class F1ModelRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("learned_artifact_status", result)
         self.assertIn("avg_brier_score", result["deltas"])
 
+    async def test_telemetry_model_evaluation_route_is_registered(self):
+        paths = {route.path for route in f1_routes.router.routes}
+
+        self.assertIn("/f1/models/telemetry/evaluation", paths)
+
     async def test_backtest_evidence_cache_endpoint_builds_diagnostic_payload(self):
         f1_routes.openf1 = _FakeOpenF1()
 

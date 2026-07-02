@@ -113,6 +113,7 @@ class SimulatorModelBundle:
             "dnf_adapter_source": getattr(self.dnf_adapter or self.survival_adapter, "source", None),
             "rating_adapter_source": getattr(self.rating_adapter, "source", None),
             "ml_model_contract_confidence": self.confidence,
+            "ml_artifact_readiness": self.metadata.get("artifact_readiness") or {},
         }
 
 

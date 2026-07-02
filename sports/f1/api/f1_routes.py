@@ -10,12 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from time import monotonic
+from typing import Any
 
 from fastapi import APIRouter
 import redis
 
 from common.ml.bridge.outcome_publisher import OutcomePublisher
-from common.ml.types import OutcomeProbability
+from common.ml.types import OpsEvent, OutcomeProbability
 from sports.f1.data.f1_client import F1Client
 from sports.f1.data.openf1_client import OpenF1Client
 from sports.f1.data.f1_sentiment import DEFAULT_RSS_FEEDS, read_f1_sentiment, refresh_f1_sentiment
@@ -47,6 +48,26 @@ from sports.f1.predictor.probability import detect_stage, enrich_probability_pay
 from sports.f1.predictor.probability.calibration import build_calibration_profile
 from sports.f1.predictor.data_quality import attach_data_quality, build_data_quality_report
 from sports.f1.assistant import AssistantActionRequest, AssistantChatRequest, F1AssistantService
+from sports.f1.ml.telemetry.artifacts import load_telemetry_artifact_manifest
+from sports.f1.ml.telemetry.explanations import telemetry_feature_importance
+from sports.f1.ml.telemetry.features import build_telemetry_features_from_openf1_session
+from sports.f1.ml.telemetry.model import build_telemetry_model_output
+from sports.f1.ml.telemetry.policy import telemetry_rollout_policy
+from sports.f1.ml.telemetry.types import TelemetryFeaturePayload
+from sports.f1.ml.markets.edge_service import (
+    F1EdgeRequest,
+    RaceQuote,
+    append_order_submissions,
+    build_exposure_state,
+    build_order_intents,
+    compute_race_edges,
+    load_order_submissions,
+    probability_map_from_records,
+    settle_order_submissions,
+    submit_order_intents,
+)
+from sports.f1.ml.markets.bet_ledger import run_bet_ledger
+from sports.f1.ml.markets.synthetic_market import build_synthetic_decisions
 
 router = APIRouter(prefix="/f1", tags=["f1"])
 
@@ -56,6 +77,7 @@ predictor: F1Predictor | None = None
 openf1: OpenF1Client | None = None
 live_engine: F1LiveSessionEngine | None = None
 live_recorder: FastF1LiveRecorderManager | None = None
+fastf1_telemetry = None
 storage: F1Storage | None = None
 backtester: F1BacktestService | None = None
 
@@ -71,7 +93,13 @@ _race_profile_response_cache: dict[tuple[int], tuple[float, dict]] = {}
 _race_profile_tasks: dict[tuple[int], asyncio.Task] = {}
 _live_state_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _outcome_publisher_override = None
+_ops_publisher_override = None
 _last_bridge_publish_status: dict = {"ok": None, "reason": "not_requested", "record_count": 0}
+_RECENT_OPS_EVENTS_MAX = 200
+_recent_ops_events: list[dict] = []
+_last_pipeline_run: dict = {"source_mode": None, "reason": "no_run_yet"}
+_active_freshness_alert_keys: set[str] = set()
+_ORDER_SUBMISSION_LEDGER_ROOT = Path(__file__).resolve().parents[3] / "data" / "f1" / "order_submissions"
 
 _WEEKEND_SESSION_LABELS = {
     "fp1": "Practice 1",
@@ -159,6 +187,80 @@ def _clear_static_response_caches() -> None:
     _race_profile_response_cache.clear()
 
 
+def set_ops_publisher(pub) -> None:
+    """Install the optional F1 ops-event publisher used by the API lifespan."""
+
+    global _ops_publisher_override
+    _ops_publisher_override = pub
+
+
+def _emit_ops_event(
+    event_type: str,
+    *,
+    message: str = "",
+    severity: str = "info",
+    entity_id: str | None = None,
+    **detail,
+) -> dict:
+    event = OpsEvent(
+        domain="f1",
+        event_type=str(event_type or "event"),
+        severity=str(severity or "info"),
+        message=str(message or ""),
+        entity_id=entity_id,
+        detail={k: v for k, v in detail.items() if v is not None},
+        emitted_at=datetime.now(timezone.utc),
+    )
+    record = event.model_dump(mode="json")
+    _recent_ops_events.append(record)
+    del _recent_ops_events[:-_RECENT_OPS_EVENTS_MAX]
+    publisher = _ops_publisher_override
+    if publisher is not None:
+        try:
+            publisher.publish(event)
+        except Exception as exc:
+            record["publish_error"] = f"{exc.__class__.__name__}: {exc}"
+    return record
+
+
+def _record_pipeline_run(
+    *,
+    payload: dict | None = None,
+    simulation: dict | None = None,
+    truth: dict | None = None,
+    bridge_records: list | None = None,
+) -> dict:
+    global _last_pipeline_run
+    truth = truth or {}
+    simulation = simulation or {}
+    source_mode = truth.get("source_mode") or simulation.get("source_mode") or simulation.get("ml_input_source") or "unknown"
+    previous_mode = _last_pipeline_run.get("source_mode")
+    _last_pipeline_run = {
+        "source_mode": source_mode,
+        "reason": truth.get("fallback_reason") or simulation.get("fallback_reason") or simulation.get("reason"),
+        "confidence": truth.get("confidence") or simulation.get("confidence"),
+        "bridge_record_count": len(bridge_records or []),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    fallback_modes = {"estimated", "fallback", "evidence_fallback"}
+    if source_mode in fallback_modes and previous_mode != source_mode:
+        _emit_ops_event(
+            "degraded",
+            severity="warn",
+            message="F1 pipeline running on fallback data",
+            source_mode=source_mode,
+            reason=_last_pipeline_run.get("reason"),
+        )
+    elif previous_mode in fallback_modes and source_mode not in fallback_modes:
+        _emit_ops_event(
+            "recovered",
+            message="F1 pipeline recovered from fallback data",
+            source_mode=source_mode,
+            previous_source_mode=previous_mode,
+        )
+    return _last_pipeline_run
+
+
 async def _race_profile_for_round(round_num: int) -> dict:
     cache_key = (round_num,)
     cached = _get_ttl_cache(_race_profile_response_cache, cache_key, _STATIC_RESPONSE_CACHE_TTL_SECONDS, "race_profile")
@@ -229,12 +331,24 @@ def _prediction_model_fields(prediction: dict | None, selected_model_id: str) ->
         "evidence_groups_used": prediction.get("evidence_groups_used") or [],
         "ml_artifact_id": prediction.get("ml_artifact_id"),
         "ml_artifact_version": prediction.get("ml_artifact_version"),
+        "ml_artifact_readiness": prediction.get("ml_artifact_readiness") or {},
         "ml_model_contract_used": prediction.get("ml_model_contract_used"),
         "ml_model_adapters_used": prediction.get("ml_model_adapters_used") or [],
         "ml_model_fallback_reason": prediction.get("ml_model_fallback_reason"),
         "pace_adapter_source": prediction.get("pace_adapter_source"),
         "dnf_adapter_source": prediction.get("dnf_adapter_source"),
         "rating_adapter_source": prediction.get("rating_adapter_source"),
+        "telemetry_model_used": prediction.get("telemetry_model_used"),
+        "telemetry_model_id": prediction.get("telemetry_model_id"),
+        "telemetry_model_version": prediction.get("telemetry_model_version"),
+        "telemetry_confidence": prediction.get("telemetry_confidence"),
+        "telemetry_source_mode": prediction.get("telemetry_source_mode"),
+        "telemetry_missing_groups": prediction.get("telemetry_missing_groups") or [],
+        "telemetry_fallback_reason": prediction.get("telemetry_fallback_reason"),
+        "telemetry_warn_only": prediction.get("telemetry_warn_only"),
+        "telemetry_policy": prediction.get("telemetry_policy") or {},
+        "telemetry_leakage_guard_status": prediction.get("telemetry_leakage_guard_status") or {},
+        "telemetry_probability_deltas": prediction.get("telemetry_probability_deltas") or [],
     }
 
 
@@ -369,6 +483,7 @@ def _apply_ml_live_runner_payload(simulation: dict, ml_payload: dict, drivers: l
         "evidence_groups_used",
         "ml_artifact_id",
         "ml_artifact_version",
+        "ml_artifact_readiness",
         "ml_model_contract_used",
         "ml_model_adapters_used",
         "ml_model_fallback_reason",
@@ -463,13 +578,51 @@ def _publish_outcome_probabilities(records: list[OutcomeProbability]) -> dict:
         publisher = _outcome_publisher_override or OutcomePublisher()
         publisher.publish_batch(records)
         _last_bridge_publish_status = {"ok": True, "reason": "published", "record_count": len(records)}
+        _emit_ops_event(
+            "prediction_ready",
+            message="F1 probabilities published",
+            record_count=len(records),
+            entity_id=records[0].entity_id if records else None,
+        )
     except Exception as exc:
         _last_bridge_publish_status = {
             "ok": False,
             "reason": f"{exc.__class__.__name__}: {exc}",
             "record_count": len(records),
         }
+        _emit_ops_event(
+            "publish_failed",
+            severity="error",
+            message="F1 probability publish failed",
+            record_count=len(records),
+            reason=_last_bridge_publish_status["reason"],
+            entity_id=records[0].entity_id if records else None,
+        )
     return _last_bridge_publish_status
+
+
+def _telemetry_health_status() -> dict[str, Any]:
+    artifact = load_telemetry_artifact_manifest()
+    policy = telemetry_rollout_policy()
+    if artifact.get("ok"):
+        status = "artifact_ready"
+    elif artifact.get("configured"):
+        status = "artifact_incomplete"
+    else:
+        status = "deterministic_v0"
+    return {
+        "available": True,
+        "status": status,
+        "policy_enabled": policy.get("enabled"),
+        "warn_only": policy.get("warn_only"),
+        "min_confidence": policy.get("min_confidence"),
+        "artifact_ready": bool(artifact.get("ok")),
+        "artifact_configured": bool(artifact.get("configured")),
+        "artifact_id": artifact.get("artifact_id"),
+        "artifact_version": artifact.get("artifact_version"),
+        "artifact_missing_heads": artifact.get("missing_heads") or [],
+        "fallback_reason": artifact.get("fallback_reason"),
+    }
 
 
 def init(fc: F1Client, fp: F1Predictor):
@@ -1050,6 +1203,7 @@ def _compact_live_probability_payload(payload: dict) -> dict:
         "trained_artifacts_used",
         "ml_artifact_id",
         "ml_artifact_version",
+        "ml_artifact_readiness",
         "ml_live_runner",
         "ml_live_runner_used",
     ):
@@ -2083,12 +2237,324 @@ async def compare_f1_models_summary(
     )
 
 
+@router.get("/models/telemetry/evaluation")
+async def get_f1_telemetry_model_evaluation(
+    start_season: int = 2023,
+    end_season: int | None = None,
+    stage: str = "practice_available",
+    baseline_model_id: str = "ml_simulator_v1",
+    allow_partial: bool = False,
+    include_races: bool = False,
+):
+    """Evaluate telemetry simulator diagnostics for Model Lab.
+
+    The endpoint intentionally reuses the existing backtester rather than adding
+    a separate telemetry-only pipeline. It returns a compact, stable contract for
+    dashboard diagnostics even when detailed telemetry rows are sparse.
+    """
+
+    end = end_season if end_season is not None else max(start_season, client.season - 1)
+    comparison = await _backtester().compare_summary(
+        start_season=start_season,
+        end_season=end,
+        include_races=include_races,
+        allow_partial=allow_partial,
+        stage=stage,
+    )
+    if not comparison.get("ok", False):
+        return comparison
+
+    models = comparison.get("models") or []
+    telemetry_model = _model_result(models, "telemetry_simulator_v1")
+    baseline_model = _model_result(models, baseline_model_id) or _model_result(models, PRODUCTION_MODEL_ID)
+    if not telemetry_model:
+        return {
+            "ok": False,
+            "code": "telemetry_model_missing",
+            "reason": "telemetry_simulator_v1 was not present in the backtest comparison.",
+            "model_id": "telemetry_simulator_v1",
+            "baseline_model_id": baseline_model_id,
+        }
+
+    race_rows = _model_race_rows(telemetry_model)
+    baseline_rows = _model_race_rows(baseline_model or {})
+    coverage = _telemetry_evaluation_coverage(race_rows, fallback_race_count=int(telemetry_model.get("race_count") or 0))
+    buckets = _telemetry_confidence_buckets(race_rows)
+    source_modes = _telemetry_source_modes(race_rows)
+    artifact_status = load_telemetry_artifact_manifest()
+    rollout_policy = telemetry_rollout_policy()
+    limitations = _telemetry_evaluation_limitations(
+        race_rows,
+        coverage,
+        artifact_status,
+        comparison.get("fallback_coverage") or telemetry_model.get("fallback_coverage") or {},
+    )
+    recommendations = _telemetry_evaluation_recommendations(coverage, artifact_status, rollout_policy)
+
+    return {
+        "ok": True,
+        "model_id": "telemetry_simulator_v1",
+        "baseline_model_id": (baseline_model or {}).get("model_id") or baseline_model_id,
+        "start_season": int(start_season),
+        "end_season": int(end),
+        "stage": stage,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "race_count": int(telemetry_model.get("race_count") or len(race_rows)),
+        "coverage": coverage,
+        "confidence_buckets": buckets,
+        "source_modes": source_modes,
+        "feature_importance": telemetry_feature_importance(),
+        "rollout_policy": rollout_policy,
+        "learned_artifact_status": artifact_status,
+        "deltas": {
+            "winner_accuracy": _metric_delta(telemetry_model, baseline_model, "winner_accuracy", lower_is_better=False),
+            "avg_brier_score": _metric_delta(telemetry_model, baseline_model, "avg_brier_score", lower_is_better=True),
+            "avg_log_loss": _metric_delta(telemetry_model, baseline_model, "avg_log_loss", lower_is_better=True),
+            "avg_expected_finish_error": _metric_delta(telemetry_model, baseline_model, "avg_expected_finish_error", lower_is_better=True),
+        },
+        "telemetry_summary": _compact_model_metrics(telemetry_model),
+        "baseline_summary": _compact_model_metrics(baseline_model or {}),
+        "limitations": limitations,
+        "recommendations": recommendations,
+        "sample": {
+            "telemetry_rows": len(race_rows),
+            "baseline_rows": len(baseline_rows),
+        },
+    }
+
+
+def _model_result(models: list[dict[str, Any]], model_id: str | None) -> dict[str, Any] | None:
+    if not model_id:
+        return None
+    return next((model for model in models if model.get("model_id") == model_id), None)
+
+
+def _model_race_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for season in model.get("seasons") or []:
+        rows.extend(row for row in season.get("races") or [] if isinstance(row, dict))
+    return rows
+
+
+def _telemetry_quality_from_row(row: dict[str, Any]) -> float | None:
+    for key in ("telemetry_quality", "telemetry_confidence", "weekend_evidence_confidence", "confidence"):
+        value = row.get(key)
+        try:
+            if value is not None:
+                return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+    evidence = row.get("weekend_evidence") or row.get("truth") or {}
+    if isinstance(evidence, dict):
+        try:
+            value = evidence.get("telemetry_quality") or evidence.get("confidence")
+            if value is not None:
+                return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _telemetry_source_from_row(row: dict[str, Any]) -> str:
+    for key in ("telemetry_source_mode", "source_mode", "ml_input_source", "stage"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return "unknown"
+
+
+def _telemetry_evaluation_coverage(rows: list[dict[str, Any]], fallback_race_count: int = 0) -> dict[str, Any]:
+    race_count = len(rows) or int(fallback_race_count or 0)
+    quality_values = [value for row in rows if (value := _telemetry_quality_from_row(row)) is not None]
+    high_quality = [value for value in quality_values if value >= 0.70]
+    return {
+        "race_count": race_count,
+        "quality_known_races": len(quality_values),
+        "quality_known_ratio": round(len(quality_values) / max(1, race_count), 4),
+        "high_quality_races": len(high_quality),
+        "high_quality_ratio": round(len(high_quality) / max(1, race_count), 4),
+        "avg_telemetry_quality": round(sum(quality_values) / len(quality_values), 4) if quality_values else 0.0,
+    }
+
+
+def _telemetry_confidence_buckets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {"low": [], "medium": [], "high": [], "unknown": []}
+    for row in rows:
+        quality = _telemetry_quality_from_row(row)
+        if quality is None:
+            key = "unknown"
+        elif quality >= 0.70:
+            key = "high"
+        elif quality >= 0.35:
+            key = "medium"
+        else:
+            key = "low"
+        buckets[key].append(row)
+    output = []
+    for key in ("low", "medium", "high", "unknown"):
+        items = buckets[key]
+        metrics = [item.get("metrics") or {} for item in items]
+        qualities = [value for item in items if (value := _telemetry_quality_from_row(item)) is not None]
+        output.append({
+            "bucket": key,
+            "race_count": len(items),
+            "winner_accuracy": round(sum(1 for metric in metrics if metric.get("winner_hit")) / max(1, len(metrics)), 4),
+            "avg_brier_score": _avg_metric(metrics, "brier_score"),
+            "avg_log_loss": _avg_metric(metrics, "log_loss"),
+            "avg_telemetry_quality": round(sum(qualities) / len(qualities), 4) if qualities else 0.0,
+        })
+    return output
+
+
+def _telemetry_source_modes(rows: list[dict[str, Any]]) -> dict[str, int]:
+    modes: dict[str, int] = {}
+    for row in rows:
+        mode = _telemetry_source_from_row(row)
+        modes[mode] = modes.get(mode, 0) + 1
+    return modes
+
+
+def _avg_metric(metrics: list[dict[str, Any]], key: str) -> float:
+    values = []
+    for metric in metrics:
+        try:
+            if metric.get(key) is not None:
+                values.append(float(metric.get(key)))
+        except (TypeError, ValueError):
+            continue
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
+def _metric_delta(
+    telemetry_model: dict[str, Any],
+    baseline_model: dict[str, Any] | None,
+    key: str,
+    *,
+    lower_is_better: bool,
+) -> dict[str, Any]:
+    model_value = _safe_number(telemetry_model.get(key))
+    baseline_value = _safe_number((baseline_model or {}).get(key))
+    if model_value is None or baseline_value is None:
+        return {"metric": key, "model": model_value, "baseline": baseline_value, "delta": None, "favorable": None}
+    delta = round(model_value - baseline_value, 6)
+    favorable = delta <= 0 if lower_is_better else delta >= 0
+    return {
+        "metric": key,
+        "model": model_value,
+        "baseline": baseline_value,
+        "delta": delta,
+        "favorable": favorable,
+    }
+
+
+def _safe_number(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_model_metrics(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: model.get(key)
+        for key in (
+            "model_id",
+            "race_count",
+            "winner_accuracy",
+            "avg_podium_hit_rate",
+            "avg_points_hit_rate",
+            "avg_brier_score",
+            "avg_log_loss",
+            "avg_expected_finish_error",
+            "fallback_coverage",
+            "leakage_status",
+        )
+        if key in model
+    }
+
+
+def _telemetry_evaluation_limitations(
+    rows: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    artifact_status: dict[str, Any],
+    fallback_coverage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    limitations: list[dict[str, Any]] = []
+    if len(rows) < 20:
+        limitations.append({
+            "severity": "warning",
+            "code": "small_telemetry_sample",
+            "message": "Telemetry evaluation has a small completed-race sample.",
+            "details": {"race_count": len(rows)},
+        })
+    if coverage.get("quality_known_ratio", 0.0) < 0.50:
+        limitations.append({
+            "severity": "warning",
+            "code": "telemetry_quality_sparse",
+            "message": "Most evaluated races do not expose explicit telemetry-quality scores yet.",
+            "details": coverage,
+        })
+    if not artifact_status.get("ok"):
+        limitations.append({
+            "severity": "info",
+            "code": "learned_artifact_inactive",
+            "message": "Telemetry simulator is running with deterministic fallback heads.",
+            "details": {"fallback_reason": artifact_status.get("fallback_reason")},
+        })
+    if fallback_coverage:
+        limitations.append({
+            "severity": "info",
+            "code": "fallback_coverage",
+            "message": "Backtest fallback coverage is included for operator review.",
+            "details": fallback_coverage,
+        })
+    return limitations
+
+
+def _telemetry_evaluation_recommendations(
+    coverage: dict[str, Any],
+    artifact_status: dict[str, Any],
+    policy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    recommendations: list[dict[str, Any]] = []
+    if coverage.get("high_quality_ratio", 0.0) < 0.35:
+        recommendations.append({
+            "priority": "high",
+            "target": "telemetry_ingestion",
+            "action": "Persist richer OpenF1/FastF1 practice telemetry summaries before expanding telemetry model influence.",
+            "reason": "High-quality telemetry coverage is still low.",
+        })
+    if not artifact_status.get("ok"):
+        recommendations.append({
+            "priority": "medium",
+            "target": "learned_heads",
+            "action": "Train and register all telemetry heads before enabling learned telemetry adjustments.",
+            "reason": artifact_status.get("fallback_reason") or "artifact_not_ready",
+        })
+    if policy.get("warn_only"):
+        recommendations.append({
+            "priority": "medium",
+            "target": "rollout_policy",
+            "action": "Telemetry is in warn-only mode; review this evaluation before enabling active influence.",
+            "reason": "Warn-only policy prevents telemetry adjustments from changing served probabilities.",
+        })
+    if not recommendations:
+        recommendations.append({
+            "priority": "low",
+            "target": "monitoring",
+            "action": "Continue monitoring telemetry deltas against the baseline across new race weekends.",
+            "reason": "Coverage and artifact posture are acceptable for the current gate.",
+        })
+    return recommendations
+
+
 @router.get("/health")
 async def get_f1_health():
     features = (predictor._features if predictor else {}) or {}
     sentiment = _sentiment_snapshot()
     weather_by_round = features.get("weather_by_round") or {}
     weather_by_round_session = features.get("weather_by_round_session") or {}
+    telemetry_health = _telemetry_health_status()
     storage_health = await storage.health() if storage else {
         "redis": {"available": False, "last_error": "storage_unavailable"},
         "clickhouse": {"available": False, "last_error": "storage_unavailable"},
@@ -2146,6 +2612,7 @@ async def get_f1_health():
                 "latest_mode": "unavailable",
                 "latest_reason": "live_engine_unavailable",
             },
+            "telemetry": telemetry_health,
             "data_quality": {
                 "available": True,
                 "default_policy": "quality-governed bounded influence",
@@ -2166,11 +2633,74 @@ async def get_f1_health():
                 "weather": not bool(weather_by_round),
                 "sentiment": not bool((sentiment.get("drivers") or {}) or (sentiment.get("teams") or {})),
                 "live": not bool(live_engine),
+                "telemetry_artifact": bool(telemetry_health.get("artifact_configured")) and not bool(telemetry_health.get("artifact_ready")),
                 "redis": not bool(storage_health.get("redis", {}).get("available")),
                 "clickhouse": not bool(storage_health.get("clickhouse", {}).get("available")),
             }.items()
             if enabled
         ],
+    }
+
+
+@router.get("/pipeline/health")
+async def get_f1_pipeline_health():
+    storage_health = await storage.health() if storage else {
+        "redis": {"available": False, "last_error": "storage_unavailable"},
+        "clickhouse": {"available": False, "last_error": "storage_unavailable"},
+    }
+    features = (predictor._features if predictor else {}) or {}
+    freshness_alerts = []
+    if client is None or predictor is None:
+        freshness_alerts.append({
+            "source": "official_results",
+            "severity": "warn",
+            "reason": "client_or_predictor_unavailable",
+        })
+    if storage_health.get("redis", {}).get("available") is not True:
+        freshness_alerts.append({
+            "source": "redis",
+            "severity": "warn",
+            "reason": storage_health.get("redis", {}).get("last_error") or "unavailable",
+        })
+    if storage_health.get("clickhouse", {}).get("available") is not True:
+        freshness_alerts.append({
+            "source": "clickhouse",
+            "severity": "warn",
+            "reason": storage_health.get("clickhouse", {}).get("last_error") or "unavailable",
+        })
+    _active_freshness_alert_keys.clear()
+    _active_freshness_alert_keys.update(str(alert.get("source")) for alert in freshness_alerts)
+    return {
+        "ok": True,
+        "provenance": {
+            "mode": "trained" if features.get("drivers") else "heuristic_fallback",
+            "last_pipeline_run": _last_pipeline_run,
+        },
+        "calibration": {
+            "empirical_active": bool(features.get("calibration_profile")),
+        },
+        "market_coverage": {
+            "computed": ["winner", "podium", "fastest_lap", "dnf"],
+            "published": ["winner", "podium", "fastest_lap", "dnf"],
+            "computed_not_published": ["safety_car"],
+        },
+        "confidence_ceilings": {
+            "live": 0.95,
+            "estimated": 0.25,
+            "fallback": 0.15,
+        },
+        "bridge": {
+            "domain": "f1",
+            "ops_channel_pattern": "f1:ops:{event_type}",
+            "probability_channel_pattern": "f1:prob:{entity_id}:{entity_code}:{market}",
+            "last_publish": _last_bridge_publish_status,
+        },
+        "freshness_alerts": freshness_alerts,
+        "freshness_summary": {
+            "total": len(freshness_alerts),
+            "by_source": {alert["source"]: 1 for alert in freshness_alerts},
+        },
+        "recent_events": list(_recent_ops_events),
     }
 
 
@@ -2848,6 +3378,7 @@ async def get_f1_live_probabilities(round_num: int, session: str = "race", model
         "trained_artifacts_used": simulation.get("trained_artifacts_used"),
         "ml_artifact_id": simulation.get("ml_artifact_id"),
         "ml_artifact_version": simulation.get("ml_artifact_version"),
+        "ml_artifact_readiness": simulation.get("ml_artifact_readiness") or {},
         "ml_live_runner": simulation.get("ml_live_runner"),
         "ml_live_runner_used": simulation.get("ml_live_runner_used"),
         "live_state": live_state,
@@ -3201,6 +3732,7 @@ async def get_race_probability_audit(
         "evidence_groups_used": simulation.get("evidence_groups_used") or [],
         "ml_artifact_id": simulation.get("ml_artifact_id"),
         "ml_artifact_version": simulation.get("ml_artifact_version"),
+        "ml_artifact_readiness": simulation.get("ml_artifact_readiness") or {},
         "stage": audited.get("stage"),
         "truth": truth,
         "weekend_evidence": audited.get("weekend_evidence") or simulation.get("weekend_evidence") or truth.get("weekend_evidence") or {},
@@ -3226,6 +3758,499 @@ async def get_race_probability_audit(
         "bias_warnings": audited.get("bias_warnings") or truth.get("bias_warnings") or [],
         "influence_caps_applied": audited.get("influence_caps_applied") or truth.get("influence_caps_applied") or {},
         "leakage_guard_status": audited.get("leakage_guard_status") or truth.get("leakage_guard_status") or {},
+    }
+
+
+def _order_submission_ledger_path(entity_id: str, mode: str = "paper") -> Path:
+    normalized_mode = _slug(mode or "paper").lower()
+    return _ORDER_SUBMISSION_LEDGER_ROOT / f"{_slug(entity_id)}-{normalized_mode}.jsonl"
+
+
+def _order_settlement_report_path(entity_id: str, mode: str = "paper") -> Path:
+    normalized_mode = _slug(mode or "paper").lower()
+    return _ORDER_SUBMISSION_LEDGER_ROOT / f"{_slug(entity_id)}-{normalized_mode}-settlement.json"
+
+
+async def _race_market_probabilities(
+    round_num: int,
+    *,
+    session: str,
+    live: bool,
+    model_id: str | None,
+) -> tuple[dict | None, list[OutcomeProbability], dict | None]:
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return None, [], {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    simulation = await get_race_simulation(round_num, session=session, live=live, model_id=model_id)
+    if not simulation.get("ok", True):
+        return simulation, [], simulation
+    rows = simulation.get("simulations") or simulation.get("probabilities") or []
+    model_version = (
+        simulation.get("prediction_model_version")
+        or simulation.get("model_version")
+        or simulation.get("model_id")
+        or model_id
+        or "f1-simulation"
+    )
+    records = _simulation_rows_to_outcome_probabilities(
+        season=client.season,
+        race=race,
+        rows=rows,
+        model_version=str(model_version),
+        generated_at=simulation.get("generated_at"),
+    )
+    return simulation, records, None
+
+
+@router.post("/races/{round_num}/edges")
+async def post_f1_race_edges(
+    round_num: int,
+    body: F1EdgeRequest,
+    session: str = "race",
+    live: bool = False,
+    model_id: str | None = None,
+):
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    simulation, records, error = await _race_market_probabilities(
+        round_num,
+        session=session,
+        live=live,
+        model_id=model_id,
+    )
+    if error:
+        return error
+    quotes = [RaceQuote.from_input(quote) for quote in body.quotes]
+    edges = compute_race_edges(
+        probability_map_from_records(records),
+        quotes,
+        bankroll_usd=body.bankroll_usd,
+        min_edge_bps=body.min_edge_bps,
+        shrinkage=body.shrinkage,
+        max_per_market_pct=body.max_per_market_pct,
+        trade_readiness=body.trade_readiness,
+    )
+    return {
+        "ok": True,
+        "round": round_num,
+        "session": (session or "race").lower(),
+        "live": bool(live),
+        "entity_id": _race_entity_id(client.season, race),
+        "model_id": (simulation or {}).get("model_id"),
+        "model_version": (simulation or {}).get("prediction_model_version") or (simulation or {}).get("model_version"),
+        "model_markets": sorted({record.market for record in records}),
+        "quote_count": len(quotes),
+        "probability_count": len(records),
+        "count": len(edges),
+        "tradeable_count": sum(1 for row in edges if row.get("tradeable")),
+        "would_trade_count": sum(1 for row in edges if row.get("would_trade")),
+        "edges": edges,
+    }
+
+
+@router.post("/ledger/backtest")
+async def post_f1_ledger_backtest(body: dict):
+    payload = body or {}
+    samples = payload.get("samples") or payload.get("decisions") or []
+    if not isinstance(samples, list) or not samples:
+        return {
+            "ok": False,
+            "reason": "No ledger decisions or samples supplied",
+            "code": "missing_decisions",
+        }
+    decisions = samples if payload.get("decisions") else build_synthetic_decisions(
+        samples,
+        market_bias=float(payload.get("market_bias", 0.0)),
+        overround=float(payload.get("overround", 0.04)),
+        spread=float(payload.get("spread", 0.02)),
+    )
+    ledger = run_bet_ledger(
+        decisions,
+        bankroll_usd=float(payload.get("bankroll_usd", 1000.0)),
+        min_edge_bps=float(payload.get("min_edge_bps", 200.0)),
+        shrinkage=float(payload.get("shrinkage", 0.25)),
+        max_per_market_pct=float(payload.get("max_per_market_pct", 0.05)),
+        default_fee_bps=float(payload.get("default_fee_bps", 0.0)),
+    )
+    return {
+        "ok": True,
+        "synthetic": not bool(payload.get("decisions")),
+        "samples": len(samples),
+        **ledger,
+    }
+
+
+@router.get("/ledger/season/{season}")
+async def get_f1_season_ledger(
+    season: int,
+    market_shrink: float = 0.25,
+    min_edge_bps: float = 200.0,
+    bankroll_usd: float = 1000.0,
+    model_id: str | None = None,
+    stage: str = "pre_weekend",
+):
+    backtest = await _backtester().backtest_season(
+        season,
+        include_races=True,
+        allow_partial=True,
+        model_id=model_id,
+        stage=stage,
+    )
+    if not backtest.get("ok", False):
+        return backtest
+    samples: list[dict] = []
+    races = backtest.get("races") or []
+    for race_row in races:
+        actual_winner = str(race_row.get("actual_winner") or "").upper()
+        round_num = race_row.get("round")
+        for item in race_row.get("probability_distribution") or []:
+            code = str(item.get("driver_id") or item.get("driver_code") or item.get("code") or "").upper()
+            if not code:
+                continue
+            model_prob = item.get("win_probability", item.get("win_prob"))
+            if model_prob is None:
+                continue
+            try:
+                model_prob = float(model_prob)
+            except (TypeError, ValueError):
+                continue
+            market_ref = max(0.01, min(0.99, model_prob * (1.0 - float(market_shrink)) + 0.5 * float(market_shrink)))
+            samples.append({
+                "model_prob": model_prob,
+                "market_ref": market_ref,
+                "outcome": 1 if code == actual_winner else 0,
+                "label": f"{season}-R{round_num}-{code}",
+            })
+    ledger = run_bet_ledger(
+        build_synthetic_decisions(samples),
+        bankroll_usd=bankroll_usd,
+        min_edge_bps=min_edge_bps,
+    )
+    return {
+        "ok": True,
+        "synthetic": True,
+        "season": season,
+        "model_id": backtest.get("model_id") or model_id,
+        "races_evaluated": len(races),
+        "samples": len(samples),
+        **ledger,
+    }
+
+
+@router.get("/races/{round_num}/orders/submissions")
+async def get_f1_race_order_submissions(round_num: int, mode: str = "paper"):
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    entity_id = _race_entity_id(client.season, race)
+    path = _order_submission_ledger_path(entity_id, mode)
+    submissions = load_order_submissions(path)
+    exposure = build_exposure_state([submission.model_dump() for submission in submissions])
+    return {
+        "ok": True,
+        "round": round_num,
+        "entity_id": entity_id,
+        "mode": (mode or "paper").lower(),
+        "ledger_path": str(path),
+        "count": len(submissions),
+        "submissions": [submission.model_dump() for submission in submissions],
+        "exposure_state": exposure.model_dump(),
+    }
+
+
+@router.post("/races/{round_num}/orders/submit")
+async def post_f1_race_order_submissions(
+    round_num: int,
+    body: dict,
+    mode: str = "paper",
+    allow_live: bool = False,
+):
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    payload = body or {}
+    normalized_mode = str(payload.get("mode") or mode or "paper").strip().lower()
+    entity_id = _race_entity_id(client.season, race)
+    path = _order_submission_ledger_path(entity_id, normalized_mode)
+    existing = load_order_submissions(path)
+
+    intents = payload.get("intents") or []
+    if not intents and payload.get("edges"):
+        intents = build_order_intents(
+            payload.get("edges") or [],
+            race_id=entity_id,
+            mode=normalized_mode,
+        )
+    submissions = submit_order_intents(
+        intents,
+        existing_submissions=existing,
+        allow_live=bool(payload.get("allow_live") or allow_live),
+    )
+    persist_blocked = bool(payload.get("persist_blocked"))
+    candidates = [
+        submission
+        for submission in submissions
+        if submission.status != "duplicate_ignored" and (persist_blocked or submission.status != "blocked")
+    ]
+    append_status = append_order_submissions(path, candidates) if candidates else {
+        "ok": True,
+        "path": str(path),
+        "existing_count": len(existing),
+        "input_count": 0,
+        "appended_count": 0,
+        "duplicate_count": 0,
+        "total_count": len(existing),
+    }
+    loaded = load_order_submissions(path)
+    exposure = build_exposure_state([submission.model_dump() for submission in loaded])
+    return {
+        "ok": True,
+        "round": round_num,
+        "entity_id": entity_id,
+        "mode": normalized_mode,
+        "ledger_path": str(path),
+        "submitted_count": len(submissions),
+        "persisted_count": append_status.get("appended_count", 0),
+        "duplicate_count": sum(1 for submission in submissions if submission.status == "duplicate_ignored"),
+        "blocked_count": sum(1 for submission in submissions if submission.status == "blocked"),
+        "append_status": append_status,
+        "submissions": [submission.model_dump() for submission in submissions],
+        "exposure_state": exposure.model_dump(),
+    }
+
+
+@router.post("/races/{round_num}/orders/settle")
+async def post_f1_race_order_settlement(
+    round_num: int,
+    body: dict,
+    mode: str = "paper",
+    persist_report: bool = False,
+):
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    payload = body or {}
+    normalized_mode = str(payload.get("mode") or mode or "paper").strip().lower()
+    outcomes = payload.get("outcomes") or payload.get("results") or {}
+    if not isinstance(outcomes, dict) or not outcomes:
+        return {
+            "ok": False,
+            "reason": "No settlement outcomes supplied",
+            "code": "missing_outcomes",
+            "example": {"outcomes": {"winner:VER": True, "podium:LEC": False}},
+        }
+    entity_id = _race_entity_id(client.season, race)
+    path = _order_submission_ledger_path(entity_id, normalized_mode)
+    submissions = load_order_submissions(path)
+    report = settle_order_submissions(submissions, outcomes)
+    exposure = build_exposure_state(report.get("settlements") or [])
+    response = {
+        **report,
+        "round": round_num,
+        "entity_id": entity_id,
+        "mode": normalized_mode,
+        "ledger_path": str(path),
+        "exposure_state": exposure.model_dump(),
+    }
+    if bool(payload.get("persist_report") or persist_report):
+        report_path = _order_settlement_report_path(entity_id, normalized_mode)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        stored = {**response, "report_path": str(report_path)}
+        report_path.write_text(json.dumps(stored, indent=2, sort_keys=True), encoding="utf-8")
+        response["report_path"] = str(report_path)
+    return response
+
+
+async def _telemetry_features_for_round(round_num: int, session: str = "race", live: bool = False) -> dict[str, Any]:
+    race = client.get_race_by_round(round_num)
+    if not race:
+        return {"ok": False, "reason": "Race not found", "code": "race_not_found"}
+    race_id = _race_entity_id(client.season, race)
+    openf1_session = None
+    if openf1:
+        try:
+            openf1_session = await openf1.get_session_features(
+                race=race,
+                session=session,
+                drivers=client.get_drivers(),
+                live=live,
+            )
+        except Exception as exc:
+            openf1_session = {
+                "ok": False,
+                "source": "openf1",
+                "reason": f"{exc.__class__.__name__}: {exc}",
+                "raw_counts": {},
+            }
+    if openf1_session and openf1_session.get("ok"):
+        payload = build_telemetry_features_from_openf1_session(
+            race_id=race_id,
+            session=session,
+            openf1_session=openf1_session,
+            live=live,
+        )
+        return {
+            "ok": bool(payload.ok),
+            "race": race.model_dump(mode="json"),
+            "round": round_num,
+            "session": session,
+            "telemetry_features": payload.model_dump(mode="json"),
+            "telemetry_snapshot": {
+                "ok": bool(payload.ok),
+                "source": "openf1",
+                "raw_counts": dict(openf1_session.get("raw_counts") or payload.raw_counts or {}),
+                "summary": openf1_session,
+            },
+        }
+    if fastf1_telemetry:
+        try:
+            payload, snapshot = fastf1_telemetry.telemetry_features(
+                race,
+                client.season,
+                round_num,
+                session=session,
+                live=live,
+            )
+            return {
+                "ok": bool(payload.ok),
+                "race": race.model_dump(mode="json"),
+                "round": round_num,
+                "session": session,
+                "telemetry_features": payload.model_dump(mode="json"),
+                "telemetry_snapshot": snapshot,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": f"FastF1 telemetry bridge failed: {exc}",
+                "code": "fastf1_telemetry_failed",
+            }
+    payload = build_telemetry_features_from_openf1_session(
+        race_id=race_id,
+        session=session,
+        openf1_session=openf1_session or {"ok": False, "source": "openf1", "reason": "openf1_unavailable"},
+        live=live,
+    )
+    return {
+        "ok": False,
+        "race": race.model_dump(mode="json"),
+        "round": round_num,
+        "session": session,
+        "reason": "Telemetry features unavailable",
+        "code": "telemetry_features_unavailable",
+        "telemetry_features": payload.model_dump(mode="json"),
+        "telemetry_snapshot": {"ok": False, "source": "estimated", "raw_counts": payload.raw_counts},
+    }
+
+
+@router.get("/races/{round_num}/telemetry/features")
+async def get_race_telemetry_features(round_num: int, session: str = "race", live: bool = False):
+    return await _telemetry_features_for_round(round_num, session=session, live=live)
+
+
+@router.get("/races/{round_num}/telemetry/model")
+async def get_race_telemetry_model(
+    round_num: int,
+    session: str = "race",
+    live: bool = False,
+    artifact_path: str | None = None,
+):
+    features = await _telemetry_features_for_round(round_num, session=session, live=live)
+    if not features.get("ok"):
+        return features
+    payload = features.get("telemetry_features") or {}
+    model = build_telemetry_model_output(
+        TelemetryFeaturePayload.model_validate(payload),
+        stage="practice_available" if session.lower().startswith("fp") else session,
+        artifact_path=artifact_path,
+    )
+    model_payload = model.model_dump(mode="json")
+    response = {
+        "ok": True,
+        "round": round_num,
+        "session": session,
+        "model_id": model.model_id,
+        "selected_model_id": model.model_id,
+        "model_version": model.model_version,
+        "telemetry_model": model_payload,
+        "telemetry_features": payload,
+        "telemetry_snapshot": features.get("telemetry_snapshot") or {},
+    }
+    race = client.get_race_by_round(round_num)
+    if storage and race:
+        response["storage"] = await storage.persist_telemetry_snapshot(
+            client.season,
+            race,
+            session,
+            response,
+            model_id=model.model_id,
+        )
+    return response
+
+
+@router.get("/races/{round_num}/telemetry/segments")
+async def get_race_telemetry_segments(round_num: int, session: str = "race", live: bool = False):
+    model = await get_race_telemetry_model(round_num, session=session, live=live)
+    if not model.get("ok"):
+        return model
+    adjustments = (model.get("telemetry_model") or {}).get("driver_adjustments") or {}
+    segments = []
+    for item in (model.get("telemetry_features") or {}).get("segment_features") or []:
+        row = dict(item)
+        code = row.get("driver_code")
+        row["model_adjustment"] = adjustments.get(code) or {}
+        segments.append(row)
+    return {
+        "ok": True,
+        "round": round_num,
+        "session": session,
+        "segments": sorted(segments, key=lambda row: abs(float(row.get("magnitude") or 0.0)), reverse=True),
+    }
+
+
+@router.get("/races/{round_num}/telemetry/lap-comparison")
+async def get_race_telemetry_lap_comparison(
+    round_num: int,
+    session: str = "race",
+    live: bool = False,
+    driver_a: str | None = None,
+    driver_b: str | None = None,
+):
+    features = await _telemetry_features_for_round(round_num, session=session, live=live)
+    if not features.get("ok"):
+        return features
+    driver_features = (features.get("telemetry_features") or {}).get("driver_features") or {}
+    requested = [code.upper() for code in (driver_a, driver_b) if code]
+    if len(requested) < 2:
+        requested = list(driver_features.keys())[:2]
+    drivers = [
+        {"driver_code": code, **(driver_features.get(code) or {})}
+        for code in requested
+        if code in driver_features
+    ]
+    deltas = []
+    if len(drivers) >= 2:
+        left, right = drivers[0], drivers[1]
+        for key in ("clean_air_pace_delta_s", "pace_sigma_delta", "tire_deg_slope_delta", "traffic_penalty_s"):
+            left_value = _safe_number(left.get(key))
+            right_value = _safe_number(right.get(key))
+            if left_value is None or right_value is None:
+                continue
+            deltas.append({
+                "metric": key,
+                "driver_a": left["driver_code"],
+                "driver_b": right["driver_code"],
+                "a": left_value,
+                "b": right_value,
+                "delta": round(left_value - right_value, 5),
+            })
+    return {
+        "ok": True,
+        "round": round_num,
+        "session": session,
+        "drivers": drivers,
+        "deltas": deltas,
     }
 
 

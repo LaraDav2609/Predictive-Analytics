@@ -655,6 +655,7 @@ def _model_input_metadata(prediction: RacePrediction) -> dict[str, Any]:
         "simulator_iterations": prediction.simulator_iterations,
         "ml_artifact_id": prediction.ml_artifact_id,
         "ml_artifact_version": prediction.ml_artifact_version,
+        "ml_artifact_readiness": prediction.ml_artifact_readiness,
         "ml_model_contract_used": prediction.ml_model_contract_used,
         "ml_model_adapters_used": prediction.ml_model_adapters_used,
         "ml_model_fallback_reason": prediction.ml_model_fallback_reason,

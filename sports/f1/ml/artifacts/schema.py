@@ -52,6 +52,7 @@ class F1MLArtifactBundle(BaseModel):
     pace_model: F1MLModelArtifact | None = None
     dnf_model: F1MLModelArtifact | None = None
     survival_model: F1MLModelArtifact | None = None
+    overtake_model: F1MLModelArtifact | None = None
     rating_priors: dict[str, float] = Field(default_factory=dict)
     validation_metrics: dict[str, Any] = Field(default_factory=dict)
     source_metadata: dict[str, Any] = Field(default_factory=dict)

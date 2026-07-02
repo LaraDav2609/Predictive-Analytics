@@ -17,7 +17,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from lifelines import WeibullAFTFitter
+
+try:
+    from lifelines import WeibullAFTFitter
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light CI
+    WeibullAFTFitter = None
 
 
 @dataclass
@@ -48,6 +52,9 @@ def fit(
         raise KeyError(f"missing duration column '{duration_col}'")
     if event_col not in stint_observations.columns:
         raise KeyError(f"missing event column '{event_col}'")
+
+    if WeibullAFTFitter is None:
+        raise RuntimeError("lifelines is required to fit WeibullAFT; install lifelines or use the deterministic DNF fallback.")
 
     aft = WeibullAFTFitter(penalizer=0.01)
     # lifelines requires duration_col & event_col passed by name

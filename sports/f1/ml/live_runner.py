@@ -307,6 +307,7 @@ def _apply_artifact_inputs(config: LiveRunnerConfig, initial_state: dict[str, An
         "ml_provider_sources": ["synthetic_initial_state"],
         "artifact_id": None,
         "artifact_version": None,
+        "ml_artifact_readiness": {},
         "trained_artifacts_used": False,
         "ml_fallback_reason": None,
         "ml_model_contract_used": False,
@@ -323,6 +324,7 @@ def _apply_artifact_inputs(config: LiveRunnerConfig, initial_state: dict[str, An
     meta.update({
         "artifact_id": trained_inputs.get("artifact_id") or apply_meta.get("artifact_id"),
         "artifact_version": trained_inputs.get("artifact_version") or apply_meta.get("artifact_version"),
+        "ml_artifact_readiness": summary.get("ml_artifact_readiness") or trained_inputs.get("artifact_readiness") or {},
         "ml_model_contract_used": summary.get("ml_model_contract_used"),
         "ml_model_fallback_reason": summary.get("ml_model_fallback_reason"),
     })
@@ -783,6 +785,7 @@ def _payload_from_result(
         "artifact_version": artifact_meta.get("artifact_version") or artifact_meta.get("ml_artifact_version"),
         "ml_artifact_id": artifact_meta.get("ml_artifact_id") or artifact_meta.get("artifact_id"),
         "ml_artifact_version": artifact_meta.get("ml_artifact_version") or artifact_meta.get("artifact_version"),
+        "ml_artifact_readiness": artifact_meta.get("ml_artifact_readiness") or {},
         "trained_artifacts_used": artifact_meta.get("trained_artifacts_used"),
         "ml_model_contract_used": artifact_meta.get("ml_model_contract_used"),
         "ml_model_adapters_used": artifact_meta.get("ml_model_adapters_used") or [],

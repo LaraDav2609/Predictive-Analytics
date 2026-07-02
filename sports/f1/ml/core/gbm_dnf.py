@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
+
+try:
+    from lightgbm import LGBMClassifier
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light CI
+    LGBMClassifier = None
 
 from common.ml.registry import register
 
@@ -43,6 +47,8 @@ class GBMDNFModel:
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "GBMDNFModel":
         """Binary objective with balanced class weights to compensate for the
         ~2-3 % positive rate."""
+        if LGBMClassifier is None:
+            raise RuntimeError("lightgbm is required to fit GBMDNFModel; install lightgbm or use a deterministic DNF fallback.")
         self.booster = LGBMClassifier(
             objective="binary",
             n_estimators=self.n_estimators,

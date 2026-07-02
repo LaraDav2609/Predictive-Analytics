@@ -16,7 +16,11 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
+
+try:
+    from lightgbm import LGBMClassifier
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light CI
+    LGBMClassifier = None
 
 
 @dataclass
@@ -52,6 +56,8 @@ class OvertakeModel:
         self.feature_columns: list[str] = []
 
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "OvertakeModel":
+        if LGBMClassifier is None:
+            raise RuntimeError("lightgbm is required to fit OvertakeModel; install lightgbm or use a deterministic overtake fallback.")
         self.feature_columns = list(X.columns)
         self.booster = LGBMClassifier(
             objective="binary",

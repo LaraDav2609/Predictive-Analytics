@@ -19,13 +19,12 @@ from common.ml.backtest.walk_forward import RaceData
 from common.ml.calibration import brier_score, log_loss, reliability_curve
 from sports.f1.ml.artifacts.builder import build_fastf1_artifact_bundle, build_synthetic_artifact_bundle
 from sports.f1.ml.artifacts.loader import artifact_to_simulator_model_bundle, load_simulator_model_bundle
-from sports.f1.ml.artifacts.store import save_artifact_bundle, validate_artifact_bundle
+from sports.f1.ml.artifacts.store import artifact_readiness, save_artifact_bundle, validate_artifact_bundle
 from sports.f1.ml.common.types import Race as MLSimRace
 from sports.f1.ml.markets.mapper import dnf_probabilities, podium_probabilities, winner_probabilities
 from sports.f1.ml.providers.synthetic_provider import SyntheticProvider, SyntheticRaceConfig, default_grid
 from sports.f1.ml.simulator.race_sim import PhysicalParams, SimConfig, simulate_race
 from sports.f1.models.f1 import Constructor, Driver, Race
-from sports.f1.predictor.service import F1PredictionService
 
 
 MODEL_CHOICES = ("uniform", "production_v1", "ml_simulator_v1")
@@ -44,6 +43,12 @@ class MLBacktestConfig:
     n_iterations: int = 400
     physical: bool = False
     fastf1_cache: str = ".fastf1_cache"
+    excluded_race_ids: tuple[str, ...] = field(default_factory=tuple)
+    included_track_codes: tuple[str, ...] = field(default_factory=tuple)
+    excluded_track_codes: tuple[str, ...] = field(default_factory=tuple)
+    validation_baseline_model: str = "uniform"
+    validation_candidate_model: str = "ml_simulator_v1"
+    validation_min_races: int = 5
 
 
 @dataclass
@@ -52,6 +57,7 @@ class MLBacktestResult:
     aggregate_metrics: dict[str, Any]
     model_comparison: dict[str, Any]
     calibration: dict[str, Any]
+    validation_gate: dict[str, Any]
     output_paths: dict[str, str]
 
 
@@ -72,14 +78,24 @@ def run_backtest(config: MLBacktestConfig) -> MLBacktestResult:
     output_root = Path(config.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    test_races = [race for race in sorted(races, key=lambda item: (item.season, item.round)) if race.season == config.season]
+    excluded = {str(race_id) for race_id in config.excluded_race_ids}
+    included_tracks = _normalize_code_set(config.included_track_codes)
+    excluded_tracks = _normalize_code_set(config.excluded_track_codes)
+    test_races = [
+        race
+        for race in sorted(races, key=lambda item: (item.season, item.round))
+        if race.season == config.season
+        and _race_passes_selection(race, excluded, included_tracks, excluded_tracks)
+    ]
     for race in test_races:
-        training = [
-            item for item in races
-            if item.season in train_seasons
-            and (item.season, item.round) < (race.season, race.round)
-            and item.decision_time < race.decision_time
-        ]
+        training = select_training_races(
+            races,
+            race,
+            train_seasons,
+            excluded_race_ids=excluded,
+            included_track_codes=included_tracks,
+            excluded_track_codes=excluded_tracks,
+        )
         if len(training) < config.min_training_races:
             continue
         for model_id in config.models:
@@ -90,15 +106,95 @@ def run_backtest(config: MLBacktestConfig) -> MLBacktestResult:
     aggregate = _aggregate(frame)
     comparison = _model_comparison(frame)
     calibration = _calibration(frame)
+    validation_gate = evaluate_out_of_sample_gate(
+        aggregate,
+        calibration=calibration,
+        baseline_model_id=config.validation_baseline_model,
+        candidate_model_id=config.validation_candidate_model,
+        min_races=config.validation_min_races,
+    )
     artifact_manifest = _artifact_manifest(frame)
-    paths = _write_outputs(config.season, output_root, frame, aggregate, comparison, calibration, artifact_manifest)
+    paths = _write_outputs(config.season, output_root, frame, aggregate, comparison, calibration, validation_gate, artifact_manifest)
     return MLBacktestResult(
         per_race_metrics=frame,
         aggregate_metrics=aggregate,
         model_comparison=comparison,
         calibration=calibration,
+        validation_gate=validation_gate,
         output_paths=paths,
     )
+
+
+def select_training_races(
+    races: list[RaceData],
+    target_race: RaceData,
+    training_seasons: tuple[int, ...],
+    *,
+    excluded_race_ids: set[str] | None = None,
+    included_track_codes: set[str] | None = None,
+    excluded_track_codes: set[str] | None = None,
+) -> list[RaceData]:
+    """Return leakage-safe training races available before a target race."""
+
+    excluded = excluded_race_ids or set()
+    included_tracks = included_track_codes or set()
+    excluded_tracks = excluded_track_codes or set()
+    return [
+        race for race in races
+        if race.race_id != target_race.race_id
+        and _race_passes_selection(race, excluded, included_tracks, excluded_tracks)
+        and race.season in training_seasons
+        and (race.season, race.round) < (target_race.season, target_race.round)
+        and race.decision_time < target_race.decision_time
+    ]
+
+
+def evaluate_out_of_sample_gate(
+    aggregate: dict[str, Any],
+    *,
+    calibration: dict[str, Any] | None = None,
+    baseline_model_id: str = "uniform",
+    candidate_model_id: str = "ml_simulator_v1",
+    min_races: int = 5,
+) -> dict[str, Any]:
+    """Promotion gate for A7: candidate must beat baseline out-of-sample."""
+
+    models = aggregate.get("models") or {}
+    baseline = models.get(baseline_model_id) or {}
+    candidate = models.get(candidate_model_id) or {}
+    reasons: list[str] = []
+    candidate_races = int(candidate.get("race_count") or 0)
+    if not baseline:
+        reasons.append("baseline_missing")
+    if not candidate:
+        reasons.append("candidate_missing")
+    if candidate_races < min_races:
+        reasons.append("insufficient_candidate_races")
+    comparisons = {
+        "winner_brier": _metric_delta(candidate, baseline, "winner_brier", lower_is_better=True),
+        "winner_log_loss": _metric_delta(candidate, baseline, "winner_log_loss", lower_is_better=True),
+        "winner_accuracy": _metric_delta(candidate, baseline, "winner_accuracy", lower_is_better=False),
+    }
+    if comparisons["winner_brier"].get("passed") is False:
+        reasons.append("winner_brier_not_improved")
+    if comparisons["winner_log_loss"].get("passed") is False:
+        reasons.append("winner_log_loss_not_improved")
+    calibration_gate = _candidate_calibration_gate(calibration, candidate_model_id)
+    calibration_status = str(calibration_gate.get("status") or "").lower()
+    if calibration_status == "blocked":
+        reasons.append("calibration_brier_not_improved")
+    passed = not reasons
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "blocked",
+        "baseline_model_id": baseline_model_id,
+        "candidate_model_id": candidate_model_id,
+        "min_races": min_races,
+        "race_count": candidate_races,
+        "reasons": reasons,
+        "comparisons": comparisons,
+        "calibration_gate": calibration_gate,
+    }
 
 
 def _load_races(config: MLBacktestConfig) -> list[RaceData]:
@@ -188,8 +284,10 @@ def _uniform_prediction(race: RaceData) -> dict[str, Any]:
 
 
 def _production_prediction(race: RaceData) -> dict[str, Any]:
+    from sports.f1.predictor.models.baseline import BaselineRaceModel
+    from sports.f1.predictor.models.configs import get_model_config
+
     drivers, constructors = _production_entities(race)
-    service = F1PredictionService(model_id="production_v1")
     features = {
         "completed_races": max(0, race.round - 1),
         "total_races": 10,
@@ -203,15 +301,15 @@ def _production_prediction(race: RaceData) -> dict[str, Any]:
             for index, driver in enumerate(drivers)
         },
     }
-    service.load(drivers, constructors, features, sentiment={})
-    prediction = service.predict_race(_production_race(race))
+    model = BaselineRaceModel(config=get_model_config("production_v1"))
+    prediction = model.predict(_production_race(race), drivers, constructors, features, sentiment={})
     by_code = {driver.id: driver.code for driver in drivers}
     return {
         "winner": {by_code[driver_id]: item.win_prob for driver_id, item in prediction.driver_predictions.items()},
         "podium": {by_code[driver_id]: item.podium_prob for driver_id, item in prediction.driver_predictions.items()},
         "dnf": {by_code[driver_id]: item.dnf_prob for driver_id, item in prediction.driver_predictions.items()},
         "expected_finish": {by_code[driver_id]: item.expected_finish or item.predicted_position or 20 for driver_id, item in prediction.driver_predictions.items()},
-        "metadata": {"input_source": "production_v1", "model_id": prediction.model_id},
+        "metadata": {"input_source": "production_v1", "model_id": prediction.model_id or "production_v1"},
     }
 
 
@@ -240,6 +338,7 @@ def _synthetic_ml_prediction(race: RaceData, training: list[RaceData], config: M
     )
     validation = validate_artifact_bundle(bundle, target_race=race.race_id)
     artifact_path = artifact_root / f"{race.race_id}.json"
+    readiness = artifact_readiness(bundle, target_race=race.race_id, path=str(artifact_path))
     if validation.ok:
         save_artifact_bundle(artifact_path, bundle)
         model_bundle = load_simulator_model_bundle(artifact_path, target_race=race.race_id)
@@ -277,6 +376,7 @@ def _synthetic_ml_prediction(race: RaceData, training: list[RaceData], config: M
             "input_source": "ml_simulator_v1",
             "artifact_path": str(artifact_path) if validation.ok else None,
             "artifact_id": bundle.artifact_id,
+            "artifact_readiness": readiness,
             "artifact_validation": validation.reason or "ok",
             "leakage_status": "passed" if validation.ok else validation.reason,
             **result.metadata,
@@ -300,6 +400,7 @@ def _fastf1_ml_prediction(race: RaceData, training: list[RaceData], config: MLBa
         season_end=max((item.season for item in training), default=race.season),
     )
     validation = validate_artifact_bundle(bundle, target_race=race.race_id)
+    readiness = artifact_readiness(bundle, target_race=race.race_id, path=str(artifact_path))
     if validation.ok:
         save_artifact_bundle(artifact_path, bundle)
         model_bundle = load_simulator_model_bundle(artifact_path, target_race=race.race_id)
@@ -332,6 +433,7 @@ def _fastf1_ml_prediction(race: RaceData, training: list[RaceData], config: MLBa
             "provider": "fastf1",
             "artifact_path": str(artifact_path) if validation.ok else None,
             "artifact_id": bundle.artifact_id,
+            "artifact_readiness": readiness,
             "artifact_validation": validation.reason or "ok",
             "leakage_status": "passed" if validation.ok else validation.reason,
             "leakage_guard_status": bundle.leakage_status,
@@ -426,6 +528,65 @@ def _fallback_rate(group: pd.DataFrame) -> float:
     return float(fallback.mean()) if len(fallback) else 0.0
 
 
+def _metric_delta(candidate: dict[str, Any], baseline: dict[str, Any], metric: str, *, lower_is_better: bool) -> dict[str, Any]:
+    candidate_value = _safe_float(candidate.get(metric))
+    baseline_value = _safe_float(baseline.get(metric))
+    if candidate_value is None or baseline_value is None:
+        return {"metric": metric, "candidate": candidate_value, "baseline": baseline_value, "delta": None, "passed": None}
+    delta = candidate_value - baseline_value
+    passed = delta < 0 if lower_is_better else delta >= 0
+    return {
+        "metric": metric,
+        "candidate": candidate_value,
+        "baseline": baseline_value,
+        "delta": round(delta, 6),
+        "passed": passed,
+    }
+
+
+def _candidate_calibration_gate(calibration: dict[str, Any] | None, candidate_model_id: str) -> dict[str, Any]:
+    models = (calibration or {}).get("models") or {}
+    candidate = models.get(candidate_model_id) or {}
+    gate = candidate.get("calibration_gate") or {}
+    return gate if isinstance(gate, dict) else {}
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _race_passes_selection(
+    race: RaceData,
+    excluded_race_ids: set[str],
+    included_track_codes: set[str],
+    excluded_track_codes: set[str],
+) -> bool:
+    if race.race_id in excluded_race_ids:
+        return False
+    track_code = _race_track_code(race)
+    if included_track_codes and track_code not in included_track_codes:
+        return False
+    if excluded_track_codes and track_code in excluded_track_codes:
+        return False
+    return True
+
+
+def _race_track_code(race: RaceData) -> str:
+    parts = str(race.race_id).split("-")
+    if parts and parts[0].upper() == "SYN":
+        return "SYNTH"
+    if len(parts) >= 3 and parts[0].isdigit():
+        return str(parts[2]).upper()
+    return ""
+
+
+def _normalize_code_set(values: tuple[str, ...]) -> set[str]:
+    return {str(value).strip().upper() for value in values if str(value).strip()}
+
+
 def _model_comparison(frame: pd.DataFrame) -> dict[str, Any]:
     aggregate = _aggregate(frame).get("models") or {}
     if not aggregate:
@@ -445,7 +606,7 @@ def _calibration(frame: pd.DataFrame) -> dict[str, Any]:
     if frame.empty:
         return {"models": {}}
     by_model = {}
-    for model_id, group in frame.groupby("model_id"):
+    for model_id, group in frame.sort_values(["season", "round", "race_id"]).groupby("model_id"):
         probs = group["top_pick_probability"].astype(float).to_numpy()
         hits = group["winner_hit"].astype(float).to_numpy()
         pred, obs, counts = reliability_curve(probs, hits, n_bins=5)
@@ -458,8 +619,67 @@ def _calibration(frame: pd.DataFrame) -> dict[str, Any]:
             ],
             "overconfidence": overconfidence,
             "diagnosis": "overconfident" if overconfidence > 0.05 else "underconfident" if overconfidence < -0.05 else "balanced",
+            "raw_brier": brier_score(probs, hits) if len(probs) else None,
+            "calibration_gate": _calibration_improvement(probs, hits),
         }
     return {"models": by_model}
+
+
+def _calibration_improvement(probs: np.ndarray, hits: np.ndarray) -> dict[str, Any]:
+    """Fit simple shrinkage on earlier races and require held-out Brier improvement."""
+
+    sample_count = int(len(probs))
+    if sample_count < 4:
+        return {
+            "status": "unproven",
+            "passed": None,
+            "reason": "insufficient_calibration_samples",
+            "method": "chronological_base_rate_shrinkage",
+            "sample_count": sample_count,
+            "min_samples": 4,
+            "raw_brier": brier_score(probs, hits) if sample_count else None,
+            "calibrated_brier": None,
+            "brier_improvement": None,
+        }
+
+    split = max(2, sample_count // 2)
+    if sample_count - split < 2:
+        split = sample_count - 2
+    train_probs = probs[:split]
+    train_hits = hits[:split]
+    holdout_probs = probs[split:]
+    holdout_hits = hits[split:]
+    base_rate = float(np.mean(train_hits))
+    weights = (0.0, 0.25, 0.5, 0.75, 1.0)
+    train_scores = [
+        (weight, brier_score(_shrink_probabilities(train_probs, base_rate, weight), train_hits))
+        for weight in weights
+    ]
+    raw_weight, train_brier = min(train_scores, key=lambda item: item[1])
+    raw_holdout_brier = brier_score(holdout_probs, holdout_hits)
+    calibrated = _shrink_probabilities(holdout_probs, base_rate, raw_weight)
+    calibrated_holdout_brier = brier_score(calibrated, holdout_hits)
+    improvement = raw_holdout_brier - calibrated_holdout_brier
+    passed = improvement > 1e-12
+    return {
+        "status": "passed" if passed else "blocked",
+        "passed": passed,
+        "reason": "heldout_brier_improved" if passed else "heldout_brier_not_improved",
+        "method": "chronological_base_rate_shrinkage",
+        "sample_count": sample_count,
+        "train_sample_count": int(len(train_probs)),
+        "holdout_sample_count": int(len(holdout_probs)),
+        "base_rate": base_rate,
+        "raw_weight": float(raw_weight),
+        "train_calibrated_brier": float(train_brier),
+        "raw_brier": raw_holdout_brier,
+        "calibrated_brier": calibrated_holdout_brier,
+        "brier_improvement": float(improvement),
+    }
+
+
+def _shrink_probabilities(probs: np.ndarray, base_rate: float, raw_weight: float) -> np.ndarray:
+    return np.clip((raw_weight * probs) + ((1.0 - raw_weight) * base_rate), 0.0, 1.0)
 
 
 def _artifact_manifest(frame: pd.DataFrame) -> dict[str, Any]:
@@ -468,6 +688,8 @@ def _artifact_manifest(frame: pd.DataFrame) -> dict[str, Any]:
     artifacts: list[dict[str, Any]] = []
     fallback_count = 0
     artifact_rows = 0
+    serving_ready_count = 0
+    live_ready_count = 0
     for _, row in frame.iterrows():
         if str(row.get("model_id")) != "ml_simulator_v1":
             continue
@@ -478,6 +700,11 @@ def _artifact_manifest(frame: pd.DataFrame) -> dict[str, Any]:
             metadata = {}
         fallback_groups = metadata.get("fallback_groups") or []
         validation = metadata.get("artifact_validation")
+        readiness = metadata.get("artifact_readiness") or {}
+        if readiness.get("serving_ready"):
+            serving_ready_count += 1
+        if readiness.get("live_trading_ready"):
+            live_ready_count += 1
         if validation and validation != "ok":
             fallback_count += 1
         elif fallback_groups:
@@ -489,6 +716,7 @@ def _artifact_manifest(frame: pd.DataFrame) -> dict[str, Any]:
             "artifact_id": metadata.get("artifact_id"),
             "artifact_path": metadata.get("artifact_path"),
             "artifact_validation": validation,
+            "artifact_readiness": readiness,
             "leakage_status": metadata.get("leakage_status"),
             "leakage_guard_status": metadata.get("leakage_guard_status"),
             "coverage_counts": metadata.get("coverage_counts") or {},
@@ -498,7 +726,11 @@ def _artifact_manifest(frame: pd.DataFrame) -> dict[str, Any]:
     return {
         "artifact_count": len(artifacts),
         "fallback_count": fallback_count,
+        "serving_ready_count": serving_ready_count,
+        "live_trading_ready_count": live_ready_count,
         "fallback_rate": round(fallback_count / artifact_rows, 4) if artifact_rows else 0.0,
+        "serving_ready_rate": round(serving_ready_count / artifact_rows, 4) if artifact_rows else 0.0,
+        "live_trading_ready_rate": round(live_ready_count / artifact_rows, 4) if artifact_rows else 0.0,
         "artifacts": artifacts,
     }
 
@@ -510,6 +742,7 @@ def _write_outputs(
     aggregate: dict[str, Any],
     comparison: dict[str, Any],
     calibration: dict[str, Any],
+    validation_gate: dict[str, Any],
     artifact_manifest: dict[str, Any],
 ) -> dict[str, str]:
     paths = {
@@ -517,6 +750,8 @@ def _write_outputs(
         "aggregate_metrics": str(output_root / f"aggregate_metrics_{season}.json"),
         "model_comparison": str(output_root / f"model_comparison_{season}.json"),
         "calibration": str(output_root / f"calibration_{season}.json"),
+        "validation_gate": str(output_root / f"validation_gate_{season}.json"),
+        "validation_report": str(output_root / f"validation_report_{season}.md"),
         "artifact_manifest": str(output_root / f"artifact_manifest_{season}.json"),
     }
     frame.to_csv(paths["per_race_metrics"], index=False)
@@ -524,10 +759,117 @@ def _write_outputs(
         ("aggregate_metrics", aggregate),
         ("model_comparison", comparison),
         ("calibration", calibration),
+        ("validation_gate", validation_gate),
         ("artifact_manifest", artifact_manifest),
     ):
         Path(paths[key]).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    Path(paths["validation_report"]).write_text(
+        _validation_report_markdown(season, validation_gate, aggregate, comparison, calibration, artifact_manifest),
+        encoding="utf-8",
+    )
     return paths
+
+
+def _validation_report_markdown(
+    season: int,
+    validation_gate: dict[str, Any],
+    aggregate: dict[str, Any],
+    comparison: dict[str, Any],
+    calibration: dict[str, Any],
+    artifact_manifest: dict[str, Any],
+) -> str:
+    status = str(validation_gate.get("status") or "unknown").upper()
+    candidate = validation_gate.get("candidate_model_id") or "unknown"
+    baseline = validation_gate.get("baseline_model_id") or "unknown"
+    reasons = validation_gate.get("reasons") or []
+    gate_calibration = validation_gate.get("calibration_gate") or {}
+    lines = [
+        f"# F1 Out-of-Sample Validation Report - {season}",
+        "",
+        f"**Status:** {status}",
+        f"**Candidate:** `{candidate}`",
+        f"**Baseline:** `{baseline}`",
+        f"**Race count:** {validation_gate.get('race_count', 0)} / {validation_gate.get('min_races', 0)} minimum",
+        f"**Candidate calibration:** `{gate_calibration.get('status') or 'unknown'}`",
+        "",
+        "## Gate Reasons",
+    ]
+    if reasons:
+        lines.extend(f"- `{reason}`" for reason in reasons)
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "## Metric Comparison",
+        "",
+        "| Metric | Candidate | Baseline | Delta | Passed |",
+        "|---|---:|---:|---:|---|",
+    ])
+    for metric, item in (validation_gate.get("comparisons") or {}).items():
+        lines.append(
+            "| "
+            f"{metric} | "
+            f"{_format_report_number(item.get('candidate'))} | "
+            f"{_format_report_number(item.get('baseline'))} | "
+            f"{_format_report_number(item.get('delta'))} | "
+            f"{item.get('passed')} |"
+        )
+    lines.extend([
+        "",
+        "## Model Aggregate",
+        "",
+        "| Model | Races | Winner Acc | Brier | Log Loss | Fallback Rate |",
+        "|---|---:|---:|---:|---:|---:|",
+    ])
+    for model_id, metrics in sorted((aggregate.get("models") or {}).items()):
+        lines.append(
+            "| "
+            f"{model_id} | "
+            f"{metrics.get('race_count', 0)} | "
+            f"{_format_report_number(metrics.get('winner_accuracy'))} | "
+            f"{_format_report_number(metrics.get('winner_brier'))} | "
+            f"{_format_report_number(metrics.get('winner_log_loss'))} | "
+            f"{_format_report_number(metrics.get('fallback_rate'))} |"
+        )
+    lines.extend([
+        "",
+        "## Calibration Gate",
+        "",
+        "| Model | Status | Raw Brier | Calibrated Brier | Improvement | Method |",
+        "|---|---|---:|---:|---:|---|",
+    ])
+    for model_id, metrics in sorted((calibration.get("models") or {}).items()):
+        gate = metrics.get("calibration_gate") or {}
+        lines.append(
+            "| "
+            f"{model_id} | "
+            f"{gate.get('status') or '-'} | "
+            f"{_format_report_number(gate.get('raw_brier'))} | "
+            f"{_format_report_number(gate.get('calibrated_brier'))} | "
+            f"{_format_report_number(gate.get('brier_improvement'))} | "
+            f"{gate.get('method') or '-'} |"
+        )
+    lines.extend([
+        "",
+        "## Artifact Readiness",
+        "",
+        f"- Best model by comparison rule: `{comparison.get('best_model') or 'none'}`",
+        f"- ML artifact count: {artifact_manifest.get('artifact_count', 0)}",
+        f"- Serving-ready artifacts: {artifact_manifest.get('serving_ready_count', 0)} ({_format_report_number(artifact_manifest.get('serving_ready_rate'))})",
+        f"- Live-trading-ready artifacts: {artifact_manifest.get('live_trading_ready_count', 0)} ({_format_report_number(artifact_manifest.get('live_trading_ready_rate'))})",
+        f"- ML artifact fallback rate: {_format_report_number(artifact_manifest.get('fallback_rate'))}",
+        "",
+        "Live trading remains blocked unless this report status is PASSED and the unified risk manager is active.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _format_report_number(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "-"
+    return f"{number:.4f}"
 
 
 def _ml_race_from_racedata(race: RaceData) -> MLSimRace:

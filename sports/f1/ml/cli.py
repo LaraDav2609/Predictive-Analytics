@@ -29,6 +29,12 @@ def backtest(
     n_iterations: int = typer.Option(400, help="Monte Carlo iterations per race for ml_simulator_v1."),
     physical: bool = typer.Option(False, "--physical/--no-physical", help="Enable physical simulator mode for ml_simulator_v1."),
     fastf1_cache: str = typer.Option(".fastf1_cache", help="FastF1 cache directory."),
+    excluded_races: str = typer.Option("", help="Comma-separated race ids to exclude from training/testing, for anomalies or leakage audits."),
+    included_tracks: str = typer.Option("", help="Comma-separated track codes to include in training/testing, e.g. MONZA,BAHRAIN."),
+    excluded_tracks: str = typer.Option("", help="Comma-separated track codes to exclude from training/testing, e.g. SPA."),
+    validation_baseline_model: str = typer.Option("uniform", help="Baseline model id for the out-of-sample promotion gate."),
+    validation_candidate_model: str = typer.Option("ml_simulator_v1", help="Candidate model id for the out-of-sample promotion gate."),
+    validation_min_races: int = typer.Option(5, help="Minimum candidate race count required by the promotion gate."),
 ) -> None:
     """Walk-forward backtest over a full season.
 
@@ -41,6 +47,9 @@ def backtest(
         train_seasons = tuple(int(s.strip()) for s in training_seasons.split(",") if s.strip())
     else:
         train_seasons = tuple(range(season - 3, season))
+    excluded = tuple(item.strip() for item in excluded_races.split(",") if item.strip())
+    include_track_codes = tuple(item.strip() for item in included_tracks.split(",") if item.strip())
+    exclude_track_codes = tuple(item.strip() for item in excluded_tracks.split(",") if item.strip())
 
     try:
         models = expand_model_choice(model)
@@ -61,6 +70,12 @@ def backtest(
                 n_iterations=n_iterations,
                 physical=physical,
                 fastf1_cache=fastf1_cache,
+                excluded_race_ids=excluded,
+                included_track_codes=include_track_codes,
+                excluded_track_codes=exclude_track_codes,
+                validation_baseline_model=validation_baseline_model,
+                validation_candidate_model=validation_candidate_model,
+                validation_min_races=validation_min_races,
             )
         )
     except Exception as exc:
@@ -72,6 +87,15 @@ def backtest(
     for label, path in result.output_paths.items():
         typer.echo(f"  {label:22s} {path}")
     typer.echo(f"  best model: {result.model_comparison.get('best_model') or '(none)'}")
+    gate = result.validation_gate or {}
+    typer.echo(
+        "  validation gate: "
+        f"{gate.get('status', 'unknown')} "
+        f"candidate={gate.get('candidate_model_id', validation_candidate_model)} "
+        f"baseline={gate.get('baseline_model_id', validation_baseline_model)}"
+    )
+    if gate.get("reasons"):
+        typer.echo(f"    reasons: {','.join(gate.get('reasons') or [])}")
     for model_id, metrics in (result.aggregate_metrics.get("models") or {}).items():
         typer.echo(
             f"    {model_id:18s} "
@@ -336,6 +360,192 @@ def train_artifacts(
     typer.echo(f"provider: {bundle.source_metadata.get('provider')}")
     typer.echo(f"coverage: {bundle.source_metadata.get('coverage_counts') or bundle.validation_metrics.get('coverage') or {}}")
     typer.echo(f"fallback groups: {bundle.source_metadata.get('fallback_groups') or []}")
+
+
+@app.command("artifact-status")
+def artifact_status(
+    path: str = typer.Option(..., "--path", help="Artifact JSON path to inspect."),
+    target_race: str = typer.Option("", help="Optional target race id for leakage validation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Inspect serving and live-trading readiness for an ML simulator artifact."""
+    import json
+
+    from sports.f1.ml.artifacts.store import load_artifact_readiness
+
+    readiness = load_artifact_readiness(path, target_race=target_race or None)
+    if json_output:
+        typer.echo(json.dumps(readiness, indent=2, sort_keys=True))
+        return
+
+    typer.echo(f"artifact: {readiness.get('artifact_id') or '(unavailable)'}")
+    typer.echo(f"model: {readiness.get('model_id') or '-'} {readiness.get('model_version') or '-'}")
+    typer.echo(f"serving: {readiness.get('status')} live: {readiness.get('live_status')}")
+    blockers = readiness.get("promotion_blockers") or []
+    if blockers:
+        typer.echo(f"blockers: {','.join(blockers)}")
+    coverage = readiness.get("coverage") or {}
+    typer.echo(
+        "coverage: "
+        f"drivers={coverage.get('driver_count', 0)} "
+        f"pace={coverage.get('pace_coverage', 0.0):.3f} "
+        f"dnf={coverage.get('dnf_coverage', 0.0):.3f} "
+        f"rating={coverage.get('rating_coverage', 0.0):.3f}"
+    )
+    quality = readiness.get("model_quality") or {}
+    if quality:
+        typer.echo(
+            "quality: "
+            f"pace_beats_baseline={quality.get('pace_beats_baseline')} "
+            f"dnf_beats_baseline={quality.get('dnf_beats_baseline')} "
+            f"overtake_beats_baseline={quality.get('overtake_beats_baseline')}"
+        )
+    calibration = readiness.get("calibration_status") or {}
+    if calibration:
+        typer.echo(
+            "calibration: "
+            f"{calibration.get('status')} "
+            f"brier_improvement={calibration.get('brier_improvement')} "
+            f"method={calibration.get('method') or '-'}"
+        )
+
+
+@app.command("append-order-submissions")
+def append_order_submissions_command(
+    input_path: str = typer.Option(..., help="JSON file containing one submission, a list, or {'submissions': [...]} records."),
+    ledger_path: str = typer.Option(..., help="Append-only JSONL ledger path."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable status."),
+) -> None:
+    """Append paper/live order submission audit records to a JSONL ledger."""
+    import json
+    from pathlib import Path
+
+    from sports.f1.ml.markets.edge_service import append_order_submissions, build_exposure_state, load_order_submissions
+
+    source = Path(input_path)
+    if not source.exists():
+        raise typer.BadParameter(f"input_path does not exist: {input_path}")
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"invalid JSON input: {exc}") from exc
+    if isinstance(raw, dict) and isinstance(raw.get("submissions"), list):
+        submissions = raw.get("submissions") or []
+    elif isinstance(raw, list):
+        submissions = raw
+    else:
+        submissions = [raw]
+
+    status = append_order_submissions(ledger_path, submissions)
+    loaded = load_order_submissions(ledger_path)
+    exposure = build_exposure_state([record.model_dump() for record in loaded])
+    payload = {
+        **status,
+        "loaded_count": len(loaded),
+        "exposure_state": exposure.model_dump(),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo(f"ledger: {payload['path']}")
+    typer.echo(
+        "append: "
+        f"input={payload['input_count']} appended={payload['appended_count']} "
+        f"duplicates={payload['duplicate_count']} total={payload['total_count']}"
+    )
+    typer.echo(
+        "exposure: "
+        f"daily={payload['exposure_state']['daily_exposure_usd']} "
+        f"markets={len(payload['exposure_state']['market_exposure_usd'])} "
+        f"venues={len(payload['exposure_state']['venue_exposure_usd'])}"
+    )
+
+
+@app.command("order-submissions")
+def order_submissions_command(
+    ledger_path: str = typer.Option(..., help="Append-only JSONL ledger path."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable ledger payload."),
+) -> None:
+    """Inspect a paper/live order submission ledger and its exposure snapshot."""
+    import json
+
+    from sports.f1.ml.markets.edge_service import build_exposure_state, load_order_submissions
+
+    submissions = load_order_submissions(ledger_path)
+    exposure = build_exposure_state([record.model_dump() for record in submissions])
+    payload = {
+        "ok": True,
+        "path": ledger_path,
+        "count": len(submissions),
+        "submissions": [record.model_dump() for record in submissions],
+        "exposure_state": exposure.model_dump(),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo(f"ledger: {ledger_path}")
+    typer.echo(f"submissions: {len(submissions)}")
+    typer.echo(
+        "exposure: "
+        f"daily={payload['exposure_state']['daily_exposure_usd']} "
+        f"markets={len(payload['exposure_state']['market_exposure_usd'])} "
+        f"venues={len(payload['exposure_state']['venue_exposure_usd'])}"
+    )
+
+
+@app.command("settle-order-submissions")
+def settle_order_submissions_command(
+    ledger_path: str = typer.Option(..., help="Append-only JSONL submission ledger path."),
+    outcomes_path: str = typer.Option(..., help="JSON file of realized outcomes, e.g. {'winner:VER': true}."),
+    output_path: str = typer.Option("", help="Optional JSON path to write the settlement report."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable settlement report."),
+) -> None:
+    """Settle an order submission ledger against realized F1 market outcomes."""
+    import json
+    from pathlib import Path
+
+    from sports.f1.ml.markets.edge_service import build_exposure_state, load_order_submissions, settle_order_submissions
+
+    outcomes_file = Path(outcomes_path)
+    if not outcomes_file.exists():
+        raise typer.BadParameter(f"outcomes_path does not exist: {outcomes_path}")
+    try:
+        outcomes = json.loads(outcomes_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"invalid outcomes JSON: {exc}") from exc
+    if not isinstance(outcomes, dict):
+        raise typer.BadParameter("outcomes JSON must be an object")
+
+    submissions = load_order_submissions(ledger_path)
+    report = settle_order_submissions(submissions, outcomes)
+    exposure = build_exposure_state(report.get("settlements") or [])
+    payload = {
+        **report,
+        "ledger_path": ledger_path,
+        "outcomes_path": outcomes_path,
+        "exposure_state": exposure.model_dump(),
+    }
+    if output_path:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        payload["output_path"] = str(target)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo(f"ledger: {ledger_path}")
+    typer.echo(
+        "settlement: "
+        f"settled={payload['settlement_count']} skipped={payload['skipped_count']} "
+        f"pnl={payload['realized_pnl']} roi={payload['roi']}"
+    )
+    typer.echo(
+        "exposure: "
+        f"daily_pnl={payload['exposure_state']['daily_pnl_usd']} "
+        f"daily_open={payload['exposure_state']['daily_exposure_usd']}"
+    )
+    if output_path:
+        typer.echo(f"report: {payload['output_path']}")
 
 
 @app.command("train-telemetry-artifacts")

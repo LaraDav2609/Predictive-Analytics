@@ -15,7 +15,7 @@ from sports.f1.ml.artifacts.builder import build_synthetic_artifact_bundle
 from sports.f1.ml.artifacts.builder import build_fastf1_artifact_bundle
 from sports.f1.ml.artifacts.loader import artifact_to_ml_trained_inputs, artifact_to_simulator_model_bundle, load_ml_trained_inputs
 from sports.f1.ml.artifacts.schema import F1MLArtifactBundle, F1MLDriverArtifact
-from sports.f1.ml.artifacts.store import load_artifact_bundle, save_artifact_bundle, validate_artifact_bundle
+from sports.f1.ml.artifacts.store import artifact_readiness, load_artifact_bundle, load_artifact_readiness, save_artifact_bundle, validate_artifact_bundle
 from sports.f1.ml.common.types import Lap, Race as MLSimRace, SessionType, TireCompound
 from sports.f1.ml.markets.mapper import dnf_probabilities, winner_probabilities
 from sports.f1.ml.simulator.model_contract import PaceDistribution, SimulatorModelBundle
@@ -33,7 +33,11 @@ from sports.f1.ml.telemetry.types import TelemetryFeaturePayload, TelemetryFeatu
 from sports.f1.models.f1 import Constructor, Driver, Race
 from sports.f1.predictor.models.baseline import BaselineRaceModel
 from sports.f1.predictor.models.registry import F1ModelRegistry
-from sports.f1.predictor.service import F1PredictionService
+
+try:
+    from sports.f1.predictor.service import F1PredictionService
+except ModuleNotFoundError:
+    F1PredictionService = None
 
 
 class F1MLArtifactTests(unittest.TestCase):
@@ -68,6 +72,105 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertTrue(loaded.feature_columns)
         self.assertTrue(loaded.drivers)
 
+    def test_artifact_readiness_separates_serving_from_live_trading(self):
+        bundle = build_synthetic_artifact_bundle()
+
+        readiness = artifact_readiness(bundle)
+
+        self.assertTrue(readiness["serving_ready"])
+        self.assertFalse(readiness["live_trading_ready"])
+        self.assertIn("out_of_sample_gate_missing", readiness["promotion_blockers"])
+        self.assertGreater(readiness["coverage"]["pace_coverage"], 0.0)
+
+    def test_artifact_readiness_passes_live_gate_when_embedded(self):
+        bundle = build_synthetic_artifact_bundle(metrics={
+            "out_of_sample_gate": {
+                "passed": True,
+                "status": "passed",
+                "candidate_model_id": "ml_simulator_v1",
+                "baseline_model_id": "uniform",
+            }
+        })
+
+        readiness = artifact_readiness(bundle)
+
+        self.assertTrue(readiness["serving_ready"])
+        self.assertTrue(readiness["live_trading_ready"])
+        self.assertEqual([], readiness["promotion_blockers"])
+
+    def test_artifact_readiness_blocks_live_when_quality_underperforms(self):
+        bundle = build_synthetic_artifact_bundle(metrics={
+            "out_of_sample_gate": {
+                "passed": True,
+                "status": "passed",
+                "candidate_model_id": "ml_simulator_v1",
+                "baseline_model_id": "uniform",
+            },
+            "model_quality": {
+                "pace_beats_baseline": False,
+                "dnf_beats_baseline": True,
+                "overtake_beats_baseline": False,
+            },
+        })
+
+        readiness = artifact_readiness(bundle)
+
+        self.assertTrue(readiness["serving_ready"])
+        self.assertFalse(readiness["live_trading_ready"])
+        self.assertIn("pace_model_underperformed_baseline", readiness["promotion_blockers"])
+        self.assertIn("overtake_model_underperformed_baseline", readiness["promotion_blockers"])
+
+    def test_artifact_readiness_reports_passing_calibration_status(self):
+        bundle = build_synthetic_artifact_bundle(metrics={
+            "out_of_sample_gate": {
+                "passed": True,
+                "status": "passed",
+                "candidate_model_id": "ml_simulator_v1",
+                "baseline_model_id": "uniform",
+            },
+            "calibration": {
+                "method": "isotonic",
+                "baseline_brier": 0.210,
+                "calibrated_brier": 0.184,
+                "sample_count": 48,
+            },
+        })
+
+        readiness = artifact_readiness(bundle)
+
+        self.assertTrue(readiness["live_trading_ready"])
+        self.assertEqual("passed", readiness["calibration_status"]["status"])
+        self.assertAlmostEqual(0.026, readiness["calibration_status"]["brier_improvement"])
+        self.assertEqual([], readiness["promotion_blockers"])
+
+    def test_artifact_readiness_blocks_live_when_calibration_underperforms(self):
+        bundle = build_synthetic_artifact_bundle(metrics={
+            "out_of_sample_gate": {
+                "passed": True,
+                "status": "passed",
+                "candidate_model_id": "ml_simulator_v1",
+                "baseline_model_id": "uniform",
+            },
+            "calibration": {
+                "method": "isotonic",
+                "heldout_brier_improvement": -0.004,
+                "sample_count": 36,
+            },
+        })
+
+        readiness = artifact_readiness(bundle)
+
+        self.assertTrue(readiness["serving_ready"])
+        self.assertFalse(readiness["live_trading_ready"])
+        self.assertEqual("blocked", readiness["calibration_status"]["status"])
+        self.assertIn("calibration_underperformed_baseline", readiness["promotion_blockers"])
+
+    def test_load_artifact_readiness_reports_missing_artifact(self):
+        readiness = load_artifact_readiness("missing-artifact.json")
+
+        self.assertFalse(readiness["serving_ready"])
+        self.assertEqual("artifact_load_failed", readiness["reason"])
+
     def test_invalid_artifact_returns_fallback_metadata(self):
         result = load_ml_trained_inputs("missing-artifact.json")
 
@@ -83,6 +186,8 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertEqual("stale_artifact", result["artifact_load_error"])
 
     def test_ml_simulator_uses_artifact_path_and_exposes_metadata(self):
+        if F1PredictionService is None:
+            self.skipTest("httpx/API prediction stack is not installed in this test runtime")
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "artifact.json"
             save_artifact_bundle(path, self._two_driver_bundle())
@@ -95,12 +200,16 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertEqual("two-driver-test-artifact", prediction.ml_artifact_id)
         self.assertTrue(prediction.trained_artifacts_used)
         self.assertTrue(prediction.ml_model_contract_used)
+        self.assertTrue(prediction.ml_artifact_readiness["serving_ready"])
+        self.assertFalse(prediction.ml_artifact_readiness["live_trading_ready"])
         self.assertIn("pace", prediction.ml_model_adapters_used)
         self.assertEqual("artifact_static_dnf", prediction.dnf_adapter_source)
         self.assertIn("artifact_bundle", prediction.ml_provider_sources)
         self.assertGreater(prediction.driver_predictions["russell"].win_prob, prediction.driver_predictions["antonelli"].win_prob)
 
     def test_artifact_dnf_input_changes_dnf_probability(self):
+        if F1PredictionService is None:
+            self.skipTest("httpx/API prediction stack is not installed in this test runtime")
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "artifact.json"
             save_artifact_bundle(path, self._two_driver_bundle())
@@ -112,6 +221,8 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertGreater(prediction.driver_predictions["russell"].dnf_prob, prediction.driver_predictions["antonelli"].dnf_prob)
 
     def test_ml_simulator_uses_artifact_bundle_object(self):
+        if F1PredictionService is None:
+            self.skipTest("httpx/API prediction stack is not installed in this test runtime")
         service = F1PredictionService(model_id="ml_simulator_v1")
         service.load(self.drivers, self.constructors, {**self.features, "ml_artifact_bundle": self._two_driver_bundle()}, sentiment={})
 
@@ -122,6 +233,8 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertTrue(prediction.ml_model_contract_used)
 
     def test_missing_artifact_path_falls_back_without_crashing(self):
+        if F1PredictionService is None:
+            self.skipTest("httpx/API prediction stack is not installed in this test runtime")
         service = F1PredictionService(model_id="ml_simulator_v1")
         service.load(self.drivers, self.constructors, {**self.features, "ml_artifact_path": "missing.json"}, sentiment={})
 
@@ -245,6 +358,19 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual("ml_simulator_v1", loaded.model_id)
         self.assertTrue(loaded.drivers)
+
+    def test_cli_artifact_status_reports_readiness(self):
+        if CliRunner is None or app is None:
+            self.skipTest("typer is not installed in this test runtime")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trained.json"
+            save_artifact_bundle(path, build_synthetic_artifact_bundle())
+            result = CliRunner().invoke(app, ["artifact-status", "--path", str(path)])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn("serving: ready", result.output)
+        self.assertIn("live: blocked", result.output)
+        self.assertIn("calibration: missing", result.output)
 
     def test_telemetry_artifact_builder_writes_complete_manifest(self):
         with TemporaryDirectory() as tmp:
@@ -540,6 +666,17 @@ class F1MLArtifactTests(unittest.TestCase):
         self.assertIn("AAA", bundle.drivers)
         self.assertIsNotNone(bundle.pace_model)
         self.assertIsNotNone(bundle.dnf_model)
+        self.assertEqual("empirical_driver_median_pace_v1", bundle.pace_model.kind)
+        self.assertEqual("smoothed_driver_dnf_hazard_v1", bundle.dnf_model.kind)
+        self.assertIsNotNone(bundle.overtake_model)
+        self.assertEqual("empirical_position_change_overtake_v1", bundle.overtake_model.kind)
+        self.assertTrue(bundle.validation_metrics["pace_model"]["trained"])
+        self.assertTrue(bundle.validation_metrics["dnf_model"]["trained"])
+        self.assertTrue(bundle.validation_metrics["overtake_model"]["trained"])
+        self.assertIn("mae_seconds", bundle.validation_metrics["pace_model"])
+        self.assertIn("brier", bundle.validation_metrics["dnf_model"])
+        self.assertIn("positive_passes", bundle.validation_metrics["overtake_model"])
+        self.assertIn("model_quality", bundle.validation_metrics)
 
     def test_fastf1_artifact_builder_marks_future_training_as_leakage(self):
         provider = _FixtureTelemetryProvider()
@@ -658,6 +795,12 @@ class _FixtureTelemetryProvider:
         rows = []
         for code, base in (("AAA", 80.0), ("BBB", 81.0)):
             for lap in range(1, 8):
+                if code == "BBB" and lap >= 5:
+                    position = 1
+                elif code == "AAA" and lap >= 5:
+                    position = 2
+                else:
+                    position = 1 if code == "AAA" else 2
                 rows.append(Lap(
                     race_id=f"{race.season}-{race.round:02d}-{race.track_code}",
                     driver_code=code,
@@ -668,7 +811,7 @@ class _FixtureTelemetryProvider:
                     sector3_s=25.0,
                     compound=TireCompound.MEDIUM,
                     tire_age_laps=lap,
-                    position=1 if code == "AAA" else 2,
+                    position=position,
                 ))
         return rows
 

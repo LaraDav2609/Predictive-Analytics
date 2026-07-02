@@ -15,7 +15,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from lifelines import CoxPHFitter
+
+try:
+    from lifelines import CoxPHFitter
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light CI
+    CoxPHFitter = None
 
 
 @dataclass
@@ -33,6 +37,9 @@ def fit(
 ) -> CoxFit:
     if stint_observations.empty:
         raise ValueError("stint_observations is empty")
+
+    if CoxPHFitter is None:
+        raise RuntimeError("lifelines is required to fit CoxPH; install lifelines or use the deterministic DNF fallback.")
 
     cox = CoxPHFitter(penalizer=0.01)
     cox.fit(stint_observations, duration_col=duration_col, event_col=event_col)

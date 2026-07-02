@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor
+
+try:
+    from lightgbm import LGBMRegressor
+except ModuleNotFoundError:  # pragma: no cover - exercised in dependency-light CI
+    LGBMRegressor = None
 
 from common.ml.registry import register
 
@@ -51,6 +55,8 @@ class GBMPaceModel:
     # ------------------------------------------------------------------ point
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "GBMPaceModel":
         """Fit a single L1-regression GBM on (X, y)."""
+        if LGBMRegressor is None:
+            raise RuntimeError("lightgbm is required to fit GBMPaceModel; install lightgbm or use a fallback pace model.")
         self.booster = LGBMRegressor(
             objective="regression_l1",
             n_estimators=self.n_estimators,
@@ -78,6 +84,8 @@ class GBMPaceModel:
         """Train one booster per α with `objective='quantile'`. Boosters are
         independent and may not be perfectly monotone in α; the simulator can
         tolerate occasional crossings."""
+        if LGBMRegressor is None:
+            raise RuntimeError("lightgbm is required to fit GBMPaceModel quantiles; install lightgbm or use a fallback pace model.")
         y = np.asarray(y)
         self.quantile_boosters = {}
         for a in alphas:

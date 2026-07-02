@@ -45,6 +45,7 @@ class RacePrediction(BaseModel):
     evidence_groups_used: list[str] = Field(default_factory=list)
     ml_artifact_id: str | None = None
     ml_artifact_version: str | None = None
+    ml_artifact_readiness: dict = Field(default_factory=dict)
     ml_model_contract_used: bool | None = None
     ml_model_adapters_used: list[str] = Field(default_factory=list)
     ml_model_fallback_reason: str | None = None

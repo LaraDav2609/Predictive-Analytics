@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from sports.f1.ml.artifacts.schema import F1MLArtifactBundle
-from sports.f1.ml.artifacts.store import load_artifact_bundle, validate_artifact_bundle
+from sports.f1.ml.artifacts.store import artifact_readiness, load_artifact_bundle, validate_artifact_bundle
 from sports.f1.ml.simulator.model_contract import (
     SimulatorModelBundle,
     StaticDNFAdapter,
@@ -45,6 +45,7 @@ def artifact_to_simulator_model_bundle(
     validation = validate_artifact_bundle(parsed, target_race=target_race)
     if not validation.ok:
         return _fallback_model_bundle(validation.reason or "artifact_invalid", path=path, artifact_id=parsed.artifact_id)
+    readiness = artifact_readiness(parsed, target_race=target_race, path=path)
 
     rows = _artifact_driver_rows(parsed)
     pace_rows = {code: row for code, row in rows.items() if row.get("pace_mean_seconds") is not None or row.get("pace_sigma_seconds") is not None}
@@ -85,6 +86,7 @@ def artifact_to_simulator_model_bundle(
         confidence=round(sum(confidence_values) / len(confidence_values), 4) if confidence_values else 0.0,
         metadata={
             "artifact_path": path,
+            "artifact_readiness": readiness,
             "schema_version": parsed.schema_version,
             "training_seasons": parsed.training_seasons,
             "training_races": parsed.training_races,
@@ -108,6 +110,7 @@ def artifact_to_ml_trained_inputs(
     validation = validate_artifact_bundle(parsed, target_race=target_race)
     if not validation.ok:
         return _fallback(validation.reason or "artifact_invalid", path=path, artifact_id=parsed.artifact_id)
+    readiness = artifact_readiness(parsed, target_race=target_race, path=path)
 
     drivers = _artifact_driver_rows(parsed)
 
@@ -120,6 +123,7 @@ def artifact_to_ml_trained_inputs(
         "artifact_version": parsed.model_version,
         "artifact_schema_version": parsed.schema_version,
         "artifact_path": path,
+        "artifact_readiness": readiness,
         "artifact_metadata": {
             "training_seasons": parsed.training_seasons,
             "training_races": parsed.training_races,
