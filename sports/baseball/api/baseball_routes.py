@@ -63,6 +63,63 @@ async def get_game(game_pk: int):
     return {"ok": True, "game": games[0].model_dump(mode="json")}
 
 
+@router.get("/games/{game_pk}/analysis")
+async def game_analysis(game_pk: int):
+    """Decomposable pre-game read for one game: the named analysis components
+    (team strength, home field, recent form, starting pitcher) and how they add up
+    to the home win probability — the baseball equivalent of the F1 'why this pick'
+    breakdown. Team state is rebuilt leak-free from the season's prior games."""
+    from sports.baseball.analytics.game_model import TeamState, predict_game
+    from sports.baseball.analytics.backtest import team_states_before
+
+    game = await client.fetch_game(game_pk)
+    if not game:
+        raise HTTPException(status_code=404, detail=f"Game {game_pk} not found")
+    season = game.date.year
+    games = await client.fetch_schedule_range(date(season, 3, 1), game.date.date() + timedelta(days=1))
+    states = team_states_before(games, game.date)
+    home_state = states.get(game.home_team_id, TeamState())
+    away_state = states.get(game.away_team_id, TeamState())
+    pred = predict_game(home_state, away_state, home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher)
+    return {
+        "ok": True,
+        "game": {
+            "id": game.id, "date": game.date.isoformat(),
+            "home_team": game.home_team, "away_team": game.away_team,
+            "home_team_id": game.home_team_id, "away_team_id": game.away_team_id,
+            "home_pitcher": game.home_pitcher, "away_pitcher": game.away_pitcher,
+            "venue": game.venue, "status": game.status,
+            "home_score": game.home_score, "away_score": game.away_score,
+        },
+        "season": season,
+        **pred,
+    }
+
+
+@router.get("/backtest")
+async def backtest(season: int = 2023, min_games: int = 15, calibrate: bool = True):
+    """Leak-free, walk-forward backtest of the model over a full season — Brier /
+    log loss / reliability / accuracy, Brier-skill vs the home-base-rate baseline,
+    and a Platt calibration report. The go/no-go signal is whether Brier skill > 0
+    (does the model beat just predicting the home base rate)."""
+    from sports.baseball.analytics.backtest import run_backtest as _run
+
+    games = await client.fetch_schedule_range(date(season, 3, 1), date(season, 11, 1))
+    result = _run(games, min_games=min_games, calibrate=calibrate)
+    skill = result.get("brier_skill_score", 0.0)
+    result["gate"] = {
+        "beats_base_rate": bool(skill > 0),
+        "brier_skill_score": skill,
+        "verdict": (
+            "Model beats the home base rate out-of-sample (positive Brier skill)."
+            if skill > 0 else
+            "Model ranks teams (accuracy > base rate) but does not yet beat base-rate "
+            "probability precision — the starting-pitcher lever is the next step."
+        ),
+    }
+    return {"ok": True, "season": season, **result}
+
+
 @router.post("/refresh")
 async def refresh():
     await client.refresh()

@@ -40,6 +40,18 @@ def _finished(games) -> list:
     return sorted(out, key=lambda g: g.date)
 
 
+def team_states_before(games, before) -> dict[int, TeamState]:
+    """Build each team's running state from only the games played strictly before
+    ``before`` (leak-free) — used to produce a live/pre-game analysis for a match."""
+    states: dict[int, TeamState] = {}
+    for g in _finished(games):
+        if g.date >= before:
+            break
+        states.setdefault(g.home_team_id, TeamState()).record_game(g.home_score, g.away_score)
+        states.setdefault(g.away_team_id, TeamState()).record_game(g.away_score, g.home_score)
+    return states
+
+
 def run_backtest(games, *, min_games: int = 10, calibrate: bool = True, calibration_fraction: float = 0.4) -> dict:
     finished = _finished(games)
     states: dict[int, TeamState] = {}
