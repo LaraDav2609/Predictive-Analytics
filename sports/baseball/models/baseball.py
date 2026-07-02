@@ -38,6 +38,8 @@ class MLBGame(BaseModel):
     away_score: Optional[int] = None
     home_pitcher: Optional[str] = None
     away_pitcher: Optional[str] = None
+    home_pitcher_id: Optional[int] = None
+    away_pitcher_id: Optional[int] = None
     prediction: Optional["MLBPrediction"] = None
 
 

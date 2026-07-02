@@ -33,6 +33,28 @@ def test_components_sum_to_probability():
     assert out["leak_free"] is True
 
 
+def test_pitcher_era_shifts_probability():
+    home = TeamState(runs_for=400, runs_against=400, wins=40, losses=40)
+    away = TeamState(runs_for=400, runs_against=400, wins=40, losses=40)   # even teams
+    # home starter much better (lower ERA) -> favours home
+    out = predict_game(home, away, home_pitcher_era=2.80, away_pitcher_era=5.20, min_games=10)
+    sp = out["components"]["starting_pitcher"]
+    assert sp["modeled"] is True
+    assert sp["contribution"] > 0                      # better home starter helps home
+    assert sp["home_prior_era"] == 2.80
+    # symmetric: worse home starter hurts home
+    out2 = predict_game(home, away, home_pitcher_era=5.20, away_pitcher_era=2.80, min_games=10)
+    assert out2["components"]["starting_pitcher"]["contribution"] < 0
+
+
+def test_pitcher_neutral_when_era_missing():
+    out = predict_game(TeamState(wins=40, losses=40, runs_for=400, runs_against=400),
+                       TeamState(wins=40, losses=40, runs_for=400, runs_against=400),
+                       home_pitcher_era=3.0, away_pitcher_era=None, min_games=10)
+    sp = out["components"]["starting_pitcher"]
+    assert sp["modeled"] is False and sp["contribution"] == 0.0
+
+
 def test_confidence_zero_without_history():
     out = predict_game(TeamState(), TeamState(), min_games=10)
     assert out["confidence"] == 0.0

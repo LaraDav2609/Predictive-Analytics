@@ -52,7 +52,8 @@ def team_states_before(games, before) -> dict[int, TeamState]:
     return states
 
 
-def run_backtest(games, *, min_games: int = 10, calibrate: bool = True, calibration_fraction: float = 0.4) -> dict:
+def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
+                 calibration_fraction: float = 0.4, pitcher_era: dict | None = None) -> dict:
     finished = _finished(games)
     states: dict[int, TeamState] = {}
     records: list[BacktestRecord] = []
@@ -60,7 +61,10 @@ def run_backtest(games, *, min_games: int = 10, calibrate: bool = True, calibrat
     for g in finished:
         home = states.setdefault(g.home_team_id, TeamState())
         away = states.setdefault(g.away_team_id, TeamState())
-        pred = predict_game(home, away, home_pitcher=g.home_pitcher, away_pitcher=g.away_pitcher, min_games=min_games)
+        h_era = pitcher_era.get(g.home_pitcher_id) if pitcher_era else None
+        a_era = pitcher_era.get(g.away_pitcher_id) if pitcher_era else None
+        pred = predict_game(home, away, home_pitcher=g.home_pitcher, away_pitcher=g.away_pitcher,
+                            home_pitcher_era=h_era, away_pitcher_era=a_era, min_games=min_games)
         if pred["leak_free"]:
             actual = 1.0 if g.home_score > g.away_score else 0.0
             records.append(BacktestRecord(

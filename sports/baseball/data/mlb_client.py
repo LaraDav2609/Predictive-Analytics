@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://statsapi.mlb.com/api/v1"
 
 
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class MLBClient(SportsDataClient):
     def __init__(self):
         self._client = make_async_client(base_url=BASE_URL, timeout=30.0)
@@ -141,6 +148,8 @@ class MLBClient(SportsDataClient):
 
                 home_pitcher = home.get("probablePitcher", {}).get("fullName")
                 away_pitcher = away.get("probablePitcher", {}).get("fullName")
+                home_pitcher_id = home.get("probablePitcher", {}).get("id")
+                away_pitcher_id = away.get("probablePitcher", {}).get("id")
 
                 games.append(MLBGame(
                     id=g.get("gamePk", 0),
@@ -157,8 +166,42 @@ class MLBClient(SportsDataClient):
                     away_score=away.get("score"),
                     home_pitcher=home_pitcher,
                     away_pitcher=away_pitcher,
+                    home_pitcher_id=home_pitcher_id,
+                    away_pitcher_id=away_pitcher_id,
                 ))
         return games
+
+    async def fetch_pitching_season_stats(self, season: int) -> dict[int, dict]:
+        """Bulk per-pitcher season pitching stats for a season, keyed by player id
+        ({id: {"era": float, "fip"?: float, "ip": float}}). One request — used to
+        rate starting pitchers by their PRIOR season (leak-free for a backtest)."""
+        try:
+            resp = await self._client.get("/stats", params={
+                "stats": "season", "group": "pitching", "sportId": 1,
+                "season": season, "limit": 2000, "playerPool": "all",
+            })
+            resp.raise_for_status()
+            out: dict[int, dict] = {}
+            for block in resp.json().get("stats", []) or []:
+                for split in block.get("splits", []) or []:
+                    pid = (split.get("player") or {}).get("id")
+                    stat = split.get("stat") or {}
+                    if pid is None:
+                        continue
+                    try:
+                        era = float(stat.get("era"))
+                    except (TypeError, ValueError):
+                        continue
+                    out[int(pid)] = {
+                        "era": era,
+                        "ip": _safe_float(stat.get("inningsPitched")),
+                        "whip": _safe_float(stat.get("whip")),
+                        "strikeouts": _safe_float(stat.get("strikeOuts")),
+                    }
+            return out
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch MLB pitching season stats %s: %s", season, e)
+            return {}
 
     async def fetch_game(self, game_pk: int) -> Optional[MLBGame]:
         """Fetch a single game by gamePk."""

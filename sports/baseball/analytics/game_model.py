@@ -22,6 +22,8 @@ HOME_FIELD_EDGE = 0.035
 PYTHAG_EXP = 1.83          # Pythagenpat-ish exponent for run-based win expectancy
 FORM_WEIGHT = 0.08         # how much a full last-10 gap swings the probability
 FORM_CAP = 0.05
+PITCHER_WEIGHT = 0.020     # per run of prior-season ERA gap between the starters
+PITCHER_CAP = 0.06
 PROB_FLOOR, PROB_CEIL = 0.05, 0.95
 
 
@@ -74,6 +76,8 @@ def predict_game(
     *,
     home_pitcher: str | None = None,
     away_pitcher: str | None = None,
+    home_pitcher_era: float | None = None,
+    away_pitcher_era: float | None = None,
     min_games: int = 10,
 ) -> dict[str, Any]:
     """Home win probability + its additive component breakdown.
@@ -86,7 +90,12 @@ def predict_game(
     strength = log5(h_pyth, a_pyth) - 0.5                       # matchup lean vs coin flip
     form = _clamp((home.last10_pct() - away.last10_pct()) * FORM_WEIGHT, -FORM_CAP, FORM_CAP)
     home_field = HOME_FIELD_EDGE
-    pitcher = 0.0                                               # neutral until SP model is wired
+    # Starting pitcher: prior-season ERA gap (lower ERA is better → favours that team).
+    pitcher = 0.0
+    pitcher_modeled = False
+    if home_pitcher_era is not None and away_pitcher_era is not None:
+        pitcher = _clamp((float(away_pitcher_era) - float(home_pitcher_era)) * PITCHER_WEIGHT, -PITCHER_CAP, PITCHER_CAP)
+        pitcher_modeled = True
 
     raw = 0.5 + strength + home_field + form + pitcher
     home_win_prob = _clamp(raw, PROB_FLOOR, PROB_CEIL)
@@ -115,10 +124,13 @@ def predict_game(
         },
         "starting_pitcher": {
             "contribution": round(pitcher, 4),
-            "modeled": False,
+            "modeled": pitcher_modeled,
             "home": home_pitcher,
             "away": away_pitcher,
-            "detail": "Not yet modeled — needs starting-pitcher projections (the biggest missing lever)",
+            "home_prior_era": round(float(home_pitcher_era), 2) if home_pitcher_era is not None else None,
+            "away_prior_era": round(float(away_pitcher_era), 2) if away_pitcher_era is not None else None,
+            "detail": ("Prior-season ERA gap (lower is better favours that team)" if pitcher_modeled
+                       else "No reliable prior-season ERA for one starter — neutral"),
         },
     }
     return {

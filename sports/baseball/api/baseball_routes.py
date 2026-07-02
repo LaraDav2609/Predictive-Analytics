@@ -19,6 +19,22 @@ def init(mc: MLBClient, bp: BaseballPredictor):
     client, predictor = mc, bp
 
 
+_era_cache: dict[int, dict[int, float]] = {}
+
+
+async def _prior_season_era_map(season: int, min_ip: float = 20.0) -> dict[int, float]:
+    """Prior-season starter ERA keyed by player id — leak-free for ``season`` (the
+    previous season is fully known before this one starts). Filtered to >= min_ip
+    innings so tiny relief samples don't add noise. Cached per season."""
+    prior = int(season) - 1
+    if prior in _era_cache:
+        return _era_cache[prior]
+    raw = await client.fetch_pitching_season_stats(prior)
+    era_map = {pid: s["era"] for pid, s in raw.items() if s.get("ip") and s["ip"] >= min_ip}
+    _era_cache[prior] = era_map
+    return era_map
+
+
 @router.get("/teams")
 async def get_teams():
     teams = client.get_teams()
@@ -80,7 +96,12 @@ async def game_analysis(game_pk: int):
     states = team_states_before(games, game.date)
     home_state = states.get(game.home_team_id, TeamState())
     away_state = states.get(game.away_team_id, TeamState())
-    pred = predict_game(home_state, away_state, home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher)
+    era_map = await _prior_season_era_map(season)
+    pred = predict_game(
+        home_state, away_state,
+        home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher,
+        home_pitcher_era=era_map.get(game.home_pitcher_id), away_pitcher_era=era_map.get(game.away_pitcher_id),
+    )
     return {
         "ok": True,
         "game": {
@@ -105,7 +126,10 @@ async def backtest(season: int = 2023, min_games: int = 15, calibrate: bool = Tr
     from sports.baseball.analytics.backtest import run_backtest as _run
 
     games = await client.fetch_schedule_range(date(season, 3, 1), date(season, 11, 1))
-    result = _run(games, min_games=min_games, calibrate=calibrate)
+    era_map = await _prior_season_era_map(season)               # prior season = leak-free
+    result = _run(games, min_games=min_games, calibrate=calibrate, pitcher_era=era_map)
+    result["pitcher_prior_season"] = season - 1
+    result["pitchers_rated"] = len(era_map)
     skill = result.get("brier_skill_score", 0.0)
     result["gate"] = {
         "beats_base_rate": bool(skill > 0),
