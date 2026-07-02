@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import httpx
 
+from common.data.http import make_async_client
 from sports.baseball.models.baseball import (
     MLBHistoricalPlayerProfile,
     MLBHistoricalPlayerStats,
@@ -24,7 +25,7 @@ class MLBHistoricalClient:
     """Fetches historical team and player data from the MLB Stats API."""
 
     def __init__(self):
-        self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=30.0)
+        self._client = make_async_client(base_url=BASE_URL, timeout=30.0)
 
     async def get_team_history(
         self,

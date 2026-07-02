@@ -6,6 +6,7 @@ from typing import Optional
 
 import httpx
 
+from common.data.http import make_async_client
 from common.data.base_client import SportsDataClient
 from common.models.sport import Sport, Competition
 from sports.baseball.models.baseball import MLBTeam, MLBGame, MLBStanding
@@ -17,7 +18,7 @@ BASE_URL = "https://statsapi.mlb.com/api/v1"
 
 class MLBClient(SportsDataClient):
     def __init__(self):
-        self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=30.0)
+        self._client = make_async_client(base_url=BASE_URL, timeout=30.0)
         self._teams: list[MLBTeam] = []
         self._standings: list[MLBStanding] = []
         self._schedule: list[MLBGame] = []
