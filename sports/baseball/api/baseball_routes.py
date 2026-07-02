@@ -62,6 +62,73 @@ async def _pitcher_rating_fn(season: int, games):
     return _rate, len(logs)
 
 
+def _apply_serve_calibration(pred: dict) -> dict:
+    """Apply the enabled serve calibrator to a prediction dict IN PLACE. Keeps the
+    additive waterfall honest: the named components still sum to the raw model
+    probability, and calibration is surfaced as a final ``calibration`` component
+    (adjustment = calibrated − model) plus a top-level ``calibration`` block. When
+    no calibrator is enabled the numbers are untouched (applied=False)."""
+    from sports.baseball.analytics.serve_calibration import calibrate
+
+    raw = pred["home_win_prob"]
+    cal = calibrate(raw)
+    pred["calibration"] = cal
+    pred["home_win_prob_model"] = round(raw, 4)
+    if cal["applied"]:
+        pred["home_win_prob"] = cal["value"]
+        pred["away_win_prob"] = round(1.0 - cal["value"], 4)
+        pred.setdefault("components", {})["calibration"] = {
+            "contribution": cal["delta"],
+            "applied": True,
+            "method": cal["method"],
+            "detail": "Platt calibration fit on past seasons — nudges the raw model "
+                      "toward historically accurate probabilities",
+        }
+    return pred
+
+
+@router.get("/calibration")
+async def get_calibration():
+    """Current serve-calibrator state (params, provenance, enabled flag)."""
+    from sports.baseball.analytics.serve_calibration import state
+    return {"ok": True, **state()}
+
+
+@router.post("/calibration/fit")
+async def fit_calibration(season: int = 2023, min_games: int = 15, enable: bool = False):
+    """Fit a Platt serve-calibrator on a full season (leak-free walk-forward
+    predictions), persist it, and optionally enable it. Returns the fit summary
+    incl. an honest earlier-window→later-window holdout check."""
+    from sports.baseball.analytics.backtest import fit_serve_calibrator
+    from sports.baseball.analytics.serve_calibration import save
+
+    games = await client.fetch_schedule_range(date(season, 3, 1), date(season, 11, 1))
+    rate, rated = await _pitcher_rating_fn(season, games)
+    fit = fit_serve_calibrator(games, min_games=min_games, rate_pitcher=rate)
+    if not fit.get("fitted"):
+        return {"ok": False, **fit}
+    artifact = {
+        "method": fit["method"],
+        "params": fit["params"],
+        "enabled": bool(enable),
+        "fit_season": season,
+        "fit_n": fit["n"],
+        "pitchers_rated": rated,
+        "fit_brier_raw": fit["fit_brier_raw"],
+        "fit_brier_cal": fit["fit_brier_cal"],
+        "holdout": fit.get("holdout"),
+    }
+    state = save(artifact)
+    return {"ok": True, "fit": fit, "state": state}
+
+
+@router.post("/calibration/enable")
+async def enable_calibration(on: bool = True):
+    """Enable/disable the fitted serve-calibrator without refitting."""
+    from sports.baseball.analytics.serve_calibration import set_enabled
+    return {"ok": True, **set_enabled(on)}
+
+
 @router.get("/teams")
 async def get_teams():
     teams = client.get_teams()
@@ -134,6 +201,7 @@ async def game_analysis(game_pk: int):
         home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher,
         home_pitcher_era=h_rating, away_pitcher_era=a_rating,
     )
+    _apply_serve_calibration(pred)
     return {
         "ok": True,
         "game": {
@@ -180,10 +248,12 @@ async def backtest(season: int = 2023, min_games: int = 15, calibrate: bool = Tr
 async def pipeline_health():
     """Data-source + model health for the baseball pipeline monitor (mirrors the F1
     pipeline monitor). All sources are free."""
+    from sports.baseball.analytics.serve_calibration import state as calib_state
     teams = client.get_teams()
     standings = client.get_standings()
     schedule = client.get_schedule()
     reachable = len(teams) > 0
+    calib = calib_state()
 
     sources = [
         {
@@ -203,19 +273,27 @@ async def pipeline_health():
         "sources": sources,
         "counts": {"teams": len(teams), "standings": len(standings), "scheduled_games": len(schedule)},
         "model": {
-            "version": "mlb-decomp-v1",
+            "version": "mlb-decomp-v2",
             "components": [
                 {"name": "team_strength", "modeled": True},
                 {"name": "home_field", "modeled": True},
                 {"name": "recent_form", "modeled": True},
-                {"name": "starting_pitcher", "modeled": False},
+                {"name": "starting_pitcher", "modeled": True},
             ],
-            "calibration": "Platt (fit in backtest; not yet applied at serve)",
+            "calibration": (
+                f"Platt applied at serve (fit {calib.get('fit_season')}, n={calib.get('fit_n')})"
+                if calib.get("enabled") else
+                "Platt fitted but disabled at serve" if calib.get("fitted") else
+                "Platt available in backtest; not yet fitted for serve"
+            ),
+            "calibrator": calib,
         },
         "backtest": {"available": True, "endpoint": "/api/baseball/backtest", "kind": "leak-free walk-forward"},
         "notes": [
             "Data is free and real-time (MLB StatsAPI); no paid feed required.",
-            "Model ranks teams (accuracy > base rate) but Brier skill ~0 — the starting-pitcher model is the next lever.",
+            "Starting pitcher now modeled via within-season FIP (shrunk toward prior-season ERA).",
+            ("Serve probabilities are Platt-calibrated." if calib.get("enabled")
+             else "Fit a serve calibrator via POST /api/baseball/calibration/fit?enable=true."),
         ],
     }
 

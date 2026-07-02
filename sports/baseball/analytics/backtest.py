@@ -52,11 +52,11 @@ def team_states_before(games, before) -> dict[int, TeamState]:
     return states
 
 
-def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
-                 calibration_fraction: float = 0.4, pitcher_era: dict | None = None,
-                 rate_pitcher=None) -> dict:
-    """``rate_pitcher(pitcher_id, game_date) -> float | None`` supplies a date-aware
-    (leak-free) starter rating; ``pitcher_era`` is the static per-id fallback."""
+def replay(games, *, min_games: int = 10, pitcher_era: dict | None = None,
+           rate_pitcher=None) -> list[BacktestRecord]:
+    """Leak-free date-ordered replay → the scored per-game records. Shared by the
+    backtest metrics and the serve-calibrator fit so both see the exact same
+    (probability, outcome) pairs from a prior-only ``TeamState``."""
     finished = _finished(games)
     states: dict[int, TeamState] = {}
     records: list[BacktestRecord] = []
@@ -83,8 +83,45 @@ def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
             ))
         home.record_game(g.home_score, g.away_score)
         away.record_game(g.away_score, g.home_score)
+    return records
 
+
+def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
+                 calibration_fraction: float = 0.4, pitcher_era: dict | None = None,
+                 rate_pitcher=None) -> dict:
+    """``rate_pitcher(pitcher_id, game_date) -> float | None`` supplies a date-aware
+    (leak-free) starter rating; ``pitcher_era`` is the static per-id fallback."""
+    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher)
     return _metrics(records, calibrate, calibration_fraction)
+
+
+def fit_serve_calibrator(games, *, min_games: int = 10, pitcher_era: dict | None = None,
+                         rate_pitcher=None, holdout_fraction: float = 0.4) -> dict:
+    """Fit a Platt scaler for use at SERVE time. Two reads come back:
+
+    - ``params`` (a, b) fit on ALL scored games in the range — the calibrator we
+      actually deploy (use every past game to calibrate the next one).
+    - ``holdout`` — an honest earlier-window-fit / later-window-score check proving
+      the calibration helps out-of-sample before we enable it.
+    """
+    from common.ml.calibration import PlattScaler
+
+    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher)
+    n = len(records)
+    if n < 50:
+        return {"fitted": False, "reason": f"need >=50 scored games, have {n}"}
+    p = np.array([r.prob_home for r in records]); y = np.array([r.actual for r in records])
+    scaler = PlattScaler().fit(p, y)
+    fit_brier_raw = brier_score(p, y)
+    fit_brier_cal = brier_score(scaler.transform(p), y)
+    return {
+        "fitted": True, "method": "platt",
+        "params": {"a": round(scaler.a, 6), "b": round(scaler.b, 6)},
+        "n": n,
+        "fit_brier_raw": round(float(fit_brier_raw), 4),
+        "fit_brier_cal": round(float(fit_brier_cal), 4),
+        "holdout": _calibration_report(records, holdout_fraction),
+    }
 
 
 def _row(r: BacktestRecord) -> dict:
@@ -165,11 +202,13 @@ def _calibration_report(records: list[BacktestRecord], fraction: float) -> dict:
     tp = np.array([r.prob_home for r in train]); ty = np.array([r.actual for r in train])
     hp = np.array([r.prob_home for r in holdout]); hy = np.array([r.actual for r in holdout])
     try:
-        calibrated = PlattScaler().fit(tp, ty).transform(hp)
+        scaler = PlattScaler().fit(tp, ty)
+        calibrated = scaler.transform(hp)
     except Exception as exc:
         return {"available": False, "reason": f"fit failed: {exc}"}
     return {
         "available": True, "method": "platt", "train_n": len(train), "holdout_n": len(holdout),
+        "params": {"a": round(scaler.a, 6), "b": round(scaler.b, 6)},
         "raw": {"brier": round(brier_score(hp, hy), 4), "log_loss": round(log_loss(hp, hy), 4)},
         "calibrated": {"brier": round(brier_score(calibrated, hy), 4), "log_loss": round(log_loss(calibrated, hy), 4)},
     }
