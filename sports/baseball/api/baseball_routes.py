@@ -62,6 +62,99 @@ async def _pitcher_rating_fn(season: int, games):
     return _rate, len(logs)
 
 
+# Per-pitcher game-log cache for the live schedule path (only the day's starters,
+# not the whole season) — keyed by (season, pitcher_id).
+_pitcher_log_cache: dict[tuple[int, int], list] = {}
+
+
+async def _rate_fn_for_starters(season: int, ids):
+    """Leak-free within-season FIP rating for a small set of scheduled starters.
+    Fetches only the uncached ids, concurrently, so enriching today's slate stays
+    fast (vs. the season-wide fetch used by the backtest)."""
+    import asyncio
+    from sports.baseball.analytics.pitcher_form import fetch_pitcher_logs, rating_asof
+
+    prior = await _prior_season_era_map(season)
+    need = [int(p) for p in ids if p and (season, int(p)) not in _pitcher_log_cache]
+    if need:
+        fetched = await asyncio.gather(
+            *[fetch_pitcher_logs(client, {pid}, season) for pid in need],
+            return_exceptions=True,
+        )
+        for pid, res in zip(need, fetched):
+            _pitcher_log_cache[(season, pid)] = res.get(pid, []) if isinstance(res, dict) else []
+
+    def _rate(pitcher_id, game_date):
+        if not pitcher_id:
+            return None
+        pid = int(pitcher_id)
+        return rating_asof(_pitcher_log_cache.get((season, pid), []), game_date, prior.get(pid))
+
+    return _rate
+
+
+def _team_state_from_standing(standing):
+    """A ``TeamState`` from current standings — exact season-to-date W/L + run
+    differential (so Pythagorean strength is exact) and the last-10 record. Avoids a
+    full season replay for the live schedule/games serve path."""
+    from sports.baseball.analytics.game_model import TeamState
+
+    games = standing.wins + standing.losses
+    rf = ra = 0.0
+    if games > 0:
+        avg = 4.5                                   # league runs/game; diff is exact
+        per = standing.run_differential / (2.0 * games)
+        rf, ra = (avg + per) * games, (avg - per) * games
+    last10: list[int] = []
+    if standing.last_10 and "-" in standing.last_10:
+        try:
+            w, l = standing.last_10.split("-")
+            last10 = [1] * int(w) + [0] * int(l)
+        except ValueError:
+            last10 = []
+    return TeamState(runs_for=rf, runs_against=ra, wins=standing.wins,
+                     losses=standing.losses, last10=last10)
+
+
+async def _enrich_predictions(games):
+    """Overlay the decomposable model (team strength + FIP starter form) and the
+    enabled serve model (trained blend / Platt calibration) onto scheduled/live games,
+    so the Games list AND the betting-edge engine both consume the model that beats
+    the base rate — not the legacy win-pct heuristic. Best-effort: on any data hiccup
+    the original heuristic prediction is left in place."""
+    from sports.baseball.analytics.game_model import TeamState, predict_game
+    from sports.baseball.models.baseball import MLBPrediction
+
+    upcoming = [g for g in games if g.status in ("SCHEDULED", "LIVE")]
+    if not upcoming or client is None:
+        return games
+    standings = {s.team_id: s for s in client.get_standings()}
+    if not standings:
+        return games
+    season = max(g.date.year for g in upcoming)
+    ids = {i for g in upcoming for i in (g.home_pitcher_id, g.away_pitcher_id) if i}
+    try:
+        rate = await _rate_fn_for_starters(season, ids)
+    except Exception:
+        def rate(_pid, _d):
+            return None
+
+    for g in upcoming:
+        hs = _team_state_from_standing(standings[g.home_team_id]) if g.home_team_id in standings else TeamState()
+        as_ = _team_state_from_standing(standings[g.away_team_id]) if g.away_team_id in standings else TeamState()
+        pred = predict_game(
+            hs, as_, home_pitcher=g.home_pitcher, away_pitcher=g.away_pitcher,
+            home_pitcher_era=rate(g.home_pitcher_id, g.date),
+            away_pitcher_era=rate(g.away_pitcher_id, g.date),
+        )
+        _apply_serve_adjustment(pred)
+        g.prediction = MLBPrediction(
+            home_win_prob=pred["home_win_prob"], away_win_prob=pred["away_win_prob"],
+            confidence=pred["confidence"], model_version=pred.get("model_version", "mlb-decomp-v2"),
+        )
+    return games
+
+
 def _apply_serve_adjustment(pred: dict) -> dict:
     """Apply the best available serve model to a prediction IN PLACE.
 
@@ -214,6 +307,7 @@ async def get_schedule(
         games = client.get_schedule()
     if predictor:
         games = predictor.predict_games(games)
+    games = await _enrich_predictions(games)     # upgrade to decomp + FIP + serve model
     return {
         "ok": True,
         "games": [g.model_dump(mode="json") for g in games],
@@ -230,6 +324,7 @@ async def get_game(game_pk: int):
     games = [game]
     if predictor:
         games = predictor.predict_games(games)
+    games = await _enrich_predictions(games)     # same model the analysis panel serves
     return {"ok": True, "game": games[0].model_dump(mode="json")}
 
 
