@@ -127,10 +127,10 @@ def predict_game(
             "modeled": pitcher_modeled,
             "home": home_pitcher,
             "away": away_pitcher,
-            "home_prior_era": round(float(home_pitcher_era), 2) if home_pitcher_era is not None else None,
-            "away_prior_era": round(float(away_pitcher_era), 2) if away_pitcher_era is not None else None,
-            "detail": ("Prior-season ERA gap (lower is better favours that team)" if pitcher_modeled
-                       else "No reliable prior-season ERA for one starter — neutral"),
+            "home_rating": round(float(home_pitcher_era), 2) if home_pitcher_era is not None else None,
+            "away_rating": round(float(away_pitcher_era), 2) if away_pitcher_era is not None else None,
+            "detail": ("Starter form (FIP-scale, lower is better) — the better starter favours that team" if pitcher_modeled
+                       else "No reliable starter form for one side — neutral"),
         },
     }
     return {

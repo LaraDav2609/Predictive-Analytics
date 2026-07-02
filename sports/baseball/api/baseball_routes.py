@@ -20,6 +20,7 @@ def init(mc: MLBClient, bp: BaseballPredictor):
 
 
 _era_cache: dict[int, dict[int, float]] = {}
+_logs_cache: dict[int, dict[int, list]] = {}
 
 
 async def _prior_season_era_map(season: int, min_ip: float = 20.0) -> dict[int, float]:
@@ -33,6 +34,32 @@ async def _prior_season_era_map(season: int, min_ip: float = 20.0) -> dict[int, 
     era_map = {pid: s["era"] for pid, s in raw.items() if s.get("ip") and s["ip"] >= min_ip}
     _era_cache[prior] = era_map
     return era_map
+
+
+async def _season_pitcher_logs(season: int, games) -> dict[int, list]:
+    """All starters' game logs for a season, keyed by id (cached). ~one StatsAPI
+    call per starter; the whole map is built once per season."""
+    if season in _logs_cache:
+        return _logs_cache[season]
+    from sports.baseball.analytics.pitcher_form import fetch_pitcher_logs, starter_ids
+    logs = await fetch_pitcher_logs(client, starter_ids(games), season)
+    _logs_cache[season] = logs
+    return logs
+
+
+async def _pitcher_rating_fn(season: int, games):
+    """Return a leak-free ``rate(pitcher_id, game_date) -> float | None`` using
+    within-season FIP form regressed toward the pitcher's prior-season ERA."""
+    from sports.baseball.analytics.pitcher_form import rating_asof
+    prior = await _prior_season_era_map(season)
+    logs = await _season_pitcher_logs(season, games)
+
+    def _rate(pitcher_id, game_date):
+        if not pitcher_id:
+            return None
+        return rating_asof(logs.get(int(pitcher_id)), game_date, prior.get(int(pitcher_id)))
+
+    return _rate, len(logs)
 
 
 @router.get("/teams")
@@ -96,11 +123,16 @@ async def game_analysis(game_pk: int):
     states = team_states_before(games, game.date)
     home_state = states.get(game.home_team_id, TeamState())
     away_state = states.get(game.away_team_id, TeamState())
-    era_map = await _prior_season_era_map(season)
+    from sports.baseball.analytics.pitcher_form import fetch_pitcher_logs, rating_asof
+    prior = await _prior_season_era_map(season)
+    ids = {i for i in (game.home_pitcher_id, game.away_pitcher_id) if i}
+    logs = await fetch_pitcher_logs(client, ids, season)
+    h_rating = rating_asof(logs.get(game.home_pitcher_id), game.date, prior.get(game.home_pitcher_id)) if game.home_pitcher_id else None
+    a_rating = rating_asof(logs.get(game.away_pitcher_id), game.date, prior.get(game.away_pitcher_id)) if game.away_pitcher_id else None
     pred = predict_game(
         home_state, away_state,
         home_pitcher=game.home_pitcher, away_pitcher=game.away_pitcher,
-        home_pitcher_era=era_map.get(game.home_pitcher_id), away_pitcher_era=era_map.get(game.away_pitcher_id),
+        home_pitcher_era=h_rating, away_pitcher_era=a_rating,
     )
     return {
         "ok": True,
@@ -126,10 +158,10 @@ async def backtest(season: int = 2023, min_games: int = 15, calibrate: bool = Tr
     from sports.baseball.analytics.backtest import run_backtest as _run
 
     games = await client.fetch_schedule_range(date(season, 3, 1), date(season, 11, 1))
-    era_map = await _prior_season_era_map(season)               # prior season = leak-free
-    result = _run(games, min_games=min_games, calibrate=calibrate, pitcher_era=era_map)
-    result["pitcher_prior_season"] = season - 1
-    result["pitchers_rated"] = len(era_map)
+    rate, rated = await _pitcher_rating_fn(season, games)       # leak-free within-season FIP
+    result = _run(games, min_games=min_games, calibrate=calibrate, rate_pitcher=rate)
+    result["pitcher_signal"] = "within-season FIP (shrunk toward prior-season ERA)"
+    result["pitchers_rated"] = rated
     skill = result.get("brier_skill_score", 0.0)
     result["gate"] = {
         "beats_base_rate": bool(skill > 0),

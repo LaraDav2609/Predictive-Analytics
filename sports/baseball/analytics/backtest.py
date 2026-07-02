@@ -53,7 +53,10 @@ def team_states_before(games, before) -> dict[int, TeamState]:
 
 
 def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
-                 calibration_fraction: float = 0.4, pitcher_era: dict | None = None) -> dict:
+                 calibration_fraction: float = 0.4, pitcher_era: dict | None = None,
+                 rate_pitcher=None) -> dict:
+    """``rate_pitcher(pitcher_id, game_date) -> float | None`` supplies a date-aware
+    (leak-free) starter rating; ``pitcher_era`` is the static per-id fallback."""
     finished = _finished(games)
     states: dict[int, TeamState] = {}
     records: list[BacktestRecord] = []
@@ -61,8 +64,14 @@ def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
     for g in finished:
         home = states.setdefault(g.home_team_id, TeamState())
         away = states.setdefault(g.away_team_id, TeamState())
-        h_era = pitcher_era.get(g.home_pitcher_id) if pitcher_era else None
-        a_era = pitcher_era.get(g.away_pitcher_id) if pitcher_era else None
+        if rate_pitcher is not None:
+            h_era = rate_pitcher(g.home_pitcher_id, g.date)
+            a_era = rate_pitcher(g.away_pitcher_id, g.date)
+        elif pitcher_era:
+            h_era = pitcher_era.get(g.home_pitcher_id)
+            a_era = pitcher_era.get(g.away_pitcher_id)
+        else:
+            h_era = a_era = None
         pred = predict_game(home, away, home_pitcher=g.home_pitcher, away_pitcher=g.away_pitcher,
                             home_pitcher_era=h_era, away_pitcher_era=a_era, min_games=min_games)
         if pred["leak_free"]:

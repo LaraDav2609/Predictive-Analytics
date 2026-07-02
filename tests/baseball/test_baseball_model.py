@@ -41,7 +41,7 @@ def test_pitcher_era_shifts_probability():
     sp = out["components"]["starting_pitcher"]
     assert sp["modeled"] is True
     assert sp["contribution"] > 0                      # better home starter helps home
-    assert sp["home_prior_era"] == 2.80
+    assert sp["home_rating"] == 2.80
     # symmetric: worse home starter hurts home
     out2 = predict_game(home, away, home_pitcher_era=5.20, away_pitcher_era=2.80, min_games=10)
     assert out2["components"]["starting_pitcher"]["contribution"] < 0
