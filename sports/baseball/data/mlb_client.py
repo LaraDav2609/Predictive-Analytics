@@ -223,6 +223,12 @@ class MLBClient(SportsDataClient):
         try:
             resp = await self._client.get("/schedule", params={
                 "sportId": 1,
+                # Regular season + all postseason rounds only. Without this the
+                # StatsAPI /schedule returns Spring Training (S), exhibition (E)
+                # and All-Star (A) games too; when the leak-free replay window
+                # opens March 1 that inflates team win/loss records (and the
+                # backtest) with ~3 weeks of pre-season exhibition games.
+                "gameType": "R,F,D,L,W",
                 "startDate": start_date.isoformat(),
                 "endDate": end_date.isoformat(),
                 "hydrate": "probablePitcher,team",
