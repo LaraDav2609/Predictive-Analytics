@@ -21,7 +21,19 @@ import os
 import threading
 from typing import Optional
 
-FEATURE_ORDER = ["strength", "form_gap", "pitcher_gap", "pitcher_present"]
+# Raw signals the blend learns weights over. The original four are always present; the
+# run-environment and schedule-fatigue signals are appended so the blend CAN learn them
+# when a fit is run with those overlays on. They are 0 / neutral in the feature vector
+# when their overlay is absent, and any deployed artifact whose ``coef`` predates them
+# simply gets a 0 weight for the new keys (``apply_blend`` defaults missing coefs to 0),
+# so extending this list is backward-compatible with the currently enabled artifact.
+FEATURE_ORDER = [
+    "strength", "form_gap", "pitcher_gap", "pitcher_present",
+    "run_env_index", "wind_out_mph", "env_present",
+    "rest_gap", "density_gap", "fatigue_present",
+    "bullpen_gap", "bullpen_present",
+    "lineup_gap", "lineup_present",
+]
 
 _ARTIFACT_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "artifacts", "baseball_blend.json")

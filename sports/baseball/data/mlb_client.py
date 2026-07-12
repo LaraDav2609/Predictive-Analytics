@@ -203,6 +203,38 @@ class MLBClient(SportsDataClient):
             logger.warning("Failed to fetch MLB pitching season stats %s: %s", season, e)
             return {}
 
+    async def fetch_hitting_season_stats(self, season: int) -> dict[int, dict]:
+        """Bulk per-batter season hitting stats for a season, keyed by player id
+        ({id: {"obp", "slg", "ops", "pa", "woba"?}}). One request — the hitting analog of
+        ``fetch_pitching_season_stats``, used to anchor each batter's quality by their
+        PRIOR season (leak-free for a backtest). Note the public StatsAPI does NOT expose
+        a ``woba`` field, so it is ``None`` here and callers derive a wOBA-scale proxy from
+        OBP/SLG; the field is kept so a future feed that has it drops straight in."""
+        try:
+            resp = await self._client.get("/stats", params={
+                "stats": "season", "group": "hitting", "sportId": 1,
+                "season": season, "limit": 3000, "playerPool": "all",
+            })
+            resp.raise_for_status()
+            out: dict[int, dict] = {}
+            for block in resp.json().get("stats", []) or []:
+                for split in block.get("splits", []) or []:
+                    pid = (split.get("player") or {}).get("id")
+                    stat = split.get("stat") or {}
+                    if pid is None:
+                        continue
+                    out[int(pid)] = {
+                        "obp": _safe_float(stat.get("obp")),
+                        "slg": _safe_float(stat.get("slg")),
+                        "ops": _safe_float(stat.get("ops")),
+                        "pa": _safe_float(stat.get("plateAppearances")),
+                        "woba": _safe_float(stat.get("woba")),
+                    }
+            return out
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            logger.warning("Failed to fetch MLB hitting season stats %s: %s", season, e)
+            return {}
+
     async def fetch_game(self, game_pk: int) -> Optional[MLBGame]:
         """Fetch a single game by gamePk."""
         try:

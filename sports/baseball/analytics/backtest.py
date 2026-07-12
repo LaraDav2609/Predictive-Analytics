@@ -54,13 +54,33 @@ def team_states_before(games, before) -> dict[int, TeamState]:
 
 
 def replay(games, *, min_games: int = 10, pitcher_era: dict | None = None,
-           rate_pitcher=None) -> list[BacktestRecord]:
+           rate_pitcher=None, run_env: bool = False, weather_by_game: dict | None = None,
+           fatigue: bool = False, fatigue_by_game: dict | None = None,
+           bullpen_by_game: dict | None = None,
+           lineup_by_game: dict | None = None) -> list[BacktestRecord]:
     """Leak-free date-ordered replay → the scored per-game records. Shared by the
     backtest metrics and the serve-calibrator fit so both see the exact same
-    (probability, outcome) pairs from a prior-only ``TeamState``."""
+    (probability, outcome) pairs from a prior-only ``TeamState``.
+
+    ``run_env`` overlays each game's static home-park run factor (free, leak-free)
+    onto the model so the backtest can MEASURE whether the run-environment signal
+    helps. ``weather_by_game`` optionally supplies {game_id: weather_dict} (from
+    ``WeatherClient``) to add first-pitch wind/temperature on top of the park factor.
+    ``fatigue`` (or an explicit ``fatigue_by_game`` map) overlays schedule-only rest /
+    game-density signals (leak-free) so their effect can be measured too.
+    ``bullpen_by_game`` optionally supplies {game_id: bullpen_dict} (from
+    ``bullpen_fatigue.bullpen_by_game``) to overlay REAL leak-free bullpen workload. All
+    are off by default so serve behaviour is unchanged."""
     finished = _finished(games)
     states: dict[int, TeamState] = {}
     records: list[BacktestRecord] = []
+    park_factor = None
+    if run_env:
+        from sports.baseball.data.weather_client import park_factor as _pf
+        park_factor = _pf
+    if fatigue and fatigue_by_game is None:
+        from sports.baseball.analytics.schedule_fatigue import fatigue_by_game as _fbg
+        fatigue_by_game = _fbg(games)
 
     for g in finished:
         home = states.setdefault(g.home_team_id, TeamState())
@@ -73,8 +93,15 @@ def replay(games, *, min_games: int = 10, pitcher_era: dict | None = None,
             a_era = pitcher_era.get(g.away_pitcher_id)
         else:
             h_era = a_era = None
+        pf = park_factor(getattr(g, "venue", None) or g.home_team) if park_factor else None
+        wx = weather_by_game.get(g.id) if weather_by_game else None
+        fx = fatigue_by_game.get(g.id) if fatigue_by_game else None
+        bx = bullpen_by_game.get(g.id) if bullpen_by_game else None
+        lx = lineup_by_game.get(g.id) if lineup_by_game else None
         pred = predict_game(home, away, home_pitcher=g.home_pitcher, away_pitcher=g.away_pitcher,
-                            home_pitcher_era=h_era, away_pitcher_era=a_era, min_games=min_games)
+                            home_pitcher_era=h_era, away_pitcher_era=a_era,
+                            park_factor=pf, weather=wx, fatigue=fx, bullpen=bx, lineup=lx,
+                            min_games=min_games)
         if pred["leak_free"]:
             actual = 1.0 if g.home_score > g.away_score else 0.0
             records.append(BacktestRecord(
@@ -90,10 +117,21 @@ def replay(games, *, min_games: int = 10, pitcher_era: dict | None = None,
 
 def run_backtest(games, *, min_games: int = 10, calibrate: bool = True,
                  calibration_fraction: float = 0.4, pitcher_era: dict | None = None,
-                 rate_pitcher=None) -> dict:
+                 rate_pitcher=None, run_env: bool = False, weather_by_game: dict | None = None,
+                 fatigue: bool = False, fatigue_by_game: dict | None = None,
+                 bullpen_by_game: dict | None = None,
+                 lineup_by_game: dict | None = None) -> dict:
     """``rate_pitcher(pitcher_id, game_date) -> float | None`` supplies a date-aware
-    (leak-free) starter rating; ``pitcher_era`` is the static per-id fallback."""
-    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher)
+    (leak-free) starter rating; ``pitcher_era`` is the static per-id fallback.
+    ``run_env=True`` overlays the static park factor so the effect on Brier-skill is
+    measurable (compare a run with and without it). ``fatigue=True`` (or a
+    ``fatigue_by_game`` map) overlays the schedule-only rest/density signal likewise.
+    ``bullpen_by_game`` overlays the REAL leak-free bullpen workload signal so its effect
+    on Brier / Brier-skill can be measured head-to-head with a run without it."""
+    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher,
+                     run_env=run_env, weather_by_game=weather_by_game,
+                     fatigue=fatigue, fatigue_by_game=fatigue_by_game,
+                     bullpen_by_game=bullpen_by_game, lineup_by_game=lineup_by_game)
     return _metrics(records, calibrate, calibration_fraction)
 
 
@@ -133,16 +171,27 @@ def _feature_matrix(records, feature_order):
 
 
 def fit_blend(games, *, min_games: int = 15, pitcher_era: dict | None = None,
-              rate_pitcher=None, holdout_fraction: float = 0.4) -> dict:
+              rate_pitcher=None, holdout_fraction: float = 0.4,
+              run_env: bool = False, weather_by_game: dict | None = None,
+              fatigue: bool = False, fatigue_by_game: dict | None = None,
+              bullpen_by_game: dict | None = None,
+              lineup_by_game: dict | None = None) -> dict:
     """Fit a logistic BLEND over the raw signals and compare it head-to-head with the
     hand-tuned model on an honest earlier→later holdout. Returns learned weights plus
     the holdout Brier / log-loss / Brier-skill for both models, so the caller can gate
     on ``blend beats hand-tuned`` before enabling it at serve.
-    """
+
+    ``run_env`` / ``weather_by_game`` / ``fatigue`` / ``fatigue_by_game`` /
+    ``bullpen_by_game`` turn on the corresponding overlays during the replay so their raw
+    signals are non-constant and the blend can actually learn a weight for them (off by
+    default → the original four-feature fit)."""
     from sklearn.linear_model import LogisticRegression
     from sports.baseball.analytics.blend_model import FEATURE_ORDER, apply_blend
 
-    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher)
+    records = replay(games, min_games=min_games, pitcher_era=pitcher_era, rate_pitcher=rate_pitcher,
+                     run_env=run_env, weather_by_game=weather_by_game,
+                     fatigue=fatigue, fatigue_by_game=fatigue_by_game,
+                     bullpen_by_game=bullpen_by_game, lineup_by_game=lineup_by_game)
     n = len(records)
     if n < 100:
         return {"fitted": False, "reason": f"need >=100 scored games, have {n}"}
