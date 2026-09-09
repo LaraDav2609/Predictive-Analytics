@@ -18,6 +18,7 @@ from sports.f1.data.f1_sentiment import read_f1_sentiment, refresh_f1_sentiment
 from common.api import common_routes
 from sports.f1.api import f1_routes
 from sports.baseball.api import baseball_routes, baseball_history_routes
+from sports.basketball.api import basketball_routes
 from games.csgo.data.csgo_client import CsgoDataClient
 from games.csgo.data.factory import build_csgo_client
 from games.csgo.analytics.csgo_predictor import CsgoPredictor
@@ -189,4 +190,5 @@ app.include_router(common_routes.router, prefix="/api")
 app.include_router(f1_routes.router, prefix="/api")
 app.include_router(baseball_routes.router, prefix="/api")
 app.include_router(baseball_history_routes.router, prefix="/api")
+app.include_router(basketball_routes.router, prefix="/api")
 app.include_router(csgo_routes.router, prefix="/api")
