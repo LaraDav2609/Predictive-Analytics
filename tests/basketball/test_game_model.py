@@ -1,4 +1,5 @@
 from sports.basketball.analytics.game_model import predict_game, recent_form
+from sports.basketball.api.basketball_routes import _player
 from datetime import datetime, timezone
 
 
@@ -43,3 +44,17 @@ def test_multi_factor_model_favors_stronger_recent_team():
     assert result["home_win_probability"] > 0.70
     assert result["model_version"] == "bb-form-v1"
     assert result["reliability"] > 0.5
+
+
+def test_player_accepts_string_status_from_scoreboard_leaders():
+    player = _player({
+        "id": "123",
+        "displayName": "Example Player",
+        "status": "Active",
+        "headshot": None,
+        "position": None,
+    })
+
+    assert player["status"] == "Active"
+    assert player["headshot"] is None
+    assert player["position"] is None

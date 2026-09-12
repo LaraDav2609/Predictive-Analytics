@@ -119,11 +119,17 @@ def _team(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _player(raw: dict[str, Any]) -> dict[str, Any]:
-    headshot = raw.get("headshot") or {}
-    position = raw.get("position") or {}
-    experience = raw.get("experience") or {}
-    college = raw.get("college") or {}
-    birth_place = raw.get("birthPlace") or {}
+    def object_value(name: str) -> dict[str, Any]:
+        value = raw.get(name)
+        return value if isinstance(value, dict) else {}
+
+    headshot = object_value("headshot")
+    position = object_value("position")
+    experience = object_value("experience")
+    college = object_value("college")
+    birth_place = object_value("birthPlace")
+    status_value = raw.get("status")
+    status = status_value.get("name") if isinstance(status_value, dict) else status_value
     return {
         "id": raw.get("id"),
         "name": raw.get("displayName") or raw.get("fullName"),
@@ -140,7 +146,7 @@ def _player(raw: dict[str, Any]) -> dict[str, Any]:
         "experience_years": experience.get("years"),
         "college": college.get("name"),
         "birth_country": birth_place.get("country"),
-        "status": (raw.get("status") or {}).get("name"),
+        "status": status,
     }
 
 
